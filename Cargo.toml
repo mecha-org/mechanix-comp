@@ -6,29 +6,27 @@ edition = "2024"
 [workspace]
 members = ["."]
 
+[dependencies.smithay]
+git = "https://github.com/Smithay/smithay"
+rev = "492497f064d786aafec3c01e03b24a2cd0d31426"
+default-features = false
+features = [
+  "backend_winit",
+  "backend_drm",
+  "backend_gbm",
+  "backend_egl",
+  "backend_udev",
+  "backend_session_libseat",
+  "backend_libinput",
+  "renderer_gl",
+  "desktop",
+  "wayland_frontend",
+]
+
+[dependencies.smithay-drm-extras]
+git = "https://github.com/Smithay/smithay"
+rev = "492497f064d786aafec3c01e03b24a2cd0d31426"
+default-features = false
+
 [dependencies]
-smithay = {
-  git = "https://github.com/Smithay/smithay",
-  rev = "492497f064d786aafec3c01e03b24a2cd0d31426",
-  default-features = false,
-  features = [
-    "backend_winit",
-    "backend_drm",
-    "backend_gbm",
-    "backend_egl",
-    "backend_udev",
-    "backend_session_libseat",
-    "backend_libinput",
-    "renderer_gl",
-    "desktop",
-    "wayland_frontend",
-  ]
-}
-
-smithay-drm-extras = {
-  git = "https://github.com/Smithay/smithay",
-  rev = "492497f064d786aafec3c01e03b24a2cd0d31426",
-  default-features = false,
-}
-
 tracing = "0.1"

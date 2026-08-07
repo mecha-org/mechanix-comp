@@ -10,7 +10,7 @@ use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRender
 use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmNode, NodeType,
 };
-use smithay::backend::egl::{EGLContext, EGLDisplay};
+use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::input::InputEvent;
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::ImportDma;
@@ -333,11 +333,42 @@ impl State<UdevData> {
         let renderer = unsafe { GlesRenderer::new(egl_context)? };
 
         // Advertise zwp_linux_dmabuf_v1 now that the primary renderer exists.
+        //
+        // We must tell clients *which* render node to use for buffer sharing. The
+        // correct way to find this is to ask EGL itself — `EGLDevice::device_for_display`
+        // returns the device EGL actually opened (on kmsro/lcdif boards like REV7 this
+        // is the etnaviv renderD128, not the display controller card2). Falling back to
+        // `node` (the card node) would give clients an fd of -1 and break EGL init.
         if self.dmabuf_global.is_none() {
             let dmabuf_formats = renderer.dmabuf_formats();
+
+            // Ask EGL which render node it is actually using. This handles kmsro
+            // transparently: even though `node` is a display-only controller (imx-lcdif),
+            // EGL internally uses the paired etnaviv render node.
+            let render_node = EGLDevice::device_for_display(&egl_display)
+                .ok()
+                .and_then(|dev| dev.try_get_render_node().ok().flatten())
+                // Final fallback: use the card node's own render peer (works on
+                // real GPU cards like etnaviv card0 that do have a render node).
+                .or_else(|| node.node_with_type(NodeType::Render).and_then(|r| r.ok()));
+
+            let main_device_id = render_node
+                .map(|n| n.dev_id())
+                .unwrap_or_else(|| node.dev_id());
+
+            let default_feedback = smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
+                main_device_id,
+                dmabuf_formats,
+            )
+            .build()
+            .unwrap();
+
             let global = self
                 .dmabuf_state
-                .create_global::<State<UdevData>>(&self.display_handle, dmabuf_formats);
+                .create_global_with_default_feedback::<State<UdevData>>(
+                    &self.display_handle,
+                    &default_feedback,
+                );
             self.dmabuf_global = Some(global);
         }
         self.backend_data.renderer = Some(renderer);

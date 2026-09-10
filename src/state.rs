@@ -7,8 +7,8 @@ use smithay::backend::renderer::element::{
     RenderElementStates, default_primary_scanout_output_compare,
 };
 use smithay::desktop::utils::{
-    surface_primary_scanout_output, update_surface_primary_scanout_output,
-    with_surfaces_surface_tree,
+    OutputPresentationFeedback, surface_primary_scanout_output,
+    update_surface_primary_scanout_output, with_surfaces_surface_tree,
 };
 use smithay::desktop::{PopupManager, Space, Window, layer_map_for_output};
 use smithay::input::keyboard::Keysym;
@@ -18,6 +18,7 @@ use smithay::output::Output;
 use smithay::reexports::calloop::{
     EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic,
 };
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
@@ -34,6 +35,7 @@ use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::fifo::{FifoBarrierCachedState, FifoManagerState};
 use smithay::wayland::fractional_scale::{FractionalScaleManagerState, with_fractional_scale};
 use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::presentation::{PresentationState, Refresh};
 use smithay::wayland::session_lock::LockSurface;
 use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer, WlrLayerShellState};
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -120,6 +122,8 @@ pub struct State<BackendData: Backend + 'static> {
     pub commit_timing: CommitTimingManagerState,
     /// `wp_fifo`: holds commits until the previous frame was presented.
     pub fifo: FifoManagerState,
+    /// `wp_presentation`: reports when a frame was actually presented.
+    pub presentation_state: PresentationState,
     pub is_locked: bool,
     pub lock_surfaces: Vec<LockSurface>,
     pub viewporter_state: ViewporterState,
@@ -161,6 +165,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let dmabuf_state = DmabufState::new();
         let commit_timing = CommitTimingManagerState::new::<Self>(&dh);
         let fifo = FifoManagerState::new::<Self>(&dh);
+        let presentation_state = PresentationState::new::<Self>(&dh, clock.id() as u32);
 
         let seat_name = backend_data.seat_name();
 
@@ -222,6 +227,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             dmabuf_global: None,
             commit_timing,
             fifo,
+            presentation_state,
             is_locked: false,
             lock_surfaces: Vec::new(),
             viewporter_state,
@@ -457,6 +463,53 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 .map(|barrier| barrier.signal())
                 .is_some()
         });
+    }
+
+    /// Drain the `wp_presentation` feedback committed for the frame just rendered.
+    pub fn take_presentation_feedback(&self, output: &Output) -> OutputPresentationFeedback {
+        let mut feedback = OutputPresentationFeedback::new(output);
+        for window in self.space.elements_for_output(output) {
+            window.take_presentation_feedback(
+                &mut feedback,
+                surface_primary_scanout_output,
+                |_, _| wp_presentation_feedback::Kind::Vsync,
+            );
+        }
+        for layer in layer_map_for_output(output).layers() {
+            layer.take_presentation_feedback(
+                &mut feedback,
+                surface_primary_scanout_output,
+                |_, _| wp_presentation_feedback::Kind::Vsync,
+            );
+        }
+        feedback
+    }
+
+    /// Report a presented frame to its clients, at the real vblank time.
+    pub fn send_presentation_feedback(
+        &self,
+        output: &Output,
+        mut feedback: OutputPresentationFeedback,
+        vblank: Option<Time<Monotonic>>,
+        now: Time<Monotonic>,
+        seq: u64,
+    ) {
+        let (presented, flags) = match vblank {
+            Some(vblank) => (
+                vblank,
+                wp_presentation_feedback::Kind::Vsync
+                    | wp_presentation_feedback::Kind::HwClock
+                    | wp_presentation_feedback::Kind::HwCompletion,
+            ),
+            None => (now, wp_presentation_feedback::Kind::Vsync),
+        };
+        let refresh = crate::backend::output_refresh(output);
+        feedback.presented(
+            presented,
+            refresh.map(Refresh::fixed).unwrap_or(Refresh::Unknown),
+            seq,
+            flags,
+        );
     }
 
     /// Record the output each surface was presented on from the last render

@@ -279,10 +279,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap()
                 };
                 state.update_surface_scanout(&output, &result.states);
+                let feedback = state.take_presentation_feedback(&output);
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
 
                 state.send_frame_callbacks(&output, Duration::from(state.clock.now()));
                 state.release_fifo_barriers(&output);
+                state.send_presentation_feedback(&output, feedback, None, state.clock.now(), 0);
             }
             WinitEvent::CloseRequested => {
                 state.loop_signal.stop();

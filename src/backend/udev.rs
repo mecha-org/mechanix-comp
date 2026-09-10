@@ -26,6 +26,7 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, primary_gpu};
+use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -53,12 +54,16 @@ const SUPPORTED_FORMATS: &[Fourcc] = &[Fourcc::Argb8888, Fourcc::Xrgb8888];
 
 /// Concrete `DrmOutput` type: GBM allocator + framebuffer exporter, no per-frame
 /// user data (`()`), backed by a `DrmDeviceFd`.
-type GbmDrmOutput =
-    DrmOutput<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
+type GbmDrmOutput = DrmOutput<
+    GbmAllocator<DrmDeviceFd>,
+    GbmFramebufferExporter<DrmDeviceFd>,
+    OutputPresentationFeedback,
+    DrmDeviceFd,
+>;
 type GbmDrmOutputManager = DrmOutputManager<
     GbmAllocator<DrmDeviceFd>,
     GbmFramebufferExporter<DrmDeviceFd>,
-    (),
+    OutputPresentationFeedback,
     DrmDeviceFd,
 >;
 
@@ -175,9 +180,11 @@ impl Backend for UdevData {
         };
         if on {
             surface.drm_output.reset_buffers();
-        } else if let Err(err) = surface.drm_output.with_compositor(|c| c.clear()) {
-            warn!("DPMS off failed on {}: {err}", output.name());
-            return false;
+        } else {
+            if let Err(err) = surface.drm_output.with_compositor(|c| c.clear()) {
+                warn!("DPMS off failed on {}: {err}", output.name());
+                return false;
+            }
         }
         // Turning the CRTC off/on cancels any queued frame; nothing will vblank.
         let key = (id.device_id, id.crtc);
@@ -893,22 +900,30 @@ impl State<UdevData> {
             };
 
             if let Some(states) = result {
-                match surface.drm_output.queue_frame(()) {
-                    Ok(()) => {
-                        queued = true;
-                        scanout_states = Some(states);
-                    }
-                    Err(err) => {
-                        warn!("Failed to queue frame: {err}");
-                        render_failed = true;
-                    }
+                scanout_states = Some(states);
+            }
+        }
+
+        if let Some(states) = scanout_states.take() {
+            self.update_surface_scanout(&output, &states);
+            let feedback = self.take_presentation_feedback(&output);
+            let queue_result = self
+                .backend_data
+                .devices
+                .get_mut(&node)
+                .and_then(|device| device.surfaces.get_mut(&crtc))
+                .map(|surface| surface.drm_output.queue_frame(feedback));
+            match queue_result {
+                Some(Ok(())) => queued = true,
+                Some(Err(err)) => {
+                    warn!("Failed to queue frame: {err}");
+                    render_failed = true;
                 }
+                None => return,
             }
         }
 
         if queued {
-            let states = scanout_states.unwrap();
-            self.update_surface_scanout(&output, &states);
             // The frame is on the CRTC; damage arriving before its vblank re-renders.
             if let Some(frame) = self.backend_data.output_frames.get_mut(&(node, crtc)) {
                 frame.state = OutputFrameState::AwaitingVblank {
@@ -952,17 +967,29 @@ impl State<UdevData> {
         crtc: crtc::Handle,
         meta: &mut Option<DrmEventMetadata>,
     ) {
-        {
+        let submitted = {
             let Some(device) = self.backend_data.devices.get_mut(&node) else {
                 return;
             };
             let Some(surface) = device.surfaces.get_mut(&crtc) else {
                 return;
             };
-            if let Err(err) = surface.drm_output.frame_submitted() {
-                warn!("frame_submitted failed: {err}");
+            match surface.drm_output.frame_submitted() {
+                Ok(Some(feedback)) => Some(feedback),
+                Ok(None) => None,
+                Err(err) => {
+                    warn!("frame_submitted failed: {err}");
+                    None
+                }
             }
-        }
+        };
+        let Some(submitted) = submitted else {
+            // No frame was retired; let the next damage re-render.
+            if let Some(frame) = self.backend_data.output_frames.get_mut(&(node, crtc)) {
+                frame.state = OutputFrameState::Idle;
+            }
+            return;
+        };
 
         // Anchor the callback pacing clock on the real vblank time, if reported.
         let now = self.clock.now();
@@ -970,6 +997,8 @@ impl State<UdevData> {
             DrmEventTime::Monotonic(time) if !time.is_zero() => Some(Time::from(time)),
             _ => None,
         });
+        let seq = meta.as_ref().map(|meta| meta.sequence as u64).unwrap_or(0);
+
         let render_again = self
             .backend_data
             .output_frames
@@ -989,6 +1018,7 @@ impl State<UdevData> {
 
         if let Some(output) = self.output_for_crtc(node, crtc) {
             self.send_frame_callbacks(&output, Duration::from(vblank.unwrap_or(now)));
+            self.send_presentation_feedback(&output, submitted, vblank, now, seq);
             // Render before releasing FIFO waiters so a resumed commit only marks damage.
             if render_again {
                 self.render_surface(node, crtc);

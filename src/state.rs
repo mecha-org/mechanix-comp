@@ -31,6 +31,7 @@ use smithay::wayland::compositor::{
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
+use smithay::wayland::fifo::{FifoBarrierCachedState, FifoManagerState};
 use smithay::wayland::fractional_scale::{FractionalScaleManagerState, with_fractional_scale};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::session_lock::LockSurface;
@@ -117,6 +118,8 @@ pub struct State<BackendData: Backend + 'static> {
     pub dmabuf_global: Option<DmabufGlobal>,
     /// `wp_commit_timing`: holds client commits until their requested time.
     pub commit_timing: CommitTimingManagerState,
+    /// `wp_fifo`: holds commits until the previous frame was presented.
+    pub fifo: FifoManagerState,
     pub is_locked: bool,
     pub lock_surfaces: Vec<LockSurface>,
     pub viewporter_state: ViewporterState,
@@ -157,6 +160,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         // blanket `delegate_dispatch2!`.
         let dmabuf_state = DmabufState::new();
         let commit_timing = CommitTimingManagerState::new::<Self>(&dh);
+        let fifo = FifoManagerState::new::<Self>(&dh);
 
         let seat_name = backend_data.seat_name();
 
@@ -217,6 +221,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             dmabuf_state,
             dmabuf_global: None,
             commit_timing,
+            fifo,
             is_locked: false,
             lock_surfaces: Vec::new(),
             viewporter_state,
@@ -353,6 +358,22 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
+    /// Visit the surfaces on `output`: its windows, its layers, and lock
+    /// surfaces while locked.
+    fn for_each_surface_on(&self, output: &Output, mut f: impl FnMut(&WlSurface, &SurfaceData)) {
+        for window in self.space.elements_for_output(output) {
+            window.with_surfaces(&mut f);
+        }
+        for layer in layer_map_for_output(output).layers() {
+            layer.with_surfaces(&mut f);
+        }
+        if self.is_locked {
+            for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
+                with_surfaces_surface_tree(lock_surface.wl_surface(), &mut f);
+            }
+        }
+    }
+
     /// Wake the backend after `delay` to release commit-timing barriers that are due.
     pub fn wake_at(&mut self, deadline: Timestamp) {
         let now = self.clock.now();
@@ -368,8 +389,13 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     /// Signal per-surface barriers, then resume the clients they were holding back.
-    /// `signal` returns whether the surface had a barrier worth reporting.
-    fn release_blockers(&mut self, mut signal: impl FnMut(&WlSurface, &SurfaceData) -> bool) {
+    /// `signal` returns whether the surface had a barrier worth reporting. When
+    /// `output` is set, only that output's surfaces are visited.
+    fn release_blockers(
+        &mut self,
+        output: Option<&Output>,
+        mut signal: impl FnMut(&WlSurface, &SurfaceData) -> bool,
+    ) {
         let mut clients: HashMap<ClientId, Client> = HashMap::new();
         {
             let mut visit = |surface: &WlSurface, states: &SurfaceData| {
@@ -379,7 +405,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     clients.insert(client.id(), client);
                 }
             };
-            self.for_each_surface(&mut visit);
+            match output {
+                Some(output) => self.for_each_surface_on(output, &mut visit),
+                None => self.for_each_surface(&mut visit),
+            }
         }
         let dh = self.display_handle.clone();
         for client in clients.into_values() {
@@ -391,11 +420,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     /// Release commit-timing barriers whose requested time has passed.
     pub fn release_commit_timers(&mut self, deadline: impl Into<Timestamp>) {
         let deadline = deadline.into();
-        self.release_blockers(|_surface, states| {
-            match states.data_map.get::<CommitTimerBarrierStateUserData>() {
-                Some(barrier) => barrier.lock().unwrap().signal_until(deadline),
-                None => false,
-            }
+        self.release_blockers(None, |_surface, states| match states
+            .data_map
+            .get::<CommitTimerBarrierStateUserData>(
+        ) {
+            Some(barrier) => barrier.lock().unwrap().signal_until(deadline),
+            None => false,
         });
     }
 
@@ -413,6 +443,20 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             self.for_each_surface(&mut visit);
         }
         earliest
+    }
+
+    /// Signal pending `wp_fifo` barriers for surfaces on `output`.
+    pub fn release_fifo_barriers(&mut self, output: &Output) {
+        self.release_blockers(Some(output), |_surface, states| {
+            states
+                .cached_state
+                .get::<FifoBarrierCachedState>()
+                .current()
+                .barrier
+                .take()
+                .map(|barrier| barrier.signal())
+                .is_some()
+        });
     }
 
     /// Record the output each surface was presented on from the last render

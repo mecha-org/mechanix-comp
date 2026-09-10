@@ -726,6 +726,7 @@ impl State<UdevData> {
             })
             .cloned();
         if let Some(output) = output {
+            self.release_fifo_barriers(&output);
             self.session.output_power.output_removed(&output);
             self.space.unmap_output(&output);
         }
@@ -988,9 +989,11 @@ impl State<UdevData> {
 
         if let Some(output) = self.output_for_crtc(node, crtc) {
             self.send_frame_callbacks(&output, Duration::from(vblank.unwrap_or(now)));
+            // Render before releasing FIFO waiters so a resumed commit only marks damage.
             if render_again {
                 self.render_surface(node, crtc);
             }
+            self.release_fifo_barriers(&output);
         }
     }
 

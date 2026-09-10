@@ -34,7 +34,6 @@ pub struct WinitData {
     /// Cache of imported cursor frames, keyed by the raw xcursor image.
     pub pointer_images: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
     pub pointer_element: PointerElement,
-    /// Pending `wp_commit_timing` wakeups.
     pub timers: Timers<WinitData>,
 }
 
@@ -283,7 +282,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
 
                 state.send_frame_callbacks(&output, Duration::from(state.clock.now()));
-
+                state.release_fifo_barriers(&output);
             }
             WinitEvent::CloseRequested => {
                 state.loop_signal.stop();

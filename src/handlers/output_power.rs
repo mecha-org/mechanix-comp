@@ -105,6 +105,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             self.backend_data.schedule_render(output);
         } else {
             self.session.output_power.off.insert(output.clone());
+            self.release_fifo_barriers(output);
         }
         self.session.output_power.send_mode(output, on);
     }

@@ -2,8 +2,12 @@ use std::time::Duration;
 
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Physical, Size, Transform};
+
+use crate::state::State;
 
 #[cfg(feature = "session")]
 pub mod udev;
@@ -95,9 +99,10 @@ pub trait Backend {
     /// Queue a redraw of `output`; the backend skips ones already pending.
     fn schedule_render(&mut self, _output: &Output) {}
 
-    /// Queue a redraw of `output` after `delay`. Used to pace frame callbacks
-    /// (and, later, compositor animations) to the output's refresh. Backends
-    /// that cannot pace renders may leave this a no-op.
+    /// `wp_commit_timing` release wakeup after `delay`.
+    fn arm_commit_timer(&mut self, _delay: Duration) {}
+
+    /// Queue a redraw of `output` after `delay`.
     fn schedule_render_after(&mut self, _output: &Output, _delay: Duration) {}
 
     /// Transform to apply to absolute (touch) input positions for `output`.
@@ -105,5 +110,37 @@ pub trait Backend {
     /// want identity; udev/DRM (and trait default) reports them in the output's transformed space.
     fn touch_transform(&self, output: &Output) -> Transform {
         output.current_transform()
+    }
+}
+
+/// The `wp_commit_timing` wakeups, owned by each backend.
+pub struct Timers<D: Backend + 'static> {
+    loop_handle: LoopHandle<'static, State<D>>,
+    commit: Option<RegistrationToken>,
+}
+
+impl<D: Backend + 'static> Timers<D> {
+    pub fn new(loop_handle: LoopHandle<'static, State<D>>) -> Self {
+        Self {
+            loop_handle,
+            commit: None,
+        }
+    }
+
+    /// `wp_commit_timing` release wakeup after `delay`.
+    pub fn arm_commit(&mut self, delay: Duration) {
+        if let Some(token) = self.commit.take() {
+            self.loop_handle.remove(token);
+        }
+        let token = self
+            .loop_handle
+            .insert_source(Timer::from_duration(delay), |_, _, state| {
+                state.release_commit_timers(state.clock.now());
+                state.reschedule_commit_timer();
+                TimeoutAction::Drop
+            });
+        if let Ok(token) = token {
+            self.commit = Some(token);
+        }
     }
 }

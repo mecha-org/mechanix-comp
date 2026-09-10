@@ -42,7 +42,7 @@ use smithay::wayland::compositor::with_states;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use tracing::{error, info, warn};
 
-use crate::backend::{Backend, output_refresh};
+use crate::backend::{Backend, Timers, output_refresh};
 use crate::drawing::{PointerElement, cached_pointer_buffer};
 use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
@@ -125,6 +125,8 @@ pub struct UdevData {
     pointer_element: PointerElement,
     /// Per-output repaint state, keyed by (device, CRTC).
     output_frames: HashMap<(DrmNode, crtc::Handle), OutputFrame>,
+    /// Pending `wp_commit_timing` wakeups.
+    timers: Timers<UdevData>,
     /// True while the session is paused; rendering is skipped.
     paused: bool,
 }
@@ -231,6 +233,10 @@ impl Backend for UdevData {
         }
     }
 
+    fn arm_commit_timer(&mut self, delay: Duration) {
+        self.timers.arm_commit(delay);
+    }
+
     fn schedule_render_after(&mut self, output: &Output, delay: Duration) {
         let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
             return;
@@ -313,6 +319,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         pointer_images: Vec::new(),
         pointer_element: PointerElement::default(),
         output_frames: HashMap::new(),
+        timers: Timers::new(loop_handle.clone()),
         paused: false,
     };
 

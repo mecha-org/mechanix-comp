@@ -21,10 +21,13 @@ use smithay::reexports::calloop::{
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
-use smithay::reexports::wayland_server::{BindError, Display, DisplayHandle};
-use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER};
+use smithay::reexports::wayland_server::{BindError, Client, Display, DisplayHandle};
+use smithay::utils::{Clock, Logical, Monotonic, Point, Time, SERIAL_COUNTER};
+use smithay::wayland::commit_timing::{
+    CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
+};
 use smithay::wayland::compositor::{
-    CompositorClientState, CompositorState, with_states,
+    CompositorClientState, CompositorHandler, CompositorState, SurfaceData, with_states,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
@@ -112,7 +115,8 @@ pub struct State<BackendData: Backend + 'static> {
     pub backend_data: BackendData,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
-
+    /// `wp_commit_timing`: holds client commits until their requested time.
+    pub commit_timing: CommitTimingManagerState,
     pub is_locked: bool,
     pub lock_surfaces: Vec<LockSurface>,
     pub viewporter_state: ViewporterState,
@@ -152,6 +156,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         // its renderer's format list is available. Dispatch is handled by the
         // blanket `delegate_dispatch2!`.
         let dmabuf_state = DmabufState::new();
+        let commit_timing = CommitTimingManagerState::new::<Self>(&dh);
 
         let seat_name = backend_data.seat_name();
 
@@ -211,6 +216,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             backend_data,
             dmabuf_state,
             dmabuf_global: None,
+            commit_timing,
             is_locked: false,
             lock_surfaces: Vec::new(),
             viewporter_state,
@@ -323,6 +329,90 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             });
             self.push_fractional_scale(layer_surface.wl_surface(), scale);
         }
+    }
+
+    /// Visit every surface the compositor knows about (windows, layers, cursor,
+    /// DnD icon, and lock surfaces).
+    fn for_each_surface(&self, mut f: impl FnMut(&WlSurface, &SurfaceData)) {
+        for window in self.space.elements() {
+            window.with_surfaces(&mut f);
+        }
+        for output in self.space.outputs() {
+            for layer in layer_map_for_output(output).layers() {
+                layer.with_surfaces(&mut f);
+            }
+        }
+        if let CursorImageStatus::Surface(surface) = &self.cursor_status {
+            with_surfaces_surface_tree(surface, &mut f);
+        }
+        if let Some(icon) = &self.dnd_icon {
+            with_surfaces_surface_tree(&icon.surface, &mut f);
+        }
+        for lock_surface in &self.lock_surfaces {
+            with_surfaces_surface_tree(lock_surface.wl_surface(), &mut f);
+        }
+    }
+
+    /// Wake the backend after `delay` to release commit-timing barriers that are due.
+    pub fn wake_at(&mut self, deadline: Timestamp) {
+        let now = self.clock.now();
+        self.backend_data
+            .arm_commit_timer(Time::elapsed(&now, deadline.into()));
+    }
+
+    /// Arm a wakeup at the earliest pending commit-timing deadline, if any.
+    pub fn reschedule_commit_timer(&mut self) {
+        if let Some(deadline) = self.next_commit_deadline() {
+            self.wake_at(deadline);
+        }
+    }
+
+    /// Signal per-surface barriers, then resume the clients they were holding back.
+    /// `signal` returns whether the surface had a barrier worth reporting.
+    fn release_blockers(&mut self, mut signal: impl FnMut(&WlSurface, &SurfaceData) -> bool) {
+        let mut clients: HashMap<ClientId, Client> = HashMap::new();
+        {
+            let mut visit = |surface: &WlSurface, states: &SurfaceData| {
+                if signal(surface, states)
+                    && let Some(client) = surface.client()
+                {
+                    clients.insert(client.id(), client);
+                }
+            };
+            self.for_each_surface(&mut visit);
+        }
+        let dh = self.display_handle.clone();
+        for client in clients.into_values() {
+            self.client_compositor_state(&client)
+                .blocker_cleared(self, &dh);
+        }
+    }
+
+    /// Release commit-timing barriers whose requested time has passed.
+    pub fn release_commit_timers(&mut self, deadline: impl Into<Timestamp>) {
+        let deadline = deadline.into();
+        self.release_blockers(|_surface, states| {
+            match states.data_map.get::<CommitTimerBarrierStateUserData>() {
+                Some(barrier) => barrier.lock().unwrap().signal_until(deadline),
+                None => false,
+            }
+        });
+    }
+
+    /// The earliest commit-timing deadline still pending across all surfaces.
+    pub fn next_commit_deadline(&self) -> Option<Timestamp> {
+        let mut earliest: Option<Timestamp> = None;
+        {
+            let mut visit = |_surface: &WlSurface, states: &SurfaceData| {
+                if let Some(barrier) = states.data_map.get::<CommitTimerBarrierStateUserData>()
+                    && let Some(deadline) = barrier.lock().unwrap().next_deadline()
+                {
+                    earliest = Some(earliest.map_or(deadline, |earliest| earliest.min(deadline)));
+                }
+            };
+            self.for_each_surface(&mut visit);
+        }
+        earliest
     }
 
     /// Record the output each surface was presented on from the last render

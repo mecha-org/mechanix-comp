@@ -2,8 +2,10 @@ use crate::backend::Backend;
 use crate::state::State;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::wayland::commit_timing::CommitTimerStateUserData;
 use smithay::wayland::compositor::{
-    CompositorHandler, CompositorState, get_parent, is_sync_subsurface,
+    CompositorHandler, CompositorState, add_pre_commit_hook, get_parent, is_sync_subsurface,
+    with_states,
 };
 
 impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
@@ -19,6 +21,25 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
             .get_data::<crate::state::ClientState>()
             .unwrap()
             .compositor_state
+    }
+
+    fn new_surface(&mut self, surface: &WlSurface) {
+        // A commit-timer timestamp asks us to hold the commit until then, so arm
+        // a wakeup for the earliest pending deadline (this one or an older one).
+        add_pre_commit_hook::<Self, _>(surface, |state, _dh, surface| {
+            let timestamp = with_states(surface, |states| {
+                states
+                    .data_map
+                    .get::<CommitTimerStateUserData>()
+                    .and_then(|timer| timer.borrow().timestamp)
+            });
+            if let Some(timestamp) = timestamp {
+                let earliest = state
+                    .next_commit_deadline()
+                    .map_or(timestamp, |pending| pending.min(timestamp));
+                state.wake_at(earliest);
+            }
+        });
     }
 
     fn commit(&mut self, surface: &WlSurface) {

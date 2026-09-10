@@ -23,7 +23,7 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{BindError, Client, Display, DisplayHandle};
-use smithay::utils::{Clock, Logical, Monotonic, Point, Time, SERIAL_COUNTER};
+use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Time};
 use smithay::wayland::commit_timing::{
     CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
 };

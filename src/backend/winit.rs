@@ -19,7 +19,7 @@ use smithay::reexports::wayland_server::Display;
 use smithay::utils::{IsAlive, Rectangle, Transform};
 use smithay::wayland::compositor::with_states;
 
-use crate::backend::{Backend, Timers};
+use crate::backend::{Backend, Wakeups};
 use crate::drawing::{PointerElement, cached_pointer_buffer};
 use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
@@ -34,7 +34,7 @@ pub struct WinitData {
     /// Cache of imported cursor frames, keyed by the raw xcursor image.
     pub pointer_images: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
     pub pointer_element: PointerElement,
-    pub timers: Timers<WinitData>,
+    pub wakeups: Wakeups<WinitData>,
 }
 
 impl Backend for WinitData {
@@ -56,7 +56,7 @@ impl Backend for WinitData {
     }
 
     fn arm_commit_timer(&mut self, delay: Duration) {
-        self.timers.arm_commit(delay);
+        self.wakeups.arm_commit(delay);
     }
 
     fn touch_transform(&self, _output: &Output) -> Transform {
@@ -82,7 +82,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             pointer_image: crate::cursor::Cursor::load(),
             pointer_images: Vec::new(),
             pointer_element: PointerElement::default(),
-            timers: Timers::new(loop_handle),
+            wakeups: Wakeups::new(loop_handle),
         },
     );
 

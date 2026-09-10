@@ -123,12 +123,12 @@ pub trait Backend {
 }
 
 /// The `wp_commit_timing` wakeups, owned by each backend.
-pub struct Timers<D: Backend + 'static> {
+pub struct Wakeups<D: Backend + 'static> {
     loop_handle: LoopHandle<'static, State<D>>,
     commit: Option<RegistrationToken>,
 }
 
-impl<D: Backend + 'static> Timers<D> {
+impl<D: Backend + 'static> Wakeups<D> {
     pub fn new(loop_handle: LoopHandle<'static, State<D>>) -> Self {
         Self {
             loop_handle,

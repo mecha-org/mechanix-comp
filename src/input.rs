@@ -419,6 +419,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     },
                 );
                 pointer.frame(self);
+                self.schedule_render();
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let output = self.space.outputs().next().unwrap();
@@ -443,6 +444,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     },
                 );
                 pointer.frame(self);
+                self.schedule_render();
             }
             InputEvent::PointerButton { event, .. } => {
                 let pointer = self.seat.get_pointer().unwrap();

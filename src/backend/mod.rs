@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -35,6 +37,14 @@ pub fn guess_default_scale(size_mm: Option<(u32, u32)>, mode: Size<i32, Physical
 /// Snap to the fractional-scale protocol's representable values (N/120).
 pub fn snap_scale(scale: f64) -> f64 {
     (scale * 120.0).round() / 120.0
+}
+
+/// Output refresh interval from the current mode, if known.
+pub fn output_refresh(output: &Output) -> Option<Duration> {
+    output
+        .current_mode()
+        .filter(|mode| mode.refresh > 0)
+        .map(|mode| Duration::from_secs_f64(1000.0 / mode.refresh as f64))
 }
 
 /// The `MECHA_SCALE` override, if set.
@@ -84,6 +94,11 @@ pub trait Backend {
 
     /// Queue a redraw of `output`; the backend skips ones already pending.
     fn schedule_render(&mut self, _output: &Output) {}
+
+    /// Queue a redraw of `output` after `delay`. Used to pace frame callbacks
+    /// (and, later, compositor animations) to the output's refresh. Backends
+    /// that cannot pace renders may leave this a no-op.
+    fn schedule_render_after(&mut self, _output: &Output, _delay: Duration) {}
 
     /// Transform to apply to absolute (touch) input positions for `output`.
     /// Nested winit windows already report positions in window space, so they

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use smithay::backend::renderer::element::{
     RenderElementStates, default_primary_scanout_output_compare,
@@ -23,7 +23,9 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{BindError, Display, DisplayHandle};
 use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER};
-use smithay::wayland::compositor::{CompositorClientState, CompositorState, with_states};
+use smithay::wayland::compositor::{
+    CompositorClientState, CompositorState, with_states,
+};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::fractional_scale::{FractionalScaleManagerState, with_fractional_scale};
@@ -72,7 +74,6 @@ pub struct DndIcon {
 }
 
 pub struct State<BackendData: Backend + 'static> {
-    pub start_time: Instant,
     pub socket_name: OsString,
     #[cfg(feature = "session")]
     pub session: crate::session::Session<BackendData>,
@@ -144,7 +145,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         backend_data: BackendData,
         socket: SocketName,
     ) -> Self {
-        let start_time = Instant::now();
         let dh = display.handle();
         let clock = Clock::new();
 
@@ -186,7 +186,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let loop_signal = event_loop.get_signal();
 
         Self {
-            start_time,
             socket_name,
             #[cfg(feature = "session")]
             session,
@@ -290,15 +289,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Send frame callbacks to every visible surface on `output`, once per
-    /// presented frame. Lifecycle bookkeeping happens in the backends' idle
-    /// callbacks instead, so client I/O isn't blocked on frame presentation.
-    ///
-    /// Surfaces are acked every presented frame; hidden ones (cleared scan-out
-    /// records) fall back to a 1Hz throttle so their frame clocks keep running.
-    pub fn send_frame_callbacks(&mut self, output: &Output) {
-        let now = self.start_time.elapsed();
-        #[cfg(feature = "session")]
+    /// Send frame callbacks for a presented frame; `now` is its presentation time.
+    pub fn send_frame_callbacks(&mut self, output: &Output, now: Duration) {
         if self.is_locked {
             // Send frame callbacks only to live surfaces.
             for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
@@ -311,6 +303,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 );
             }
 
+            #[cfg(feature = "session")]
+            self.confirm_pending_lock();
             return;
         }
         let scale = output.current_scale().fractional_scale();
@@ -417,10 +411,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     /// `toplevel_destroyed` path (e.g. a crash); dropping the entry also drops
     /// its foreign-toplevel handle.
     pub fn cleanup_toplevels(&mut self) {
+        let before = self.toplevels.len();
         self.toplevels
             .retain(|_, ws| ws.window.toplevel().unwrap().wl_surface().is_alive());
         for layout in self.layouts.values_mut() {
             layout.retain(|s| s.is_alive());
+        }
+        if self.toplevels.len() != before {
+            self.schedule_render();
         }
     }
 

@@ -62,6 +62,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         if let Some(window) = window {
             self.space.unmap_elem(&window);
             self.focus_topmost();
+            self.schedule_render();
         }
     }
 

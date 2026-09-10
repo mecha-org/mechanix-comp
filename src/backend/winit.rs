@@ -1,6 +1,6 @@
 use std::sync::Mutex;
+use std::time::Duration;
 
-use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::AsRenderElements;
@@ -20,7 +20,7 @@ use smithay::utils::{IsAlive, Rectangle, Transform};
 use smithay::wayland::compositor::with_states;
 
 use crate::backend::Backend;
-use crate::drawing::PointerElement;
+use crate::drawing::{PointerElement, cached_pointer_buffer};
 use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
 
@@ -50,6 +50,10 @@ impl Backend for WinitData {
         // scanout buffers to reset.
     }
 
+    fn schedule_render(&mut self, _output: &Output) {
+        self.backend.window().request_redraw();
+    }
+
     fn touch_transform(&self, _output: &Output) -> Transform {
         // Nested winit windows report positions in window space already, so
         // absolute input needs no output-transform correction.
@@ -72,7 +76,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             pointer_image: crate::cursor::Cursor::load(),
             pointer_images: Vec::new(),
             pointer_element: PointerElement::default(),
-        },
+            },
     );
 
     // Disable the host compositor's cursor.
@@ -118,6 +122,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     output.set_preferred(mode);
 
     state.space.map_output(&output, (0, 0));
+    state.schedule_render();
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
 
@@ -199,38 +204,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                             (0, 0).into()
                         };
 
-                    // Pick the current cursor frame, importing it as a render
-                    // buffer once (cached in `pointer_images`). Load it at the
-                    // output's scale so the named cursor renders at the correct
-                    // physical size on scaled outputs.
                     let cursor_scale =
                         output.current_scale().fractional_scale().round().max(1.0) as u32;
                     let frame = state
                         .backend_data
                         .pointer_image
                         .get_image(cursor_scale, state.clock.now().into());
-                    let pointer_images = &mut state.backend_data.pointer_images;
-                    let pointer_image = pointer_images
-                        .iter()
-                        .find_map(|(image, texture)| {
-                            if image == &frame {
-                                Some(texture.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            let buffer = MemoryRenderBuffer::from_slice(
-                                &frame.pixels_rgba,
-                                Fourcc::Argb8888,
-                                (frame.width as i32, frame.height as i32),
-                                cursor_scale as i32,
-                                Transform::Normal,
-                                None,
-                            );
-                            pointer_images.push((frame, buffer.clone()));
-                            buffer
-                        });
+                    let pointer_image = cached_pointer_buffer(
+                        &mut state.backend_data.pointer_images,
+                        frame,
+                        cursor_scale as i32,
+                    );
                     state.backend_data.pointer_element.set_buffer(pointer_image);
 
                     // Queue the cursor above everything else.
@@ -290,10 +274,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.update_surface_scanout(&output, &result.states);
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
 
-                state.send_frame_callbacks(&output);
-                state.confirm_pending_lock();
+                state.send_frame_callbacks(&output, Duration::from(state.clock.now()));
 
-                state.backend_data.backend.window().request_redraw();
             }
             WinitEvent::CloseRequested => {
                 state.loop_signal.stop();

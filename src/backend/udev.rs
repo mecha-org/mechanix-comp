@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -9,7 +9,7 @@ use smithay::backend::drm::compositor::FrameFlags;
 use smithay::backend::drm::exporter::gbm::{GbmFramebufferExporter, NodeFilter};
 use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements};
 use smithay::backend::drm::{
-    DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmNode, NodeType,
+    DrmDevice, DrmDeviceFd, DrmEvent, DrmEventMetadata, DrmEventTime, DrmNode, NodeType,
 };
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::input::InputEvent;
@@ -17,6 +17,7 @@ use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface}
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::RenderElementStates;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
@@ -36,13 +37,13 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::GlobalId;
-use smithay::utils::{DeviceFd, IsAlive, Transform};
+use smithay::utils::{DeviceFd, IsAlive, Monotonic, Time};
 use smithay::wayland::compositor::with_states;
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use tracing::{error, info, warn};
 
-use crate::backend::Backend;
-use crate::drawing::PointerElement;
+use crate::backend::{Backend, output_refresh};
+use crate::drawing::{PointerElement, cached_pointer_buffer};
 use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
 
@@ -83,6 +84,26 @@ struct DeviceData {
     registration_token: RegistrationToken,
 }
 
+#[derive(Default)]
+enum OutputFrameState {
+    #[default]
+    Idle,
+    RenderQueued,
+    AwaitingVblank {
+        /// New damage arrived while the frame was scanning out.
+        damage_pending: bool,
+    },
+}
+
+#[derive(Default)]
+struct OutputFrame {
+    state: OutputFrameState,
+    /// When frame callbacks were last sent (pacing).
+    last_callback: Option<Time<Monotonic>>,
+    /// Pending paced redraw, if any.
+    redraw_timer: Option<RegistrationToken>,
+}
+
 pub struct UdevData {
     login: LibSeatSession,
     loop_handle: LoopHandle<'static, State<UdevData>>,
@@ -102,8 +123,10 @@ pub struct UdevData {
     /// Cache of imported cursor frames, keyed by the raw xcursor image.
     pointer_images: Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
     pointer_element: PointerElement,
-    /// CRTCs with a render already queued, so `schedule_render` on them is a no-op.
-    pending_render: HashSet<(DrmNode, crtc::Handle)>,
+    /// Per-output repaint state, keyed by (device, CRTC).
+    output_frames: HashMap<(DrmNode, crtc::Handle), OutputFrame>,
+    /// True while the session is paused; rendering is skipped.
+    paused: bool,
 }
 
 impl Backend for UdevData {
@@ -141,24 +164,25 @@ impl Backend for UdevData {
         let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
             return false;
         };
-        let Some(device) = self.devices.get_mut(&id.device_id) else {
-            return false;
-        };
-        let Some(surface) = device.surfaces.get_mut(&id.crtc) else {
+        let Some(surface) = self
+            .devices
+            .get_mut(&id.device_id)
+            .and_then(|d| d.surfaces.get_mut(&id.crtc))
+        else {
             return false;
         };
         if on {
-            // clear() left the CRTC inactive; the next queue_frame must modeset.
             surface.drm_output.reset_buffers();
-            return true;
+        } else if let Err(err) = surface.drm_output.with_compositor(|c| c.clear()) {
+            warn!("DPMS off failed on {}: {err}", output.name());
+            return false;
         }
-        match surface.drm_output.with_compositor(|c| c.clear()) {
-            Ok(()) => true,
-            Err(err) => {
-                warn!("DPMS off failed on {}: {err}", output.name());
-                false
-            }
+        // Turning the CRTC off/on cancels any queued frame; nothing will vblank.
+        let key = (id.device_id, id.crtc);
+        if let Some(frame) = self.output_frames.get_mut(&key) {
+            frame.state = OutputFrameState::Idle;
         }
+        true
     }
 
     fn prepare_resume(&mut self) {
@@ -167,27 +191,86 @@ impl Backend for UdevData {
                 warn!("Failed to activate DRM device {node} after resume: {err}");
             }
         }
+        for frame in self.output_frames.values_mut() {
+            frame.state = OutputFrameState::Idle;
+        }
     }
 
     fn schedule_render(&mut self, output: &Output) {
         let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
             return;
         };
-        if !self.pending_render.insert((id.device_id, id.crtc)) {
-            return;
+        let key = (id.device_id, id.crtc);
+        let frame = self.output_frames.entry(key).or_default();
+        // A real render supersedes any pending paced redraw.
+        let paced_redraw = if matches!(frame.state, OutputFrameState::Idle) {
+            frame.redraw_timer.take()
+        } else {
+            None
+        };
+        if let Some(token) = paced_redraw {
+            self.loop_handle.remove(token);
         }
-        self.loop_handle.insert_idle(move |state| {
-            state
-                .backend_data
-                .pending_render
-                .remove(&(id.device_id, id.crtc));
-            state.render_surface(id.device_id, id.crtc);
-        });
+        match &mut frame.state {
+            state @ OutputFrameState::Idle => {
+                *state = OutputFrameState::RenderQueued;
+                let node = id.device_id;
+                let crtc = id.crtc;
+                self.loop_handle.insert_idle(move |state| {
+                    if let Some(frame) = state.backend_data.output_frames.get_mut(&key) {
+                        frame.state = OutputFrameState::Idle;
+                    }
+                    state.render_surface(node, crtc);
+                });
+            }
+            OutputFrameState::AwaitingVblank { damage_pending } => {
+                // A frame is on the CRTC; render again once it vblanks.
+                *damage_pending = true;
+            }
+            OutputFrameState::RenderQueued => {}
+        }
+    }
+
+    fn schedule_render_after(&mut self, output: &Output, delay: Duration) {
+        let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
+            return;
+        };
+        let key = (id.device_id, id.crtc);
+        let frame = self.output_frames.entry(key).or_default();
+        if let Some(token) = frame.redraw_timer.take() {
+            self.loop_handle.remove(token);
+        }
+        let token = self
+            .loop_handle
+            .insert_source(Timer::from_duration(delay), move |_, _, state| {
+                if let Some(frame) = state.backend_data.output_frames.get_mut(&key) {
+                    frame.redraw_timer = None;
+                }
+                if let Some(output) = state.output_for_crtc(id.device_id, id.crtc) {
+                    state.backend_data.schedule_render(&output);
+                }
+                TimeoutAction::Drop
+            });
+        if let Ok(token) = token {
+            frame.redraw_timer = Some(token);
+        }
     }
 }
 
 /// Take over the session, open the primary GPU, light up its first connected
 /// connector, and run the event loop to completion.
+impl UdevData {
+    fn cancel_queued_frames(&mut self) {
+        for device in self.devices.values_mut() {
+            for surface in device.surfaces.values_mut() {
+                if let Err(err) = surface.drm_output.with_compositor(|c| c.clear()) {
+                    warn!("Cancelling queued frame failed: {err}");
+                }
+            }
+        }
+    }
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<'static, State<UdevData>> = EventLoop::try_new()?;
     let display: Display<State<UdevData>> = Display::new()?;
@@ -229,7 +312,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         pointer_image: crate::cursor::Cursor::load(),
         pointer_images: Vec::new(),
         pointer_element: PointerElement::default(),
-        pending_render: HashSet::new(),
+        output_frames: HashMap::new(),
+        paused: false,
     };
 
     let mut state = State::new(&mut event_loop, display, udev_data);
@@ -315,12 +399,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .insert_source(notifier, move |event, &mut (), state| match event {
             SessionEvent::PauseSession => {
                 info!("session paused");
+                state.backend_data.paused = true;
+                state.backend_data.cancel_queued_frames();
                 for device in state.backend_data.devices.values_mut() {
                     device.drm_output_manager.pause();
+                }
+                for frame in state.backend_data.output_frames.values_mut() {
+                    frame.state = OutputFrameState::default();
                 }
             }
             SessionEvent::ActivateSession => {
                 info!("session resumed");
+                state.backend_data.paused = false;
                 state.resume_drm_session();
             }
         })?;
@@ -599,12 +689,15 @@ impl State<UdevData> {
         );
 
         // Kick off the first render.
-        self.backend_data.loop_handle.insert_idle(move |state| {
-            state.render_surface(node, crtc);
-        });
+        self.backend_data.schedule_render(&output);
     }
 
     fn connector_disconnected(&mut self, node: DrmNode, crtc: crtc::Handle) {
+        if let Some(frame) = self.backend_data.output_frames.remove(&(node, crtc))
+            && let Some(token) = frame.redraw_timer
+        {
+            self.backend_data.loop_handle.remove(token);
+        }
         let Some(device) = self.backend_data.devices.get_mut(&node) else {
             return;
         };
@@ -655,10 +748,19 @@ impl State<UdevData> {
         if self.session.output_power.is_off(&output) {
             return;
         }
+        if self.backend_data.paused {
+            return;
+        }
+
+        let Some(refresh) = output_refresh(&output) else {
+            return;
+        };
 
         let visible = self.visible_surfaces(&output);
 
         let mut queued = false;
+        let mut render_failed = false;
+        let mut scanout_states: Option<RenderElementStates> = None;
         {
             let Some(renderer) = self.backend_data.renderer.as_mut() else {
                 return;
@@ -699,57 +801,25 @@ impl State<UdevData> {
                         };
                     let cursor_pos = pointer_location - output_geometry.loc.to_f64();
 
-                    // Pick the current animation frame, importing it as a
-                    // render buffer once (cached in `pointer_images`).
-                    //
-                    // Load the cursor at the output's scale so the named cursor
-                    // renders at the correct physical size (and sharp) on scaled
-                    // outputs, matching client-provided (surface) cursors.
                     let cursor_scale =
                         output.current_scale().fractional_scale().round().max(1.0) as u32;
                     let frame = self
                         .backend_data
                         .pointer_image
                         .get_image(cursor_scale, self.clock.now().into());
-                    let pointer_images = &mut self.backend_data.pointer_images;
-                    let pointer_image = pointer_images
-                        .iter()
-                        .find_map(|(image, texture)| {
-                            if image == &frame {
-                                Some(texture.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            let buffer = MemoryRenderBuffer::from_slice(
-                                &frame.pixels_rgba,
-                                Fourcc::Argb8888,
-                                (frame.width as i32, frame.height as i32),
-                                cursor_scale as i32,
-                                Transform::Normal,
-                                None,
-                            );
-                            pointer_images.push((frame, buffer.clone()));
-                            buffer
-                        });
-
+                    let pointer_image = cached_pointer_buffer(
+                        &mut self.backend_data.pointer_images,
+                        frame,
+                        cursor_scale as i32,
+                    );
                     self.backend_data.pointer_element.set_buffer(pointer_image);
-
-                    // Reset to the default named shape if the
-                    // client-provided cursor surface went away.
+                    if matches!(&self.cursor_status, CursorImageStatus::Surface(s) if !s.is_alive())
                     {
-                        let mut reset = false;
-                        if let CursorImageStatus::Surface(ref surface) = self.cursor_status {
-                            reset = !surface.is_alive();
-                        }
-                        if reset {
-                            self.cursor_status = CursorImageStatus::default_named();
-                        }
-                        self.backend_data
-                            .pointer_element
-                            .set_status(self.cursor_status.clone());
+                        self.cursor_status = CursorImageStatus::default_named();
                     }
+                    self.backend_data
+                        .pointer_element
+                        .set_status(self.cursor_status.clone());
 
                     custom_elements.extend(
                         self.backend_data.pointer_element.render_elements(
@@ -809,6 +879,7 @@ impl State<UdevData> {
                 Ok(_) => None,
                 Err(err) => {
                     warn!("Rendering failed: {err}");
+                    render_failed = true;
                     None
                 }
             };
@@ -817,31 +888,61 @@ impl State<UdevData> {
                 match surface.drm_output.queue_frame(()) {
                     Ok(()) => {
                         queued = true;
-                        self.update_surface_scanout(&output, &states);
+                        scanout_states = Some(states);
                     }
                     Err(err) => {
                         warn!("Failed to queue frame: {err}");
+                        render_failed = true;
                     }
                 }
             }
         }
 
-        if !queued {
-            // No pageflip; still deliver frame callbacks for the commit that woke us.
-            self.send_frame_callbacks(&output);
-            self.confirm_pending_lock();
-            // Keep repainting so surface removals get re-rendered.
-            self.schedule_repaint(&output);
+        if queued {
+            let states = scanout_states.unwrap();
+            self.update_surface_scanout(&output, &states);
+            // The frame is on the CRTC; damage arriving before its vblank re-renders.
+            if let Some(frame) = self.backend_data.output_frames.get_mut(&(node, crtc)) {
+                frame.state = OutputFrameState::AwaitingVblank {
+                    damage_pending: false,
+                };
+            }
+        } else if render_failed {
+            // Retry a failed render at the next refresh.
+            self.backend_data.schedule_render_after(&output, refresh);
+        } else {
+            // Nothing to present. Deliver frame callbacks at most once per
+            // refresh so a client cannot redraw faster than the output.
+            let now = self.clock.now();
+            let deadline = self
+                .backend_data
+                .output_frames
+                .get(&(node, crtc))
+                .and_then(|frame| frame.last_callback)
+                .map(|last| last + refresh);
+            match deadline {
+                Some(deadline) if now < deadline => {
+                    self.backend_data.schedule_render_after(
+                        &output,
+                        Duration::from(deadline) - Duration::from(now),
+                    );
+                }
+                _ => {
+                    if let Some(frame) = self.backend_data.output_frames.get_mut(&(node, crtc)) {
+                        frame.last_callback = Some(now);
+                    }
+                    self.send_frame_callbacks(&output, Duration::from(now));
+                }
+            }
         }
     }
 
-    /// Vblank handler: the queued frame scanned out. Retire it, notify clients,
-    /// and schedule the next repaint.
+    /// Vblank: retire the frame, notify clients, re-render if damage landed meanwhile.
     fn frame_finish(
         &mut self,
         node: DrmNode,
         crtc: crtc::Handle,
-        _meta: &mut Option<DrmEventMetadata>,
+        meta: &mut Option<DrmEventMetadata>,
     ) {
         {
             let Some(device) = self.backend_data.devices.get_mut(&node) else {
@@ -855,46 +956,34 @@ impl State<UdevData> {
             }
         }
 
-        if let Some(output) = self.output_for_crtc(node, crtc) {
-            self.send_frame_callbacks(&output);
-            self.confirm_pending_lock();
-            self.schedule_repaint(&output);
-        }
-    }
+        // Anchor the callback pacing clock on the real vblank time, if reported.
+        let now = self.clock.now();
+        let vblank = meta.as_ref().and_then(|meta| match meta.time {
+            DrmEventTime::Monotonic(time) if !time.is_zero() => Some(Time::from(time)),
+            _ => None,
+        });
+        let render_again = self
+            .backend_data
+            .output_frames
+            .get_mut(&(node, crtc))
+            .is_some_and(|frame| {
+                frame.last_callback = Some(vblank.unwrap_or(now));
+                let damage = matches!(
+                    frame.state,
+                    OutputFrameState::AwaitingVblank {
+                        damage_pending: true
+                    }
+                );
+                frame.state = OutputFrameState::Idle;
+                damage
+            });
 
-    /// Schedule the next repaint after a short delay: frame-callback-driven
-    /// clients repaint during it, and late changes (e.g. surface removal) are
-    /// picked up instead of leaving a stale frame on the CRTC.
-    fn schedule_repaint(&mut self, output: &Output) {
-        let Some(id) = output.user_data().get::<UdevOutputId>().copied() else {
-            return;
-        };
-        if !self
-            .backend_data
-            .pending_render
-            .insert((id.device_id, id.crtc))
-        {
-            return;
-        }
-        let frame_duration = output
-            .current_mode()
-            .map(|mode| Duration::from_secs_f64(1_000f64 / mode.refresh as f64))
-            .unwrap_or(Duration::from_millis(16));
-        let repaint_delay = Duration::from_secs_f64(frame_duration.as_secs_f64() * 0.6);
-        if self
-            .backend_data
-            .loop_handle
-            .insert_source(Timer::from_duration(repaint_delay), move |_, _, state| {
-                state
-                    .backend_data
-                    .pending_render
-                    .remove(&(id.device_id, id.crtc));
-                state.render_surface(id.device_id, id.crtc);
-                TimeoutAction::Drop
-            })
-            .is_err()
-        {
-            warn!("failed to schedule repaint");
+
+        if let Some(output) = self.output_for_crtc(node, crtc) {
+            self.send_frame_callbacks(&output, Duration::from(vblank.unwrap_or(now)));
+            if render_again {
+                self.render_surface(node, crtc);
+            }
         }
     }
 

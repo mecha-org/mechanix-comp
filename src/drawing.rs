@@ -1,6 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use smithay::{
+    backend::allocator::Fourcc,
     backend::renderer::{
         Color32F, ImportAll, ImportMem, Renderer, Texture,
         element::{
@@ -11,7 +12,7 @@ use smithay::{
     },
     input::pointer::CursorImageStatus,
     render_elements,
-    utils::{Physical, Point, Scale},
+    utils::{Physical, Point, Scale, Transform},
 };
 
 pub static CLEAR_COLOR: Color32F = Color32F::new(0.8, 0.8, 0.9, 1.0);
@@ -39,6 +40,27 @@ impl PointerElement {
     pub fn set_buffer(&mut self, buffer: MemoryRenderBuffer) {
         self.buffer = Some(buffer);
     }
+}
+
+/// Cached render buffer for `frame` at `scale`, importing it if absent.
+pub fn cached_pointer_buffer(
+    cache: &mut Vec<(xcursor::parser::Image, MemoryRenderBuffer)>,
+    frame: xcursor::parser::Image,
+    scale: i32,
+) -> MemoryRenderBuffer {
+    if let Some((_, buffer)) = cache.iter().find(|(image, _)| image == &frame) {
+        return buffer.clone();
+    }
+    let buffer = MemoryRenderBuffer::from_slice(
+        &frame.pixels_rgba,
+        Fourcc::Argb8888,
+        (frame.width as i32, frame.height as i32),
+        scale,
+        Transform::Normal,
+        None,
+    );
+    cache.push((frame, buffer.clone()));
+    buffer
 }
 
 render_elements! {

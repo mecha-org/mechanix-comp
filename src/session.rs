@@ -11,7 +11,7 @@ use smithay::wayland::idle_notify::IdleNotifierState;
 use smithay::wayland::input_method::InputMethodManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
-use smithay::wayland::session_lock::{SessionLockManagerState, SessionLocker};
+use smithay::wayland::session_lock::SessionLockManagerState;
 use smithay::wayland::shell::xdg::dialog::XdgDialogState;
 use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
@@ -36,7 +36,6 @@ pub struct Session<B: Backend + 'static> {
     pub data_control_state: DataControlState,
     pub output_power: OutputPowerManagerState,
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
-    pub pending_lock: Option<SessionLocker>,
 }
 
 impl<B: Backend + 'static> Session<B> {
@@ -60,7 +59,6 @@ impl<B: Backend + 'static> Session<B> {
             data_control_state: DataControlState::new::<S<B>, _>(dh, None, |_| true),
             output_power: OutputPowerManagerState::new::<S<B>>(dh),
             idle_inhibiting_surfaces: HashSet::new(),
-            pending_lock: None,
         }
     }
 }

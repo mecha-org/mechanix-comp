@@ -52,8 +52,8 @@ use crate::state::State;
 // things simple and is universally supported.
 const SUPPORTED_FORMATS: &[Fourcc] = &[Fourcc::Argb8888, Fourcc::Xrgb8888];
 
-/// Concrete `DrmOutput` type: GBM allocator + framebuffer exporter, no per-frame
-/// user data (`()`), backed by a `DrmDeviceFd`.
+/// Concrete `DrmOutput` type: GBM allocator + framebuffer exporter, presentation
+/// feedback as per-frame user data, backed by a `DrmDeviceFd`.
 type GbmDrmOutput = DrmOutput<
     GbmAllocator<DrmDeviceFd>,
     GbmFramebufferExporter<DrmDeviceFd>,
@@ -728,6 +728,7 @@ impl State<UdevData> {
             self.release_fifo_barriers(&output);
             self.session.output_power.output_removed(&output);
             self.space.unmap_output(&output);
+            self.maybe_send_locked();
         }
     }
 
@@ -774,6 +775,7 @@ impl State<UdevData> {
         };
 
         let visible = self.visible_surfaces(&output);
+        let locked = self.is_locked();
 
         let mut queued = false;
         let mut render_failed = false;
@@ -878,7 +880,7 @@ impl State<UdevData> {
                     renderer,
                     &self.space,
                     &output,
-                    self.is_locked,
+                    locked,
                     &self.lock_surfaces,
                     &self.toplevels,
                     &visible,
@@ -926,6 +928,7 @@ impl State<UdevData> {
         }
 
         if queued {
+            self.lock_frame_queued(&output);
             // The frame is on the CRTC; damage arriving before its vblank re-renders.
             if let Some(frame) = self.backend_data.repaints.get_mut(&(node, crtc)) {
                 frame.state = RepaintState::AwaitingVblank {
@@ -1019,6 +1022,8 @@ impl State<UdevData> {
 
 
         if let Some(output) = self.output_for_crtc(node, crtc) {
+            self.lock_frame_presented(&output);
+            // Ack with the vblank time so client frame-callback clocks match it.
             self.send_frame_callbacks(&output, Duration::from(vblank.unwrap_or(now)));
             self.send_presentation_feedback(&output, submitted, vblank, now, seq);
             // Render before releasing FIFO waiters so a resumed commit only marks damage.

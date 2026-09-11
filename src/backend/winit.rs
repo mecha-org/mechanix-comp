@@ -156,7 +156,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 layer_map_for_output(&output).arrange();
                 state.apply_layout(&output);
 
-                if state.is_locked {
+                if state.is_locked() {
                     let logical_size = state.space.output_geometry(&output).map(|geo| geo.size);
                     for surface in &state.lock_surfaces {
                         surface.with_pending_state(|pending| {
@@ -190,6 +190,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let visible = state.visible_surfaces(&output);
+                let locked = state.is_locked();
                 let result = {
                     let (renderer, mut framebuffer) = state.backend_data.backend.bind().unwrap();
                     let scale =
@@ -268,7 +269,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         renderer,
                         &state.space,
                         &output,
-                        state.is_locked,
+                        locked,
                         &state.lock_surfaces,
                         &state.toplevels,
                         &visible,
@@ -283,6 +284,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
 
                 state.send_frame_callbacks(&output, Duration::from(state.clock.now()));
+                state.lock_frame_queued(&output);
+                state.lock_frame_presented(&output);
                 state.release_fifo_barriers(&output);
                 state.send_presentation_feedback(&output, feedback, None, state.clock.now(), 0);
             }

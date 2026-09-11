@@ -32,7 +32,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let output = self.space.outputs().next()?;
         let output_geo = self.space.output_geometry(output)?;
 
-        if self.is_locked {
+        if self.is_locked() {
             // Find if the pos is within any lock surface.
             for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
                 let surface = lock_surface.wl_surface();
@@ -320,7 +320,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         pos: Point<f64, Logical>,
         serial: smithay::utils::Serial,
     ) {
-        if self.is_locked {
+        if self.is_locked() {
             if let Some((surface, _)) = self.surface_under(pos) {
                 self.seat
                     .get_keyboard()

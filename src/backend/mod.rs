@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use smithay::backend::drm::DrmNode;
+use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -41,6 +43,13 @@ pub fn guess_default_scale(size_mm: Option<(u32, u32)>, mode: Size<i32, Physical
 /// Snap to the fractional-scale protocol's representable values (N/120).
 pub fn snap_scale(scale: f64) -> f64 {
     (scale * 120.0).round() / 120.0
+}
+
+/// The render node EGL actually opened (kmsro: not the display GPU's node).
+pub fn egl_render_node(display: &EGLDisplay) -> Option<DrmNode> {
+    EGLDevice::device_for_display(display)
+        .ok()
+        .and_then(|device| device.try_get_render_node().ok().flatten())
 }
 
 /// Output refresh interval from the current mode, if known.

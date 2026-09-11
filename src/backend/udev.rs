@@ -26,8 +26,8 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
-use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
+use smithay::desktop::utils::OutputPresentationFeedback;
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
@@ -779,6 +779,7 @@ impl State<UdevData> {
 
         let mut queued = false;
         let mut render_failed = false;
+        let mut cursor_animated = false;
         let mut scanout_states: Option<RenderElementStates> = None;
         {
             let Some(renderer) = self.backend_data.renderer.as_mut() else {
@@ -839,6 +840,8 @@ impl State<UdevData> {
                     self.backend_data
                         .pointer_element
                         .set_status(self.cursor_status.clone());
+                    cursor_animated = matches!(self.cursor_status, CursorImageStatus::Named(_))
+                        && self.backend_data.pointer_image.is_animated(cursor_scale);
 
                     custom_elements.extend(
                         self.backend_data.pointer_element.render_elements(
@@ -963,6 +966,10 @@ impl State<UdevData> {
                 }
             }
         }
+
+        if cursor_animated && !self.is_locked() {
+            self.backend_data.schedule_render_after(&output, refresh);
+        }
     }
 
     /// Vblank: retire the frame, notify clients, re-render if damage landed meanwhile.
@@ -996,7 +1003,6 @@ impl State<UdevData> {
             return;
         };
 
-        // Anchor the callback pacing clock on the real vblank time, if reported.
         let now = self.clock.now();
         let vblank = meta.as_ref().and_then(|meta| match meta.time {
             DrmEventTime::Monotonic(time) if !time.is_zero() => Some(Time::from(time)),

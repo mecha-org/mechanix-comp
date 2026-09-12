@@ -8,7 +8,7 @@ use smithay::wayland::xdg_activation::{
 
 impl<BackendData: Backend + 'static> XdgActivationHandler for State<BackendData> {
     fn activation_state(&mut self) -> &mut XdgActivationState {
-        &mut self.xdg_activation_state
+        &mut self.session.xdg_activation_state
     }
 
     fn request_activation(

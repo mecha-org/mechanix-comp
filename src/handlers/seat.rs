@@ -1,18 +1,26 @@
 use crate::backend::Backend;
 use crate::state::State;
-use smithay::desktop::{PopupKind, PopupManager};
 use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::tablet::TabletSeatHandler;
 use smithay::input::{Seat, SeatHandler, SeatState};
-use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Point, Rectangle};
-use smithay::wayland::input_method::{InputMethodHandler, PopupSurface};
+use smithay::utils::{Logical, Point};
 use smithay::wayland::pointer_constraints::{
     ConstraintRemove, PointerConstraint, PointerConstraintsHandler, with_pointer_constraint,
 };
 use smithay::wayland::seat::WaylandFocus;
+
+#[cfg(feature = "session")]
+use smithay::desktop::{PopupKind, PopupManager};
+#[cfg(feature = "session")]
+use smithay::reexports::wayland_server::Resource;
+#[cfg(feature = "session")]
+use smithay::utils::Rectangle;
+#[cfg(feature = "session")]
+use smithay::wayland::input_method::{InputMethodHandler, PopupSurface};
+#[cfg(feature = "session")]
 use smithay::wayland::selection::data_device::set_data_device_focus;
+#[cfg(feature = "session")]
 use tracing::warn;
 
 impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
@@ -28,14 +36,18 @@ impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
         self.cursor_status = image;
     }
 
+    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        let dh = &self.display_handle;
-        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
-        set_data_device_focus(dh, seat, client);
+        #[cfg(feature = "session")]
+        set_data_device_focus(
+            &self.display_handle,
+            seat,
+            focused.and_then(|s| self.display_handle.get_client(s.id()).ok()),
+        );
     }
 }
 
-impl<BackendData: Backend> PointerConstraintsHandler for State<BackendData> {
+impl<BackendData: Backend + 'static> PointerConstraintsHandler for State<BackendData> {
     fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
         // XXX region
         let Some(current_focus) = pointer.current_focus() else {
@@ -104,7 +116,8 @@ impl<BackendData: Backend> PointerConstraintsHandler for State<BackendData> {
     }
 }
 
-impl<BackendData: Backend> InputMethodHandler for State<BackendData> {
+#[cfg(feature = "session")]
+impl<BackendData: Backend + 'static> InputMethodHandler for State<BackendData> {
     fn new_popup(&mut self, surface: PopupSurface) {
         if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {
             warn!("Failed to track popup: {}", err);
@@ -129,6 +142,6 @@ impl<BackendData: Backend> InputMethodHandler for State<BackendData> {
     }
 }
 
-impl<BackendData: Backend> TabletSeatHandler for State<BackendData> {
+impl<BackendData: Backend + 'static> TabletSeatHandler for State<BackendData> {
     type ToolFocus = WlSurface;
 }

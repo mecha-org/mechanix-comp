@@ -291,6 +291,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
 
                 state.send_frame_callbacks(&output);
+                state.confirm_pending_lock();
 
                 state.backend_data.backend.window().request_redraw();
             }
@@ -306,13 +307,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     event_loop.run(None, &mut state, move |state| {
-        // Per-frame upkeep: refresh the space, clean up dead popups/toplevels,
-        // re-derive keyboard focus, and flush client events.
-        state.space.refresh();
-        state.popups.cleanup();
-        state.cleanup_toplevels();
-        state.update_keyboard_focus();
+        state.refresh_space();
         state.foreign_toplevel_refresh();
+        state.update_idle_inhibit();
         let _ = state.display_handle.flush_clients();
     })?;
 

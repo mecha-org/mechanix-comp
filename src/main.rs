@@ -1,11 +1,4 @@
-mod backend;
-mod cursor;
-mod drawing;
-mod handlers;
-mod input;
-mod layout;
-mod render;
-mod state;
+use compositor::backend;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Backend selection: an explicit `MECHA_BACKEND` wins; otherwise we assume
@@ -16,9 +9,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("udev") => false,
         Some(other) => {
             eprintln!("unknown MECHA_BACKEND={other:?}, falling back to auto-detection");
-            nested_session_present()
+            parent_display_present()
         }
-        None => nested_session_present(),
+        None => parent_display_present(),
     };
 
     if use_winit {
@@ -28,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// True when we appear to be running inside another Wayland or X11 session.
-fn nested_session_present() -> bool {
+/// True when a parent Wayland or X11 display is already running.
+fn parent_display_present() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
 }

@@ -427,9 +427,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             snapshots.sort_by_key(|snap| (snap.surface == focused) as u8);
         }
 
-        self.foreign_toplevel.apply::<State<BackendData>>(
+        self.session.foreign_toplevel.apply::<State<BackendData>>(
             &self.display_handle,
-            &mut self.foreign_toplevel_list,
+            &mut self.session.foreign_toplevel_list,
             snapshots,
         );
     }
@@ -456,7 +456,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
 impl<BackendData: Backend + 'static> ForeignToplevelListHandler for State<BackendData> {
     fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
-        &mut self.foreign_toplevel_list
+        &mut self.session.foreign_toplevel_list
     }
 }
 
@@ -475,7 +475,7 @@ impl<BackendData: Backend + 'static>
 
         // Handles need a `done` per surface; `send_wlr_parent` sends it.
         let mut new_surfaces = Vec::new();
-        for (surface, data) in state.foreign_toplevel.toplevels.iter_mut() {
+        for (surface, data) in state.session.foreign_toplevel.toplevels.iter_mut() {
             if data
                 .add_wlr_instance::<State<BackendData>>(dh, client, &manager)
                 .is_some()
@@ -484,10 +484,11 @@ impl<BackendData: Backend + 'static>
             }
         }
         for surface in new_surfaces {
-            state.foreign_toplevel.send_wlr_parent(&surface);
+            state.session.foreign_toplevel.send_wlr_parent(&surface);
         }
 
         state
+            .session
             .foreign_toplevel
             .wlr_management_instances
             .insert(manager);
@@ -510,6 +511,7 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrForeignToplevelManagerV1, Sta
             zwlr_foreign_toplevel_manager_v1::Request::Stop => {
                 resource.finished();
                 state
+                    .session
                     .foreign_toplevel
                     .wlr_management_instances
                     .remove(resource);
@@ -525,6 +527,7 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrForeignToplevelManagerV1, Sta
         resource: &ZwlrForeignToplevelManagerV1,
     ) {
         state
+            .session
             .foreign_toplevel
             .wlr_management_instances
             .remove(resource);
@@ -543,7 +546,10 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrForeignToplevelHandleV1, Stat
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, State<BackendData>>,
     ) {
-        let surface = state.foreign_toplevel.surface_for_wlr_handle(resource);
+        let surface = state
+            .session
+            .foreign_toplevel
+            .surface_for_wlr_handle(resource);
         let Some(surface) = surface else {
             return;
         };
@@ -575,6 +581,6 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrForeignToplevelHandleV1, Stat
         _client: ClientId,
         resource: &ZwlrForeignToplevelHandleV1,
     ) {
-        state.foreign_toplevel.remove_wlr_instance(resource);
+        state.session.foreign_toplevel.remove_wlr_instance(resource);
     }
 }

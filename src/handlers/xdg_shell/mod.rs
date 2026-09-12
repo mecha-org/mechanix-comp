@@ -25,9 +25,10 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
 
-        // `set_parent` hasn't arrived yet, so only set bounds here; the first
-        // commit decides sizing/mapping in `handle_commit`.
+        #[cfg(feature = "session")]
         if let Some(output) = self.space.outputs().next().cloned() {
+            // `set_parent` hasn't arrived yet, so only set bounds here; the first
+            // commit decides sizing/mapping in `handle_commit`.
             let zone = layer_map_for_output(&output).non_exclusive_zone();
             surface.with_pending_state(|state| {
                 state.bounds = Some(zone.size);
@@ -64,12 +65,15 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         }
     }
 
+    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
     fn parent_changed(&mut self, surface: ToplevelSurface) {
-        let mapped = self
+        #[cfg(feature = "session")]
+        if self
             .toplevels
             .get(surface.wl_surface())
-            .is_some_and(|ws| ws.mapped);
-        if mapped && let Some(output) = self.primary_output() {
+            .is_some_and(|ws| ws.mapped)
+            && let Some(output) = self.primary_output()
+        {
             self.apply_layout(&output);
         }
     }
@@ -144,6 +148,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
+        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -163,6 +168,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
+        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -217,6 +223,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
             return;
         }
         self.toplevels.get_mut(surface.wl_surface()).unwrap().mode = WindowMode::Maximized;
+        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -237,6 +244,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.active_window = Some(focused_surface.clone());
         self.layer_shell_on_demand_focus = None;
 
+        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -288,7 +296,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Map a toplevel on its first commit.
+    /// Map a toplevel on its first commit and insert it into Comet.
+    #[cfg(feature = "session")]
     fn handle_toplevel_first_commit(&mut self, surface: &WlSurface, window: &Window) {
         let toplevel = window.toplevel().unwrap();
         let output = self.space.outputs().next().cloned();
@@ -385,19 +394,20 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     state: &mut State<BackendData>,
     surface: &WlSurface,
 ) -> bool {
-    let Some((window, mapped)) = state
-        .toplevels
-        .get(surface)
-        .map(|ws| (ws.window.clone(), ws.mapped))
-    else {
+    let Some(ws) = state.toplevels.get(surface) else {
         return false;
     };
+    let mapped = ws.mapped;
 
     if !mapped {
+        #[cfg(feature = "session")]
+        let window = ws.window.clone();
+        #[cfg(feature = "session")]
         state.handle_toplevel_first_commit(surface, &window);
         return true;
     }
 
+    #[cfg(feature = "session")]
     if let Some(output) = state.primary_output() {
         state.apply_layout(&output);
     }

@@ -9,7 +9,7 @@ use smithay::wayland::session_lock::{
 
 impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
     fn lock_state(&mut self) -> &mut SessionLockManagerState {
-        &mut self.session_lock_state
+        &mut self.session.session_lock_state
     }
 
     fn lock(&mut self, confirmation: SessionLocker) {
@@ -25,7 +25,7 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
         // Defer sending the `locked` event until the render loop has submitted
         // a locked frame to the screen (protocol requirement: the locked event
         // must not be sent before a cleared / lock-surface frame is visible).
-        self.pending_lock = Some(confirmation);
+        self.session.pending_lock = Some(confirmation);
     }
 
     fn unlock(&mut self) {

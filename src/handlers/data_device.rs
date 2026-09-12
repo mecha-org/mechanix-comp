@@ -59,6 +59,6 @@ impl<BackendData: Backend + 'static> WaylandDndGrabHandler for State<BackendData
 
 impl<BackendData: Backend + 'static> DataDeviceHandler for State<BackendData> {
     fn data_device_state(&mut self) -> &mut DataDeviceState {
-        &mut self.data_device_state
+        &mut self.session.data_device_state
     }
 }

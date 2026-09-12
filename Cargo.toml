@@ -6,6 +6,12 @@ edition = "2024"
 [workspace]
 members = ["."]
 
+[features]
+default = ["session"]
+# Clipboard, lock, foreign-toplevel, IME, vkbd, idle, output-power, activation,
+# and the udev/winit output backends.
+session = []
+
 [dependencies.smithay]
 git = "https://github.com/mecha-org/smithay"
 rev = "60aafc2b1a64395bd32ec93f41e6712a07544c34"

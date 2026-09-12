@@ -378,7 +378,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         // timers so `swayidle`-style clients don't go idle while the user is
         // using the compositor. The notifier itself keeps inhibited seats
         // (zwp-idle-inhibit-v1) from idling.
-        self.idle_notifier_state.notify_activity(&self.seat);
+        self.session.idle_notifier_state.notify_activity(&self.seat);
         match event {
             InputEvent::Keyboard { event, .. } => match self.keyboard_key_to_action::<I>(event) {
                 // TODO Separate for different backends e.g. VtSwitch

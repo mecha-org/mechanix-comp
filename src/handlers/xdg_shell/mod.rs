@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use crate::backend::Backend;
 use crate::layout::is_dialog;
 use crate::state::{State, WindowMode, WindowState};
+use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::desktop::{
     PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window, WindowSurfaceType,
     find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
@@ -297,10 +298,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Map a toplevel on its first commit and insert it into Comet.
+    /// Map a toplevel into Comet and focus it.
     #[cfg(feature = "session")]
-    fn handle_toplevel_first_commit(&mut self, surface: &WlSurface, window: &Window) {
-        let toplevel = window.toplevel().unwrap();
+    fn map_toplevel(&mut self, surface: &WlSurface, window: &Window) {
         let output = self.space.outputs().next().cloned();
         let loc = output
             .as_ref()
@@ -321,9 +321,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         } else if let Some(output) = &output {
             self.apply_layout(output);
         }
-        if !toplevel.is_initial_configure_sent() {
-            toplevel.send_configure();
+    }
+
+    /// Unmap a toplevel whose buffer went away and move focus to the next window.
+    #[cfg(feature = "session")]
+    fn unmap_toplevel(&mut self, surface: &WlSurface, window: &Window) {
+        self.toplevels.get_mut(surface).unwrap().mapped = false;
+        for layout in self.layouts.values_mut() {
+            layout.remove(surface);
         }
+        self.space.unmap_elem(window);
+        self.focus_topmost();
+        self.schedule_render();
     }
 
     fn unconstrain_popup(&self, popup: &PopupSurface) {
@@ -390,27 +399,34 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 }
 
-/// Toplevel commit handler: first-commit map, keeps dialogs centered. Returns true for toplevels (skip popup path).
+/// Maps a toplevel when it attaches a buffer and unmaps it when the buffer goes away.
+/// Returns true for toplevels (so the caller skips the popup path).
 pub fn handle_commit<BackendData: Backend + 'static>(
     state: &mut State<BackendData>,
     surface: &WlSurface,
 ) -> bool {
-    let Some(ws) = state.toplevels.get(surface) else {
+    if !state.toplevels.contains_key(surface) {
         return false;
-    };
-    let mapped = ws.mapped;
-
-    if !mapped {
-        #[cfg(feature = "session")]
-        let window = ws.window.clone();
-        #[cfg(feature = "session")]
-        state.handle_toplevel_first_commit(surface, &window);
-        return true;
     }
-
     #[cfg(feature = "session")]
-    if let Some(output) = state.primary_output() {
-        state.apply_layout(&output);
+    {
+        let ws = &state.toplevels[surface];
+        let window = ws.window.clone();
+        let mapped = ws.mapped;
+        let buffered = with_renderer_surface_state(surface, |states| states.buffer().is_some())
+            .unwrap_or(false);
+
+        match (buffered, mapped) {
+            (true, false) => state.map_toplevel(surface, &window),
+            (false, true) => state.unmap_toplevel(surface, &window),
+            // Unmapped and bufferless: the client is (re)initializing, configure it.
+            (false, false) => {
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.send_configure();
+                }
+            }
+            (true, true) => {}
+        }
     }
     true
 }

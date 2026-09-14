@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::compositor::FrameFlags;
 use smithay::backend::drm::exporter::gbm::{GbmFramebufferExporter, NodeFilter};
@@ -18,6 +19,7 @@ use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::RenderElementStates;
+use smithay::backend::renderer::element::utils::select_dmabuf_feedback;
 use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
@@ -27,7 +29,10 @@ use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
-use smithay::desktop::utils::OutputPresentationFeedback;
+use smithay::desktop::layer_map_for_output;
+use smithay::desktop::utils::{
+    OutputPresentationFeedback, send_dmabuf_feedback_surface_tree, surface_primary_scanout_output,
+};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{EventLoop, LoopHandle, RegistrationToken};
@@ -35,11 +40,14 @@ use smithay::reexports::drm::control::{Device as ControlDevice, ModeTypeFlags, c
 use smithay::reexports::input::AccelProfile;
 use smithay::reexports::input::{DeviceCapability, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
+use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::backend::GlobalId;
 use smithay::utils::{DeviceFd, IsAlive, Monotonic, Time};
-use smithay::wayland::compositor::with_states;
+use smithay::wayland::compositor::{SurfaceData, with_states};
+use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder};
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use tracing::{error, info, warn};
 
@@ -134,6 +142,16 @@ pub struct UdevData {
     wakeups: Wakeups<UdevData>,
     /// True while the session is paused; rendering is skipped.
     paused: bool,
+    /// Render-device dmabuf feedback, for per-surface selection.
+    render_dmabuf: Option<RenderDmabuf>,
+    /// Per-CRTC scanout feedback, keyed by (device, CRTC).
+    scanout_feedbacks: HashMap<(DrmNode, crtc::Handle), DmabufFeedback>,
+}
+
+struct RenderDmabuf {
+    device: DrmNode,
+    formats: FormatSet,
+    feedback: DmabufFeedback,
 }
 
 impl Backend for UdevData {
@@ -165,6 +183,11 @@ impl Backend for UdevData {
 
     fn output_power_supported(&self, output: &Output) -> bool {
         output.user_data().get::<OutputKey>().is_some()
+    }
+
+    fn scanout_dmabuf_feedback(&self, output: &Output) -> Option<DmabufFeedback> {
+        let id = output.user_data().get::<OutputKey>()?;
+        self.scanout_feedbacks.get(&(id.node, id.crtc)).cloned()
     }
 
     fn set_output_dpms(&mut self, output: &Output, on: bool) -> bool {
@@ -310,6 +333,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         repaints: HashMap::new(),
         wakeups: Wakeups::new(loop_handle.clone()),
         paused: false,
+        render_dmabuf: None,
+        scanout_feedbacks: HashMap::new(),
     };
 
     let mut state = State::new(&mut event_loop, display, udev_data);
@@ -519,17 +544,12 @@ impl State<UdevData> {
 
                 let render_node = super::egl_render_node(&egl_display)
                     .or_else(|| node.node_with_type(NodeType::Render).and_then(|r| r.ok()));
+                let dmabuf_device = render_node.unwrap_or(node);
 
-                let main_device_id = render_node
-                    .map(|n| n.dev_id())
-                    .unwrap_or_else(|| node.dev_id());
-
-                let default_feedback = smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
-                    main_device_id,
-                    dmabuf_formats,
-                )
-                .build()
-                .unwrap();
+                let default_feedback =
+                    DmabufFeedbackBuilder::new(dmabuf_device.dev_id(), dmabuf_formats.clone())
+                        .build()
+                        .unwrap();
 
                 let global = self
                     .dmabuf_state
@@ -538,6 +558,11 @@ impl State<UdevData> {
                         &default_feedback,
                     );
                 self.dmabuf_global = Some(global);
+                self.backend_data.render_dmabuf = Some(RenderDmabuf {
+                    device: dmabuf_device,
+                    formats: dmabuf_formats,
+                    feedback: default_feedback,
+                });
             }
             info!("Using {node} as the display device");
             self.backend_data.renderer = Some(renderer);
@@ -702,6 +727,36 @@ impl State<UdevData> {
             }
         };
 
+        if let Some(render) = &self.backend_data.render_dmabuf
+            && let Ok(planes) = device.drm_output_manager.device().planes(&crtc)
+        {
+            let plane_formats: FormatSet = planes
+                .primary
+                .iter()
+                .chain(planes.overlay.iter())
+                .flat_map(|plane| plane.formats.iter())
+                .copied()
+                .collect();
+            let scanout_formats: FormatSet = plane_formats
+                .intersection(&render.formats)
+                .copied()
+                .collect();
+            if let Ok(feedback) =
+                DmabufFeedbackBuilder::new(render.device.dev_id(), render.formats.clone())
+                    .add_preference_tranche(
+                        device.drm_output_manager.device().device_id(),
+                        TrancheFlags::Scanout,
+                        scanout_formats,
+                        4u32..=6,
+                    )
+                    .build()
+            {
+                self.backend_data
+                    .scanout_feedbacks
+                    .insert((node, crtc), feedback);
+            }
+        }
+
         device
             .surfaces
             .insert(crtc, CrtcOutput { global, drm_output });
@@ -716,6 +771,7 @@ impl State<UdevData> {
         {
             self.backend_data.loop_handle.remove(token);
         }
+        self.backend_data.scanout_feedbacks.remove(&(node, crtc));
         let Some(device) = self.backend_data.devices.get_mut(&node) else {
             return;
         };
@@ -913,6 +969,7 @@ impl State<UdevData> {
 
         if let Some(states) = scanout_states.take() {
             self.update_surface_scanout(&output, &states);
+            self.send_dmabuf_feedback(&output, &states);
             let feedback = self.take_presentation_feedback(&output, &states);
             let queue_result = self
                 .backend_data
@@ -1036,6 +1093,43 @@ impl State<UdevData> {
                 self.render_surface(node, crtc);
             }
             self.release_fifo_barriers(&output);
+        }
+    }
+
+    /// Send per-surface dmabuf feedback so clients allocate scanout-friendly buffers.
+    fn send_dmabuf_feedback(&self, output: &Output, states: &RenderElementStates) {
+        let Some(render) = &self.backend_data.render_dmabuf else {
+            return;
+        };
+        let Some(scanout) = output
+            .user_data()
+            .get::<OutputKey>()
+            .and_then(|id| self.backend_data.scanout_feedbacks.get(&(id.node, id.crtc)))
+        else {
+            return;
+        };
+        let select = |surface: &WlSurface, _: &SurfaceData| {
+            select_dmabuf_feedback(surface, states, &render.feedback, scanout)
+        };
+        for window in self.space.elements_for_output(output) {
+            window.send_dmabuf_feedback(output, surface_primary_scanout_output, select);
+        }
+        for layer in layer_map_for_output(output).layers() {
+            layer.send_dmabuf_feedback(output, surface_primary_scanout_output, select);
+        }
+        for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
+            if self
+                .lock_surface_outputs
+                .get(&lock_surface.wl_surface().id())
+                == Some(output)
+            {
+                send_dmabuf_feedback_surface_tree(
+                    lock_surface.wl_surface(),
+                    output,
+                    |_, _| Some(output.clone()),
+                    select,
+                );
+            }
         }
     }
 

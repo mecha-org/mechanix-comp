@@ -1,8 +1,12 @@
 use crate::backend::Backend;
-use crate::state::State;
+use crate::state::{State, WindowMode};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::ImportDma;
-use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::wayland::compositor::get_parent;
+use smithay::wayland::dmabuf::{
+    DmabufFeedback, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
+};
 
 impl<BackendData: Backend + 'static> DmabufHandler for State<BackendData> {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
@@ -24,5 +28,29 @@ impl<BackendData: Backend + 'static> DmabufHandler for State<BackendData> {
             }
             Err(_) => notifier.failed(),
         }
+    }
+
+    fn new_surface_feedback(
+        &mut self,
+        surface: &WlSurface,
+        _global: &DmabufGlobal,
+    ) -> Option<DmabufFeedback> {
+        // Fullscreen surfaces get scanout feedback before their first attempt.
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        let output = {
+            let state = self.toplevels.get(&root)?;
+            if state.mode != WindowMode::Fullscreen {
+                return None;
+            }
+            self.space
+                .outputs_for_element(&state.window)
+                .into_iter()
+                .next()
+                .or_else(|| self.space.outputs().next().cloned())?
+        };
+        self.backend_data.scanout_dmabuf_feedback(&output)
     }
 }

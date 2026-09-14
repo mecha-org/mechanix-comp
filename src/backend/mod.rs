@@ -7,6 +7,7 @@ use smithay::output::Output;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::utils::{Physical, Size, Transform};
+use smithay::wayland::dmabuf::DmabufFeedback;
 
 use crate::state::State;
 
@@ -84,6 +85,11 @@ pub trait Backend {
     fn reset_buffers(&mut self, output: &Output);
 
     fn change_vt(&mut self, _vt: i32) {} // no-op by default
+
+    /// Scanout dmabuf feedback for `output`, if this backend advertises one.
+    fn scanout_dmabuf_feedback(&self, _output: &Output) -> Option<DmabufFeedback> {
+        None
+    }
 
     /// Whether this output can be DPMS-blanked (`zwlr_output_power_v1`).
     fn output_power_supported(&self, _output: &Output) -> bool {

@@ -29,7 +29,6 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
 
         self.schedule_render();
         self.maybe_send_locked();
-
     }
 
     fn unlock(&mut self) {

@@ -1026,7 +1026,6 @@ impl State<UdevData> {
                 damage
             });
 
-
         if let Some(output) = self.output_for_crtc(node, crtc) {
             self.lock_frame_presented(&output);
             // Ack with the vblank time so client frame-callback clocks match it.

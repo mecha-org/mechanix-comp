@@ -105,13 +105,21 @@ impl LockPhase {
 }
 
 fn output_lock_frame(output: &Output) -> LockFrame {
-    output.user_data().insert_if_missing(Cell::<LockFrame>::default);
+    output
+        .user_data()
+        .insert_if_missing(Cell::<LockFrame>::default);
     output.user_data().get::<Cell<LockFrame>>().unwrap().get()
 }
 
 fn set_output_lock_frame(output: &Output, frame: LockFrame) {
-    output.user_data().insert_if_missing(Cell::<LockFrame>::default);
-    output.user_data().get::<Cell<LockFrame>>().unwrap().set(frame);
+    output
+        .user_data()
+        .insert_if_missing(Cell::<LockFrame>::default);
+    output
+        .user_data()
+        .get::<Cell<LockFrame>>()
+        .unwrap()
+        .set(frame);
 }
 
 pub struct State<BackendData: Backend + 'static> {
@@ -412,8 +420,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 }
             })
             .all(|output| output_lock_frame(output) == LockFrame::Presented);
-        if done && let LockPhase::Locking(locker) =
-            std::mem::replace(&mut self.lock_phase, LockPhase::Locked)
+        if done
+            && let LockPhase::Locking(locker) =
+                std::mem::replace(&mut self.lock_phase, LockPhase::Locked)
         {
             locker.lock();
         }

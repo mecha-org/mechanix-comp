@@ -73,6 +73,7 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
         if zone_before != layer_map_for_output(&output).non_exclusive_zone() {
             self.apply_layout(&output);
         }
+        self.schedule_render();
     }
 
     fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {

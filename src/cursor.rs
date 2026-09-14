@@ -46,6 +46,10 @@ impl Cursor {
         let size = self.size * scale;
         frame(time.as_millis() as u32, size, &self.icons)
     }
+
+    pub fn is_animated(&self, scale: u32) -> bool {
+        nearest_images(self.size * scale, &self.icons).count() > 1
+    }
 }
 
 fn nearest_images(size: u32, images: &[Image]) -> impl Iterator<Item = &Image> {

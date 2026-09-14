@@ -1,7 +1,15 @@
+use std::time::Duration;
+
+use smithay::backend::drm::DrmNode;
+use smithay::backend::egl::{EGLDevice, EGLDisplay};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::utils::{Physical, Size, Transform};
+use smithay::wayland::dmabuf::DmabufFeedback;
+
+use crate::state::State;
 
 #[cfg(feature = "session")]
 pub mod udev;
@@ -37,6 +45,21 @@ pub fn snap_scale(scale: f64) -> f64 {
     (scale * 120.0).round() / 120.0
 }
 
+/// The render node EGL actually opened (kmsro: not the display GPU's node).
+pub fn egl_render_node(display: &EGLDisplay) -> Option<DrmNode> {
+    EGLDevice::device_for_display(display)
+        .ok()
+        .and_then(|device| device.try_get_render_node().ok().flatten())
+}
+
+/// Output refresh interval from the current mode, if known.
+pub fn output_refresh(output: &Output) -> Option<Duration> {
+    output
+        .current_mode()
+        .filter(|mode| mode.refresh > 0)
+        .map(|mode| Duration::from_secs_f64(1000.0 / mode.refresh as f64))
+}
+
 /// The `MECHA_SCALE` override, if set.
 pub fn env_scale() -> Option<f64> {
     std::env::var("MECHA_SCALE")
@@ -61,13 +84,12 @@ pub trait Backend {
     /// session resume (VT switch back) where the previous framebuffers are stale.
     fn reset_buffers(&mut self, output: &Output);
 
-    /// Opportunity to pre-import a client buffer onto the render GPU before it is
-    /// sampled. A no-op with a single-GPU `GlesRenderer`.
-    fn early_import(&mut self, surface: &WlSurface) {
-        let _ = surface;
-    }
-
     fn change_vt(&mut self, _vt: i32) {} // no-op by default
+
+    /// Scanout dmabuf feedback for `output`, if this backend advertises one.
+    fn scanout_dmabuf_feedback(&self, _output: &Output) -> Option<DmabufFeedback> {
+        None
+    }
 
     /// Whether this output can be DPMS-blanked (`zwlr_output_power_v1`).
     fn output_power_supported(&self, _output: &Output) -> bool {
@@ -85,10 +107,48 @@ pub trait Backend {
     /// Queue a redraw of `output`; the backend skips ones already pending.
     fn schedule_render(&mut self, _output: &Output) {}
 
+    /// `wp_commit_timing` release wakeup after `delay`.
+    fn arm_commit_timer(&mut self, _delay: Duration) {}
+
+    /// Queue a redraw of `output` after `delay`.
+    fn schedule_render_after(&mut self, _output: &Output, _delay: Duration) {}
+
     /// Transform to apply to absolute (touch) input positions for `output`.
     /// Nested winit windows already report positions in window space, so they
     /// want identity; udev/DRM (and trait default) reports them in the output's transformed space.
     fn touch_transform(&self, output: &Output) -> Transform {
         output.current_transform()
+    }
+}
+
+/// The `wp_commit_timing` wakeups, owned by each backend.
+pub struct Wakeups<D: Backend + 'static> {
+    loop_handle: LoopHandle<'static, State<D>>,
+    commit: Option<RegistrationToken>,
+}
+
+impl<D: Backend + 'static> Wakeups<D> {
+    pub fn new(loop_handle: LoopHandle<'static, State<D>>) -> Self {
+        Self {
+            loop_handle,
+            commit: None,
+        }
+    }
+
+    /// `wp_commit_timing` release wakeup after `delay`.
+    pub fn arm_commit(&mut self, delay: Duration) {
+        if let Some(token) = self.commit.take() {
+            self.loop_handle.remove(token);
+        }
+        let token = self
+            .loop_handle
+            .insert_source(Timer::from_duration(delay), |_, _, state| {
+                state.release_commit_timers(state.clock.now());
+                state.reschedule_commit_timer();
+                TimeoutAction::Drop
+            });
+        if let Ok(token) = token {
+            self.commit = Some(token);
+        }
     }
 }

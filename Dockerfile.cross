@@ -1,0 +1,18 @@
+# aarch64 cross-build image for mechanix-comp: the cross-rs base plus the arm64
+# dev packages the *-sys crates link against. libc6:arm64 is pinned to the amd64
+# candidate because multiarch libc requires identical versions across mirrors.
+FROM ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main
+
+RUN dpkg --add-architecture arm64 \
+ && apt-get update \
+ && LIBC="$(apt-cache policy libc6:amd64 | sed -n 's/ *Candidate: //p')" \
+ && apt-get install -y --no-install-recommends "libc6:arm64=$LIBC" "libc6-dev:arm64=$LIBC" \
+ && apt-get install -y --no-install-recommends \
+        libgbm-dev:arm64 \
+        libdrm-dev:arm64 \
+        libseat-dev:arm64 \
+        libinput-dev:arm64 \
+        libudev-dev:arm64 \
+        libxkbcommon-dev:arm64 \
+        libwayland-dev:arm64 \
+ && rm -rf /var/lib/apt/lists/*

@@ -1,5 +1,6 @@
 use crate::backend::Backend;
-use crate::state::State;
+use crate::state::{LockPhase, State};
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
@@ -13,7 +14,12 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
     }
 
     fn lock(&mut self, confirmation: SessionLocker) {
-        self.is_locked = true;
+        if !matches!(self.lock_phase, LockPhase::Unlocked) {
+            // Dropping the new locker sends `finished` to the late client.
+            return;
+        }
+        self.lock_phase = LockPhase::Locking(confirmation);
+        self.reset_lock_frames();
 
         // Clear keyboard focus from all normal clients immediately so they
         // cannot receive input while we are transitioning to the locked state.
@@ -22,15 +28,15 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
             keyboard.set_focus(self, Option::<WlSurface>::None, serial);
         }
 
-        // Defer sending the `locked` event until the render loop has submitted
-        // a locked frame to the screen (protocol requirement: the locked event
-        // must not be sent before a cleared / lock-surface frame is visible).
-        self.session.pending_lock = Some(confirmation);
+        self.schedule_render();
+        self.maybe_send_locked();
     }
 
     fn unlock(&mut self) {
-        self.is_locked = false;
+        self.lock_phase = LockPhase::Unlocked;
+        self.reset_lock_frames();
         self.lock_surfaces.clear();
+        self.lock_surface_outputs.clear();
         self.focus_topmost();
         // The lock frame is still on the CRTC until the next redraw.
         self.schedule_render();
@@ -42,7 +48,8 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
             .or_else(|| self.space.outputs().next().cloned());
 
         let size = output
-            .and_then(|o| self.space.output_geometry(&o))
+            .as_ref()
+            .and_then(|o| self.space.output_geometry(o))
             .map(|geo| (geo.size.w as u32, geo.size.h as u32).into())
             .unwrap_or_else(|| (1920, 1080).into());
 
@@ -58,6 +65,10 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
             }
         }
 
+        if let Some(output) = output {
+            self.lock_surface_outputs
+                .insert(surface.wl_surface().id(), output);
+        }
         self.lock_surfaces.push(surface);
     }
 

@@ -1,5 +1,6 @@
 use crate::backend::Backend;
 use crate::state::{LockPhase, State};
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::SERIAL_COUNTER;
@@ -35,6 +36,7 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
         self.lock_phase = LockPhase::Unlocked;
         self.reset_lock_frames();
         self.lock_surfaces.clear();
+        self.lock_surface_outputs.clear();
         self.focus_topmost();
         // The lock frame is still on the CRTC until the next redraw.
         self.schedule_render();
@@ -46,7 +48,8 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
             .or_else(|| self.space.outputs().next().cloned());
 
         let size = output
-            .and_then(|o| self.space.output_geometry(&o))
+            .as_ref()
+            .and_then(|o| self.space.output_geometry(o))
             .map(|geo| (geo.size.w as u32, geo.size.h as u32).into())
             .unwrap_or_else(|| (1920, 1080).into());
 
@@ -62,6 +65,10 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
             }
         }
 
+        if let Some(output) = output {
+            self.lock_surface_outputs
+                .insert(surface.wl_surface().id(), output);
+        }
         self.lock_surfaces.push(surface);
     }
 

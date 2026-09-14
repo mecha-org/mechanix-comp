@@ -280,7 +280,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap()
                 };
                 state.update_surface_scanout(&output, &result.states);
-                let feedback = state.take_presentation_feedback(&output);
+                let feedback = state.take_presentation_feedback(&output, &result.states);
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
 
                 state.send_frame_callbacks(&output, Duration::from(state.clock.now()));

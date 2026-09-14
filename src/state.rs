@@ -8,7 +8,8 @@ use smithay::backend::renderer::element::{
     RenderElementStates, default_primary_scanout_output_compare,
 };
 use smithay::desktop::utils::{
-    OutputPresentationFeedback, surface_primary_scanout_output,
+    OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
+    surface_primary_scanout_output, take_presentation_feedback_surface_tree,
     update_surface_primary_scanout_output, with_surfaces_surface_tree,
 };
 use smithay::desktop::{PopupManager, Space, Window, layer_map_for_output};
@@ -22,7 +23,9 @@ use smithay::reexports::calloop::{
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
-use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::backend::{
+    ClientData, ClientId, DisconnectReason, ObjectId,
+};
 use smithay::reexports::wayland_server::{BindError, Client, Display, DisplayHandle};
 use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Time};
 use smithay::wayland::commit_timing::{
@@ -169,6 +172,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub presentation_state: PresentationState,
     pub lock_phase: LockPhase,
     pub lock_surfaces: Vec<LockSurface>,
+    pub lock_surface_outputs: HashMap<ObjectId, Output>,
     pub viewporter_state: ViewporterState,
     pub fractional_scale_manager_state: FractionalScaleManagerState,
     /// One layout model per output; the source of truth for window stacking.
@@ -273,6 +277,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             presentation_state,
             lock_phase: LockPhase::Unlocked,
             lock_surfaces: Vec::new(),
+            lock_surface_outputs: HashMap::new(),
             viewporter_state,
             fractional_scale_manager_state,
             layouts,
@@ -558,21 +563,41 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     /// Drain the `wp_presentation` feedback committed for the frame just rendered.
-    pub fn take_presentation_feedback(&self, output: &Output) -> OutputPresentationFeedback {
+    pub fn take_presentation_feedback(
+        &self,
+        output: &Output,
+        states: &RenderElementStates,
+    ) -> OutputPresentationFeedback {
         let mut feedback = OutputPresentationFeedback::new(output);
         for window in self.space.elements_for_output(output) {
             window.take_presentation_feedback(
                 &mut feedback,
                 surface_primary_scanout_output,
-                |_, _| wp_presentation_feedback::Kind::Vsync,
+                |surface, _| surface_presentation_feedback_flags_from_states(surface, None, states),
             );
         }
         for layer in layer_map_for_output(output).layers() {
             layer.take_presentation_feedback(
                 &mut feedback,
                 surface_primary_scanout_output,
-                |_, _| wp_presentation_feedback::Kind::Vsync,
+                |surface, _| surface_presentation_feedback_flags_from_states(surface, None, states),
             );
+        }
+        for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
+            if self
+                .lock_surface_outputs
+                .get(&lock_surface.wl_surface().id())
+                == Some(output)
+            {
+                take_presentation_feedback_surface_tree(
+                    lock_surface.wl_surface(),
+                    &mut feedback,
+                    |_, _| Some(output.clone()),
+                    |surface, _| {
+                        surface_presentation_feedback_flags_from_states(surface, None, states)
+                    },
+                );
+            }
         }
         feedback
     }

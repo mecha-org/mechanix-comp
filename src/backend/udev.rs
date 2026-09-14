@@ -913,7 +913,7 @@ impl State<UdevData> {
 
         if let Some(states) = scanout_states.take() {
             self.update_surface_scanout(&output, &states);
-            let feedback = self.take_presentation_feedback(&output);
+            let feedback = self.take_presentation_feedback(&output, &states);
             let queue_result = self
                 .backend_data
                 .devices

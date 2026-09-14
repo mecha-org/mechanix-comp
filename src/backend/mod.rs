@@ -6,7 +6,6 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Physical, Size, Transform};
 
 use crate::state::State;
@@ -83,12 +82,6 @@ pub trait Backend {
     /// Discard any cached swapchain/damage buffers for `output`, e.g. after a
     /// session resume (VT switch back) where the previous framebuffers are stale.
     fn reset_buffers(&mut self, output: &Output);
-
-    /// Opportunity to pre-import a client buffer onto the render GPU before it is
-    /// sampled. A no-op with a single-GPU `GlesRenderer`.
-    fn early_import(&mut self, surface: &WlSurface) {
-        let _ = surface;
-    }
 
     fn change_vt(&mut self, _vt: i32) {} // no-op by default
 

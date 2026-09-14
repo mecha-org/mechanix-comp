@@ -44,7 +44,6 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
-        self.backend_data.early_import(surface);
 
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();

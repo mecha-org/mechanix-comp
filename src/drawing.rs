@@ -3,7 +3,7 @@
 use smithay::{
     backend::allocator::Fourcc,
     backend::renderer::{
-        Color32F, ImportAll, ImportMem, Renderer, Texture,
+        ImportAll, ImportMem, Renderer, Texture,
         element::{
             AsRenderElements, Kind,
             memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
@@ -14,9 +14,6 @@ use smithay::{
     render_elements,
     utils::{Physical, Point, Scale, Transform},
 };
-
-pub static CLEAR_COLOR: Color32F = Color32F::new(0.8, 0.8, 0.9, 1.0);
-pub static CLEAR_COLOR_FULLSCREEN: Color32F = Color32F::new(0.0, 0.0, 0.0, 0.0);
 
 pub struct PointerElement {
     buffer: Option<MemoryRenderBuffer>,

@@ -178,25 +178,8 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        let output_geo = self
-            .space
-            .outputs()
-            .next()
-            .and_then(|o| self.space.output_geometry(o));
-        if let Some(geo) = output_geo {
-            surface.with_pending_state(|state| {
-                state.size = Some(geo.size);
-                state.states.set(xdg_toplevel::State::Fullscreen);
-            });
-            self.toplevels.get_mut(surface.wl_surface()).unwrap().mode = WindowMode::Fullscreen;
-        }
-        surface.send_configure();
-
-        let window = self
-            .toplevels
-            .get(surface.wl_surface())
-            .map(|ws| ws.window.clone());
-        if let Some(window) = window {
+        if let Some(window) = self.apply_mode_request(surface.wl_surface(), WindowMode::Fullscreen)
+        {
             self.focus_window(&window, SERIAL_COUNTER.next_serial());
         }
     }
@@ -210,11 +193,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        self.toplevels.get_mut(surface.wl_surface()).unwrap().mode = WindowMode::Maximized;
-        if let Some(output) = self.primary_output() {
-            self.apply_layout(&output);
-        }
-        surface.send_configure();
+        self.apply_mode_request(surface.wl_surface(), WindowMode::Maximized);
     }
 }
 
@@ -318,18 +297,44 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.schedule_render();
     }
 
-    /// Send the initial configure, sized so the client's first buffer is correct.
-    fn configure_toplevel(&self, surface: &WlSurface, window: &Window) {
+    /// Apply a mode change: reposition a mapped window, or reply to an unmapped one.
+    fn apply_mode_request(&mut self, surface: &WlSurface, mode: WindowMode) -> Option<Window> {
+        self.toplevels.get_mut(surface).unwrap().mode = mode;
+        let window = self.toplevels.get(surface).map(|ws| ws.window.clone())?;
+        self.reply_placement(surface, &window);
+        Some(window)
+    }
+
+    /// Reposition a mapped window, or reply to one that can't be laid out yet.
+    fn reply_placement(&mut self, surface: &WlSurface, window: &Window) {
+        if self.toplevels[surface].mapped
+            && let Some(output) = self.primary_output()
+        {
+            self.apply_layout(&output);
+        } else if window
+            .toplevel()
+            .is_some_and(|toplevel| toplevel.is_initial_configure_sent())
+        {
+            self.configure_toplevel(surface, window);
+        }
+    }
+
+    /// Send a configure carrying the toplevel's current placement.
+    fn configure_toplevel(&mut self, surface: &WlSurface, window: &Window) {
         let Some(toplevel) = window.toplevel() else {
             return;
         };
-        // A fullscreen request already configured the surface.
-        if self.toplevels[surface].mode != WindowMode::Fullscreen
-            && let Some(zone) = self
-                .primary_output()
+        let mode = self.placement_mode(surface, toplevel);
+        self.toplevels.get_mut(surface).unwrap().mode = mode;
+        let area = if mode == WindowMode::Fullscreen {
+            self.primary_output()
+                .and_then(|output| self.space.output_geometry(&output))
+        } else {
+            self.primary_output()
                 .map(|output| layer_map_for_output(&output).non_exclusive_zone())
-        {
-            self.set_toplevel_placement(toplevel, zone);
+        };
+        if let Some(area) = area {
+            self.set_toplevel_placement(toplevel, area, mode);
         }
         toplevel.send_pending_configure();
     }

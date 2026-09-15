@@ -85,13 +85,42 @@ impl ToplevelData {
             .insert(toplevel.clone(), outputs);
         Some(toplevel)
     }
+
+    /// Read a newly observed toplevel's full announcement state.
+    fn new(update: &ToplevelUpdate) -> Self {
+        let (title, app_id) = with_xdg_title_app_id(&update.surface, |title, app_id| {
+            (
+                title.unwrap_or_default().to_owned(),
+                app_id.unwrap_or_default().to_owned(),
+            )
+        });
+        ToplevelData {
+            title,
+            app_id,
+            states: update.states.clone(),
+            output: update.output.clone(),
+            parent: update.parent.clone(),
+            wlr_management_instances: HashMap::new(),
+            ext_handle: None,
+        }
+    }
+
+    /// Title/app_id present only where they differ from the announced ones.
+    fn changed_title_app_id(&self, surface: &WlSurface) -> (Option<String>, Option<String>) {
+        with_xdg_title_app_id(surface, |title, app_id| {
+            let title = title.unwrap_or("");
+            let app_id = app_id.unwrap_or("");
+            (
+                (self.title != title).then(|| title.to_owned()),
+                (self.app_id != app_id).then(|| app_id.to_owned()),
+            )
+        })
+    }
 }
 
-/// A toplevel snapshot at refresh time, for diffing against announced data.
-struct ToplevelSnapshot {
+/// One toplevel's freshly observed state, applied to the announced set.
+struct ToplevelUpdate {
     surface: WlSurface,
-    title: String,
-    app_id: String,
     states: Vec<u8>,
     output: Option<Output>,
     parent: Option<WlSurface>,
@@ -120,21 +149,118 @@ impl ForeignToplevelManagerState {
         Self::default()
     }
 
-    /// Diff snapshots against announced toplevels, emitting events; also drives ext-list in the same pass.
-    fn apply<D>(
+    /// Announce or update one toplevel, emitting events; drives the ext-list in the same pass.
+    fn apply_one<D>(
         &mut self,
         dh: &DisplayHandle,
         list: &mut ForeignToplevelListState,
-        snapshots: Vec<ToplevelSnapshot>,
+        update: &ToplevelUpdate,
+        parent_targets: &mut HashSet<WlSurface>,
     ) where
         D: ForeignToplevelListHandler
             + Dispatch<ExtForeignToplevelHandleV1, ForeignToplevelHandle>
             + Dispatch<ZwlrForeignToplevelHandleV1, ForeignToplevelUdata>
             + 'static,
     {
-        // 1. Close toplevels that are gone (destroyed or crashed).
+        match self.toplevels.entry(update.surface.clone()) {
+            Entry::Occupied(mut entry) => {
+                let data = entry.get_mut();
+                let (title, app_id) = data.changed_title_app_id(&update.surface);
+
+                let mut new_title = None;
+                if let Some(title) = title {
+                    data.title = title.clone();
+                    new_title = Some(title);
+                }
+
+                let mut new_app_id = None;
+                if let Some(app_id) = app_id {
+                    data.app_id = app_id.clone();
+                    new_app_id = Some(app_id);
+                }
+
+                // ext handle stays in sync with the diff above, so only touch it on changes.
+                if (new_title.is_some() || new_app_id.is_some())
+                    && let Some(handle) = &data.ext_handle
+                {
+                    if let Some(title) = &new_title {
+                        handle.send_title(title);
+                    }
+                    if let Some(app_id) = &new_app_id {
+                        handle.send_app_id(app_id);
+                    }
+                    handle.send_done();
+                }
+
+                let mut states_changed = false;
+                if data.states != update.states {
+                    data.states = update.states.clone();
+                    states_changed = true;
+                }
+
+                let mut output_changed = false;
+                if data.output.as_ref() != update.output.as_ref() {
+                    data.output = update.output.clone();
+                    output_changed = true;
+                }
+
+                if data.parent != update.parent {
+                    data.parent = update.parent.clone();
+                    parent_targets.insert(update.surface.clone());
+                }
+
+                if new_title.is_some() || new_app_id.is_some() || states_changed || output_changed {
+                    for (instance, outputs) in &mut data.wlr_management_instances {
+                        if let Some(title) = &new_title {
+                            instance.title(title.clone());
+                        }
+                        if let Some(app_id) = &new_app_id {
+                            instance.app_id(app_id.clone());
+                        }
+                        if states_changed {
+                            instance.state(state_for_version(&update.states, instance.version()));
+                        }
+                        if output_changed {
+                            for wl_output in outputs.drain(..) {
+                                instance.output_leave(&wl_output);
+                            }
+                            if let (Some(output), Some(client)) = (&data.output, instance.client())
+                            {
+                                for wl_output in output.client_outputs(&client) {
+                                    instance.output_enter(&wl_output);
+                                    outputs.push(wl_output);
+                                }
+                            }
+                        }
+                        instance.done();
+                    }
+                }
+
+                // Clean up dead wl_outputs.
+                for outputs in data.wlr_management_instances.values_mut() {
+                    outputs.retain(|wl_output| wl_output.is_alive());
+                }
+            }
+            Entry::Vacant(entry) => {
+                let mut data = ToplevelData::new(update);
+                data.ext_handle =
+                    Some(list.new_toplevel::<D>(data.title.clone(), data.app_id.clone()));
+                parent_targets.insert(update.surface.clone());
+                for manager in &self.wlr_management_instances {
+                    if let Some(client) = manager.client() {
+                        data.add_wlr_instance::<D>(dh, &client, manager);
+                    }
+                }
+
+                entry.insert(data);
+            }
+        }
+    }
+
+    /// Close and drop announced toplevels that are no longer active.
+    fn retain_active(&mut self, list: &mut ForeignToplevelListState, seen: &HashSet<WlSurface>) {
         self.toplevels.retain(|surface, data| {
-            let keep = snapshots.iter().any(|snap| snap.surface == *surface);
+            let keep = seen.contains(surface);
             if !keep {
                 if let Some(handle) = data.ext_handle.take() {
                     list.remove_toplevel(&handle);
@@ -145,131 +271,6 @@ impl ForeignToplevelManagerState {
             }
             keep
         });
-
-        // 2. Create or update the remaining toplevels.
-        // Surfaces whose parent changed or that are new: their own handle and
-        // the handles of their children must re-send the wlr `parent` event.
-        let mut parent_targets: HashSet<WlSurface> = HashSet::new();
-        for snap in &snapshots {
-            match self.toplevels.entry(snap.surface.clone()) {
-                Entry::Occupied(mut entry) => {
-                    let data = entry.get_mut();
-
-                    let mut new_title = None;
-                    if data.title != snap.title {
-                        data.title = snap.title.clone();
-                        new_title = Some(snap.title.clone());
-                    }
-
-                    let mut new_app_id = None;
-                    if data.app_id != snap.app_id {
-                        data.app_id = snap.app_id.clone();
-                        new_app_id = Some(snap.app_id.clone());
-                    }
-
-                    // ext handle stays in sync with the diff above, so only touch it on changes.
-                    if (new_title.is_some() || new_app_id.is_some())
-                        && let Some(handle) = &data.ext_handle
-                    {
-                        if let Some(title) = &new_title {
-                            handle.send_title(title);
-                        }
-                        if let Some(app_id) = &new_app_id {
-                            handle.send_app_id(app_id);
-                        }
-                        handle.send_done();
-                    }
-
-                    let mut states_changed = false;
-                    if data.states != snap.states {
-                        data.states = snap.states.clone();
-                        states_changed = true;
-                    }
-
-                    let mut output_changed = false;
-                    if data.output.as_ref() != snap.output.as_ref() {
-                        data.output = snap.output.clone();
-                        output_changed = true;
-                    }
-
-                    if data.parent != snap.parent {
-                        data.parent = snap.parent.clone();
-                        parent_targets.insert(snap.surface.clone());
-                    }
-
-                    if new_title.is_some()
-                        || new_app_id.is_some()
-                        || states_changed
-                        || output_changed
-                    {
-                        for (instance, outputs) in &mut data.wlr_management_instances {
-                            if let Some(title) = &new_title {
-                                instance.title(title.clone());
-                            }
-                            if let Some(app_id) = &new_app_id {
-                                instance.app_id(app_id.clone());
-                            }
-                            if states_changed {
-                                instance.state(state_for_version(&snap.states, instance.version()));
-                            }
-                            if output_changed {
-                                for wl_output in outputs.drain(..) {
-                                    instance.output_leave(&wl_output);
-                                }
-                                if let (Some(output), Some(client)) =
-                                    (&data.output, instance.client())
-                                {
-                                    for wl_output in output.client_outputs(&client) {
-                                        instance.output_enter(&wl_output);
-                                        outputs.push(wl_output);
-                                    }
-                                }
-                            }
-                            instance.done();
-                        }
-                    }
-
-                    // Clean up dead wl_outputs.
-                    for outputs in data.wlr_management_instances.values_mut() {
-                        outputs.retain(|wl_output| wl_output.is_alive());
-                    }
-                }
-                Entry::Vacant(entry) => {
-                    let mut data = ToplevelData {
-                        title: snap.title.clone(),
-                        app_id: snap.app_id.clone(),
-                        states: snap.states.clone(),
-                        output: snap.output.clone(),
-                        parent: snap.parent.clone(),
-                        wlr_management_instances: HashMap::new(),
-                        ext_handle: None,
-                    };
-                    data.ext_handle =
-                        Some(list.new_toplevel::<D>(data.title.clone(), data.app_id.clone()));
-                    parent_targets.insert(snap.surface.clone());
-                    for manager in &self.wlr_management_instances {
-                        if let Some(client) = manager.client() {
-                            data.add_wlr_instance::<D>(dh, &client, manager);
-                        }
-                    }
-
-                    entry.insert(data);
-                }
-            }
-        }
-
-        // Children of targeted surfaces change alongside them.
-        for snap in &snapshots {
-            if let Some(parent) = &snap.parent
-                && parent_targets.contains(parent)
-            {
-                parent_targets.insert(snap.surface.clone());
-            }
-        }
-
-        for surface in parent_targets {
-            self.send_wlr_parent(&surface);
-        }
     }
 
     /// Send the wlr v3 `parent` event on every handle of `surface` and its children.
@@ -364,8 +365,10 @@ fn state_for_version(states: &[u8], version: u32) -> Vec<u8> {
     }
     let fullscreen = (zwlr_foreign_toplevel_handle_v1::State::Fullscreen as u32).to_ne_bytes();
     states
-        .chunks_exact(4)
-        .filter(|chunk| *chunk != fullscreen)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|chunk| **chunk != fullscreen)
         .flatten()
         .copied()
         .collect()
@@ -381,57 +384,90 @@ fn has_buffer(surface: &WlSurface) -> bool {
     })
 }
 
-/// The toplevel's current title and app_id.
-fn foreign_toplevel_title_app_id(surface: &WlSurface) -> (String, String) {
+/// Runs `f` with the toplevel's (title, app_id) under the role lock.
+fn with_xdg_title_app_id<T>(
+    surface: &WlSurface,
+    f: impl FnOnce(Option<&str>, Option<&str>) -> T,
+) -> T {
     with_states(surface, |states| {
-        let Some(attrs) = states.data_map.get::<XdgToplevelSurfaceData>() else {
-            return (String::new(), String::new());
-        };
-        let attrs = attrs.lock().unwrap();
-        (
-            attrs.title.clone().unwrap_or_default(),
-            attrs.app_id.clone().unwrap_or_default(),
-        )
+        match states.data_map.get::<XdgToplevelSurfaceData>() {
+            Some(attrs) => {
+                let attrs = attrs.lock().unwrap();
+                f(attrs.title.as_deref(), attrs.app_id.as_deref())
+            }
+            None => f(None, None),
+        }
     })
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
     /// Reconcile both protocols with the current windows; focused last so old windows deactivate first.
     pub fn foreign_toplevel_refresh(&mut self) {
-        let focused = self.seat.get_keyboard().unwrap().current_focus();
+        let Self {
+            toplevels,
+            space,
+            session,
+            display_handle,
+            seat,
+            ..
+        } = self;
+        let focused = seat.get_keyboard().unwrap().current_focus();
+        let crate::session::Session {
+            foreign_toplevel: manager,
+            foreign_toplevel_list: list,
+            ..
+        } = session;
 
-        let mut snapshots: Vec<ToplevelSnapshot> = Vec::new();
-        for (surface, ws) in &self.toplevels {
-            if !surface.is_alive() || !has_buffer(surface) {
-                continue;
+        let mut seen: HashSet<WlSurface> = HashSet::new();
+        let mut parent_targets: HashSet<WlSurface> = HashSet::new();
+        // Two passes so the focused window is announced last.
+        for focused_pass in [false, true] {
+            for (surface, ws) in toplevels.iter() {
+                let is_focused = focused.as_ref() == Some(surface);
+                if is_focused != focused_pass {
+                    continue;
+                }
+                if !surface.is_alive() || !has_buffer(surface) {
+                    continue;
+                }
+                seen.insert(surface.clone());
+                let output = space.outputs_for_element(&ws.window).into_iter().next();
+                let parent = ws.window.toplevel().and_then(|toplevel| toplevel.parent());
+                let states = to_state_vec(ws.mode, is_focused);
+                let update = ToplevelUpdate {
+                    surface: surface.clone(),
+                    states,
+                    output,
+                    parent,
+                };
+                manager.apply_one::<State<BackendData>>(
+                    display_handle,
+                    list,
+                    &update,
+                    &mut parent_targets,
+                );
             }
-            let (title, app_id) = foreign_toplevel_title_app_id(surface);
-            let states = to_state_vec(ws.mode, focused.as_ref() == Some(surface));
-            let output = self
-                .space
-                .outputs_for_element(&ws.window)
-                .into_iter()
-                .next();
-            snapshots.push(ToplevelSnapshot {
-                surface: surface.clone(),
-                title,
-                app_id,
-                states,
-                output,
-                parent: ws.window.toplevel().and_then(|toplevel| toplevel.parent()),
-            });
         }
 
-        // Focused last.
-        if let Some(focused) = focused {
-            snapshots.sort_by_key(|snap| (snap.surface == focused) as u8);
-        }
+        manager.retain_active(list, &seen);
 
-        self.session.foreign_toplevel.apply::<State<BackendData>>(
-            &self.display_handle,
-            &mut self.session.foreign_toplevel_list,
-            snapshots,
-        );
+        // Children of a targeted surface follow their parent.
+        loop {
+            let before = parent_targets.len();
+            for (surface, data) in &manager.toplevels {
+                if let Some(parent) = &data.parent
+                    && parent_targets.contains(parent)
+                {
+                    parent_targets.insert(surface.clone());
+                }
+            }
+            if parent_targets.len() == before {
+                break;
+            }
+        }
+        for surface in parent_targets {
+            manager.send_wlr_parent(&surface);
+        }
     }
 
     /// wlr `activate` request: raise the toplevel and give it keyboard focus.

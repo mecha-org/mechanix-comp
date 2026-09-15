@@ -352,8 +352,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Queue a redraw on every output; the backend skips ones already pending.
     pub fn schedule_render(&mut self) {
-        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
-        for output in &outputs {
+        for output in self.space.outputs() {
             self.backend_data.schedule_render(output);
         }
     }

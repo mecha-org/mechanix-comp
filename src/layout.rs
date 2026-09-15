@@ -8,9 +8,9 @@ use smithay::output::Output;
 #[cfg(feature = "session")]
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::{Logical, Rectangle};
 #[cfg(feature = "session")]
-use smithay::utils::{Point, Size};
+use smithay::utils::Point;
+use smithay::utils::{Logical, Rectangle};
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::backend::Backend;
@@ -107,12 +107,26 @@ impl Layout {
 }
 
 #[cfg(feature = "session")]
-struct Placement {
-    loc: Point<i32, Logical>,
-    size: Option<Size<i32, Logical>>,
-    bounds: Option<Size<i32, Logical>>,
-    maximized: bool,
-    reported: WindowMode,
+impl<BackendData: Backend + 'static> State<BackendData> {
+    /// Set a toplevel's pending size/bounds/maximized to match the maximizing model.
+    pub(crate) fn set_toplevel_placement(
+        &self,
+        toplevel: &ToplevelSurface,
+        zone: Rectangle<i32, Logical>,
+    ) {
+        let dialog = is_dialog(toplevel);
+        toplevel.with_pending_state(|pending| {
+            if dialog {
+                pending.size = None;
+                pending.bounds = Some(zone.size);
+                pending.states.unset(xdg_toplevel::State::Maximized);
+            } else {
+                pending.size = Some(zone.size);
+                pending.bounds = None;
+                pending.states.set(xdg_toplevel::State::Maximized);
+            }
+        });
+    }
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
@@ -165,8 +179,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             }
 
             let dialog = is_dialog(toplevel);
-            let placement = if dialog {
-                let loc = toplevel
+            let loc = if dialog {
+                toplevel
                     .parent()
                     .and_then(|parent| self.window_for(&parent))
                     .and_then(|parent| self.space.element_geometry(&parent))
@@ -176,40 +190,23 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                             parent_geo.loc.y + (parent_geo.size.h - window.geometry().size.h) / 2,
                         ))
                     })
-                    .unwrap_or_else(|| centered_loc(zone, window.geometry()));
-                Placement {
-                    loc,
-                    size: None,
-                    bounds: Some(zone.size),
-                    maximized: false,
-                    reported: WindowMode::Floating,
-                }
+                    .unwrap_or_else(|| centered_loc(zone, window.geometry()))
             } else {
-                Placement {
-                    loc: zone.loc,
-                    size: Some(zone.size),
-                    bounds: None,
-                    maximized: true,
-                    reported: WindowMode::Maximized,
-                }
+                zone.loc
             };
 
             if let Some(ws) = self.toplevels.get_mut(surface) {
-                ws.mode = placement.reported;
-            }
-            toplevel.with_pending_state(|pending| {
-                pending.size = placement.size;
-                pending.bounds = placement.bounds;
-                if placement.maximized {
-                    pending.states.set(xdg_toplevel::State::Maximized);
+                ws.mode = if dialog {
+                    WindowMode::Floating
                 } else {
-                    pending.states.unset(xdg_toplevel::State::Maximized);
-                }
-            });
+                    WindowMode::Maximized
+                };
+            }
+            self.set_toplevel_placement(toplevel, zone);
             if toplevel.is_initial_configure_sent() {
                 toplevel.send_pending_configure();
             }
-            self.space.relocate_element(&window, placement.loc);
+            self.space.relocate_element(&window, loc);
         }
 
         // Space z-order is the stack, back → front.

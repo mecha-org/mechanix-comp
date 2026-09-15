@@ -288,7 +288,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Map a toplevel into Comet and focus it.
     #[cfg(feature = "session")]
     fn map_toplevel(&mut self, surface: &WlSurface, window: &Window) {
         let output = self.space.outputs().next().cloned();
@@ -313,7 +312,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Unmap a toplevel whose buffer went away and move focus to the next window.
     #[cfg(feature = "session")]
     fn unmap_toplevel(&mut self, surface: &WlSurface, window: &Window) {
         let ws = self.toplevels.get_mut(surface).unwrap();
@@ -326,6 +324,23 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.space.unmap_elem(window);
         self.focus_topmost();
         self.schedule_render();
+    }
+
+    /// Send the initial configure, sized so the client's first buffer is correct.
+    #[cfg(feature = "session")]
+    fn configure_toplevel(&self, surface: &WlSurface, window: &Window) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+        // A fullscreen request already configured the surface.
+        if self.toplevels[surface].mode != WindowMode::Fullscreen
+            && let Some(zone) = self
+                .primary_output()
+                .map(|output| layer_map_for_output(&output).non_exclusive_zone())
+        {
+            self.set_toplevel_placement(toplevel, zone);
+        }
+        toplevel.send_pending_configure();
     }
 
     fn unconstrain_popup(&self, popup: &PopupSurface) {
@@ -392,8 +407,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 }
 
-/// Maps a toplevel when it attaches a buffer and unmaps it when the buffer goes away.
-/// Returns true for toplevels (so the caller skips the popup path).
 pub fn handle_commit<BackendData: Backend + 'static>(
     state: &mut State<BackendData>,
     surface: &WlSurface,
@@ -403,40 +416,15 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     }
     #[cfg(feature = "session")]
     {
-        let ws = &state.toplevels[surface];
-        let window = ws.window.clone();
-        let mapped = ws.mapped;
-        let mode = ws.mode;
+        let window = state.toplevels[surface].window.clone();
+        let mapped = state.toplevels[surface].mapped;
         let buffered = with_renderer_surface_state(surface, |states| states.buffer().is_some())
             .unwrap_or(false);
 
         match (buffered, mapped) {
             (true, false) => state.map_toplevel(surface, &window),
             (false, true) => state.unmap_toplevel(surface, &window),
-            // Unmapped and bufferless: the client is (re)initializing, configure it.
-            (false, false) => {
-                if let Some(toplevel) = window.toplevel() {
-                    if mode != WindowMode::Fullscreen
-                        && let Some(zone) = state
-                            .primary_output()
-                            .map(|output| layer_map_for_output(&output).non_exclusive_zone())
-                    {
-                        let dialog = is_dialog(toplevel);
-                        toplevel.with_pending_state(|pending| {
-                            if dialog {
-                                pending.size = None;
-                                pending.bounds = Some(zone.size);
-                                pending.states.unset(xdg_toplevel::State::Maximized);
-                            } else {
-                                pending.size = Some(zone.size);
-                                pending.bounds = None;
-                                pending.states.set(xdg_toplevel::State::Maximized);
-                            }
-                        });
-                    }
-                    toplevel.send_pending_configure();
-                }
-            }
+            (false, false) => state.configure_toplevel(surface, &window),
             (true, true) => {}
         }
     }

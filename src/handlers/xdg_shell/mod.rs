@@ -57,9 +57,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         }
     }
 
-    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
     fn parent_changed(&mut self, surface: ToplevelSurface) {
-        #[cfg(feature = "session")]
         if self
             .toplevels
             .get(surface.wl_surface())
@@ -140,7 +138,6 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -160,7 +157,6 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -215,7 +211,6 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
             return;
         }
         self.toplevels.get_mut(surface.wl_surface()).unwrap().mode = WindowMode::Maximized;
-        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -236,7 +231,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.active_window = Some(focused_surface.clone());
         self.layer_shell_on_demand_focus = None;
 
-        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -288,7 +282,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    #[cfg(feature = "session")]
     fn map_toplevel(&mut self, surface: &WlSurface, window: &Window) {
         let output = self.space.outputs().next().cloned();
         let loc = output
@@ -312,7 +305,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    #[cfg(feature = "session")]
     fn unmap_toplevel(&mut self, surface: &WlSurface, window: &Window) {
         let ws = self.toplevels.get_mut(surface).unwrap();
         ws.mapped = false;
@@ -327,7 +319,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     /// Send the initial configure, sized so the client's first buffer is correct.
-    #[cfg(feature = "session")]
     fn configure_toplevel(&self, surface: &WlSurface, window: &Window) {
         let Some(toplevel) = window.toplevel() else {
             return;
@@ -414,7 +405,6 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     if !state.toplevels.contains_key(surface) {
         return false;
     }
-    #[cfg(feature = "session")]
     {
         let window = state.toplevels[surface].window.clone();
         let mapped = state.toplevels[surface].mapped;

@@ -2,27 +2,22 @@
 
 use std::collections::HashSet;
 
-#[cfg(feature = "session")]
 use smithay::desktop::{Window, layer_map_for_output};
 use smithay::output::Output;
-#[cfg(feature = "session")]
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-#[cfg(feature = "session")]
 use smithay::utils::Point;
 use smithay::utils::{Logical, Rectangle};
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::backend::Backend;
 use crate::state::State;
-#[cfg(feature = "session")]
 use crate::state::WindowMode;
 
 pub fn is_dialog(toplevel: &ToplevelSurface) -> bool {
     toplevel.parent().is_some()
 }
 
-#[cfg(feature = "session")]
 fn centered_loc(
     zone: Rectangle<i32, Logical>,
     geo: Rectangle<i32, Logical>,
@@ -106,7 +101,6 @@ impl Layout {
     }
 }
 
-#[cfg(feature = "session")]
 impl<BackendData: Backend + 'static> State<BackendData> {
     /// Set a toplevel's pending size/bounds/maximized to match the maximizing model.
     pub(crate) fn set_toplevel_placement(
@@ -137,12 +131,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .and_then(|t| t.parent())
     }
 
-    #[cfg(feature = "session")]
     fn window_for(&self, surface: &WlSurface) -> Option<Window> {
         self.toplevels.get(surface).map(|ws| ws.window.clone())
     }
 
-    #[cfg(feature = "session")]
     fn layout_mut(&mut self, output: &Output) -> &mut Layout {
         self.layouts.entry(output.clone()).or_default()
     }
@@ -153,7 +145,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     /// Size, position, xdg state, and Space z-order from the Comet model.
-    #[cfg(feature = "session")]
     pub fn apply_layout(&mut self, output: &Output) {
         let zone = layer_map_for_output(output).non_exclusive_zone();
         if let Some(focused) = self.active_window.clone() {

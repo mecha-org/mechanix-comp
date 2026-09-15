@@ -1,4 +1,11 @@
-use compositor::backend;
+mod backend;
+mod cursor;
+mod drawing;
+mod handlers;
+mod input;
+mod layout;
+mod render;
+mod state;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();

@@ -86,13 +86,13 @@ impl OutputPowerManagerState {
 impl<BackendData: Backend + 'static> State<BackendData> {
     /// Apply DPMS for `output` and notify protocol clients; backend refusal sends `failed`.
     pub fn set_output_power(&mut self, output: &Output, on: bool) {
-        if self.session.output_power.is_off(output) == !on {
+        if self.output_power.is_off(output) == !on {
             return;
         }
 
         if !self.backend_data.set_output_dpms(output, on) {
             warn!(output = %output.name(), on, "output power change failed");
-            if let Some(handles) = self.session.output_power.handles.get(output) {
+            if let Some(handles) = self.output_power.handles.get(output) {
                 for handle in handles {
                     handle.failed();
                 }
@@ -101,23 +101,23 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
 
         if on {
-            self.session.output_power.off.remove(output);
+            self.output_power.off.remove(output);
             self.backend_data.schedule_render(output);
         } else {
-            self.session.output_power.off.insert(output.clone());
+            self.output_power.off.insert(output.clone());
             self.release_fifo_barriers(output);
             self.maybe_send_locked();
         }
-        self.session.output_power.send_mode(output, on);
+        self.output_power.send_mode(output, on);
     }
 
     /// Wake every blanked output. Returns true if anything was off, so the
     /// caller can consume the input that woke the panel.
     pub fn wake_outputs_if_off(&mut self) -> bool {
-        if self.session.output_power.off.is_empty() {
+        if self.output_power.off.is_empty() {
             return false;
         }
-        let outputs: Vec<Output> = self.session.output_power.off.iter().cloned().collect();
+        let outputs: Vec<Output> = self.output_power.off.iter().cloned().collect();
         for output in &outputs {
             self.set_output_power(output, true);
         }
@@ -130,7 +130,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let outputs: Vec<Output> = self.space.outputs().cloned().collect();
         for output in &outputs {
             self.backend_data.reset_buffers(output);
-            if self.session.output_power.is_off(output) {
+            if self.output_power.is_off(output) {
                 let _ = self.backend_data.set_output_dpms(output, false);
             } else {
                 self.backend_data.schedule_render(output);
@@ -207,7 +207,7 @@ fn create_output_power<BackendData: Backend + 'static>(
         return;
     }
 
-    let on = !state.session.output_power.is_off(&output);
+    let on = !state.output_power.is_off(&output);
     let handle = data_init.init(
         id,
         OutputPowerUdata {
@@ -220,7 +220,6 @@ fn create_output_power<BackendData: Backend + 'static>(
         zwlr_output_power_v1::Mode::Off
     });
     state
-        .session
         .output_power
         .handles
         .entry(output)
@@ -270,6 +269,6 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrOutputPowerV1, State<BackendD
         _client: ClientId,
         resource: &ZwlrOutputPowerV1,
     ) {
-        state.session.output_power.remove_handle(resource);
+        state.output_power.remove_handle(resource);
     }
 }

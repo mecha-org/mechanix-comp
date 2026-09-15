@@ -1,28 +1,19 @@
 pub mod compositor;
-#[cfg(feature = "session")]
 pub mod data_control;
-#[cfg(feature = "session")]
 pub mod data_device;
 pub mod dmabuf;
-#[cfg(feature = "session")]
 pub mod foreign_toplevel;
 pub mod fractional_scale;
-#[cfg(feature = "session")]
 pub mod idle;
 pub mod layer_shell;
 pub mod output;
-#[cfg(feature = "session")]
 pub mod output_power;
 pub mod seat;
-#[cfg(feature = "session")]
 pub mod session_lock;
 pub mod shm;
-#[cfg(feature = "session")]
 pub mod xdg_activation;
-#[cfg(feature = "session")]
 pub mod xdg_dialog;
 pub mod xdg_shell;
-#[cfg(feature = "session")]
 pub mod xdg_toplevel_icon;
 
 use crate::backend::Backend;

@@ -10,17 +10,11 @@ use smithay::wayland::pointer_constraints::{
 };
 use smithay::wayland::seat::WaylandFocus;
 
-#[cfg(feature = "session")]
 use smithay::desktop::{PopupKind, PopupManager};
-#[cfg(feature = "session")]
 use smithay::reexports::wayland_server::Resource;
-#[cfg(feature = "session")]
 use smithay::utils::Rectangle;
-#[cfg(feature = "session")]
 use smithay::wayland::input_method::{InputMethodHandler, PopupSurface};
-#[cfg(feature = "session")]
 use smithay::wayland::selection::data_device::set_data_device_focus;
-#[cfg(feature = "session")]
 use tracing::warn;
 
 impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
@@ -37,9 +31,7 @@ impl<BackendData: Backend + 'static> SeatHandler for State<BackendData> {
         self.schedule_render();
     }
 
-    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        #[cfg(feature = "session")]
         set_data_device_focus(
             &self.display_handle,
             seat,
@@ -118,7 +110,6 @@ impl<BackendData: Backend + 'static> PointerConstraintsHandler for State<Backend
     }
 }
 
-#[cfg(feature = "session")]
 impl<BackendData: Backend + 'static> InputMethodHandler for State<BackendData> {
     fn new_popup(&mut self, surface: PopupSurface) {
         if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {

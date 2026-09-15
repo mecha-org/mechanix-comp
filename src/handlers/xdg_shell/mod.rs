@@ -26,16 +26,6 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
 
-        #[cfg(feature = "session")]
-        if let Some(output) = self.space.outputs().next().cloned() {
-            // `set_parent` hasn't arrived yet, so only set bounds here; the first
-            // commit decides sizing/mapping in `handle_commit`.
-            let zone = layer_map_for_output(&output).non_exclusive_zone();
-            surface.with_pending_state(|state| {
-                state.bounds = Some(zone.size);
-            });
-        }
-
         self.toplevels.insert(
             surface.wl_surface().clone(),
             WindowState {
@@ -67,9 +57,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         }
     }
 
-    #[cfg_attr(not(feature = "session"), allow(unused_variables))]
     fn parent_changed(&mut self, surface: ToplevelSurface) {
-        #[cfg(feature = "session")]
         if self
             .toplevels
             .get(surface.wl_surface())
@@ -150,7 +138,6 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -170,7 +157,6 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -192,25 +178,8 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        let output_geo = self
-            .space
-            .outputs()
-            .next()
-            .and_then(|o| self.space.output_geometry(o));
-        if let Some(geo) = output_geo {
-            surface.with_pending_state(|state| {
-                state.size = Some(geo.size);
-                state.states.set(xdg_toplevel::State::Fullscreen);
-            });
-            self.toplevels.get_mut(surface.wl_surface()).unwrap().mode = WindowMode::Fullscreen;
-        }
-        surface.send_configure();
-
-        let window = self
-            .toplevels
-            .get(surface.wl_surface())
-            .map(|ws| ws.window.clone());
-        if let Some(window) = window {
+        if let Some(window) = self.apply_mode_request(surface.wl_surface(), WindowMode::Fullscreen)
+        {
             self.focus_window(&window, SERIAL_COUNTER.next_serial());
         }
     }
@@ -224,12 +193,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        self.toplevels.get_mut(surface.wl_surface()).unwrap().mode = WindowMode::Maximized;
-        #[cfg(feature = "session")]
-        if let Some(output) = self.primary_output() {
-            self.apply_layout(&output);
-        }
-        surface.send_configure();
+        self.apply_mode_request(surface.wl_surface(), WindowMode::Maximized);
     }
 }
 
@@ -246,7 +210,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.active_window = Some(focused_surface.clone());
         self.layer_shell_on_demand_focus = None;
 
-        #[cfg(feature = "session")]
         if let Some(output) = self.primary_output() {
             self.apply_layout(&output);
         }
@@ -298,8 +261,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Map a toplevel into Comet and focus it.
-    #[cfg(feature = "session")]
     fn map_toplevel(&mut self, surface: &WlSurface, window: &Window) {
         let output = self.space.outputs().next().cloned();
         let loc = output
@@ -323,16 +284,59 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Unmap a toplevel whose buffer went away and move focus to the next window.
-    #[cfg(feature = "session")]
     fn unmap_toplevel(&mut self, surface: &WlSurface, window: &Window) {
-        self.toplevels.get_mut(surface).unwrap().mapped = false;
+        let ws = self.toplevels.get_mut(surface).unwrap();
+        ws.mapped = false;
+        // A remap is a fresh mapping: reset the mode so it is re-evaluated.
+        ws.mode = WindowMode::Floating;
         for layout in self.layouts.values_mut() {
             layout.remove(surface);
         }
         self.space.unmap_elem(window);
         self.focus_topmost();
         self.schedule_render();
+    }
+
+    /// Apply a mode change: reposition a mapped window, or reply to an unmapped one.
+    fn apply_mode_request(&mut self, surface: &WlSurface, mode: WindowMode) -> Option<Window> {
+        self.toplevels.get_mut(surface).unwrap().mode = mode;
+        let window = self.toplevels.get(surface).map(|ws| ws.window.clone())?;
+        self.reply_placement(surface, &window);
+        Some(window)
+    }
+
+    /// Reposition a mapped window, or reply to one that can't be laid out yet.
+    fn reply_placement(&mut self, surface: &WlSurface, window: &Window) {
+        if self.toplevels[surface].mapped
+            && let Some(output) = self.primary_output()
+        {
+            self.apply_layout(&output);
+        } else if window
+            .toplevel()
+            .is_some_and(|toplevel| toplevel.is_initial_configure_sent())
+        {
+            self.configure_toplevel(surface, window);
+        }
+    }
+
+    /// Send a configure carrying the toplevel's current placement.
+    fn configure_toplevel(&mut self, surface: &WlSurface, window: &Window) {
+        let Some(toplevel) = window.toplevel() else {
+            return;
+        };
+        let mode = self.placement_mode(surface, toplevel);
+        self.toplevels.get_mut(surface).unwrap().mode = mode;
+        let area = if mode == WindowMode::Fullscreen {
+            self.primary_output()
+                .and_then(|output| self.space.output_geometry(&output))
+        } else {
+            self.primary_output()
+                .map(|output| layer_map_for_output(&output).non_exclusive_zone())
+        };
+        if let Some(area) = area {
+            self.set_toplevel_placement(toplevel, area, mode);
+        }
+        toplevel.send_pending_configure();
     }
 
     fn unconstrain_popup(&self, popup: &PopupSurface) {
@@ -399,8 +403,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 }
 
-/// Maps a toplevel when it attaches a buffer and unmaps it when the buffer goes away.
-/// Returns true for toplevels (so the caller skips the popup path).
 pub fn handle_commit<BackendData: Backend + 'static>(
     state: &mut State<BackendData>,
     surface: &WlSurface,
@@ -408,23 +410,16 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     if !state.toplevels.contains_key(surface) {
         return false;
     }
-    #[cfg(feature = "session")]
     {
-        let ws = &state.toplevels[surface];
-        let window = ws.window.clone();
-        let mapped = ws.mapped;
+        let window = state.toplevels[surface].window.clone();
+        let mapped = state.toplevels[surface].mapped;
         let buffered = with_renderer_surface_state(surface, |states| states.buffer().is_some())
             .unwrap_or(false);
 
         match (buffered, mapped) {
             (true, false) => state.map_toplevel(surface, &window),
             (false, true) => state.unmap_toplevel(surface, &window),
-            // Unmapped and bufferless: the client is (re)initializing, configure it.
-            (false, false) => {
-                if let Some(toplevel) = window.toplevel() {
-                    toplevel.send_configure();
-                }
-            }
+            (false, false) => state.configure_toplevel(surface, &window),
             (true, true) => {}
         }
     }

@@ -54,7 +54,6 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
             return;
         };
 
-        #[cfg(feature = "session")]
         let zone_before = layer_map_for_output(&output).non_exclusive_zone();
         {
             let mut map = layer_map_for_output(&output);
@@ -69,7 +68,6 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
         if self.layer_shell_on_demand_focus.as_ref() == Some(surface.wl_surface()) {
             self.layer_shell_on_demand_focus = None;
         }
-        #[cfg(feature = "session")]
         if zone_before != layer_map_for_output(&output).non_exclusive_zone() {
             self.apply_layout(&output);
         }
@@ -112,7 +110,6 @@ pub fn handle_commit<BackendData: Backend + 'static>(
             .initial_configure_sent
     });
 
-    #[cfg(feature = "session")]
     let zone_before = layer_map_for_output(&output).non_exclusive_zone();
     let (needs_configure, on_demand) = {
         let mut map = layer_map_for_output(&output);
@@ -130,7 +127,6 @@ pub fn handle_commit<BackendData: Backend + 'static>(
         (!initial_configure_sent, on_demand)
     };
 
-    #[cfg(feature = "session")]
     if zone_before != layer_map_for_output(&output).non_exclusive_zone() {
         state.apply_layout(&output);
     }

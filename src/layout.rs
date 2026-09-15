@@ -2,27 +2,22 @@
 
 use std::collections::HashSet;
 
-#[cfg(feature = "session")]
 use smithay::desktop::{Window, layer_map_for_output};
 use smithay::output::Output;
-#[cfg(feature = "session")]
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::Point;
 use smithay::utils::{Logical, Rectangle};
-#[cfg(feature = "session")]
-use smithay::utils::{Point, Size};
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::backend::Backend;
 use crate::state::State;
-#[cfg(feature = "session")]
 use crate::state::WindowMode;
 
 pub fn is_dialog(toplevel: &ToplevelSurface) -> bool {
     toplevel.parent().is_some()
 }
 
-#[cfg(feature = "session")]
 fn centered_loc(
     zone: Rectangle<i32, Logical>,
     geo: Rectangle<i32, Logical>,
@@ -106,13 +101,54 @@ impl Layout {
     }
 }
 
-#[cfg(feature = "session")]
-struct Placement {
-    loc: Point<i32, Logical>,
-    size: Option<Size<i32, Logical>>,
-    bounds: Option<Size<i32, Logical>>,
-    maximized: bool,
-    reported: WindowMode,
+impl<BackendData: Backend + 'static> State<BackendData> {
+    /// Set a toplevel's pending size/bounds/states for `mode` over `area`.
+    pub(crate) fn set_toplevel_placement(
+        &self,
+        toplevel: &ToplevelSurface,
+        area: Rectangle<i32, Logical>,
+        mode: WindowMode,
+    ) {
+        toplevel.with_pending_state(|pending| {
+            pending.states.unset(xdg_toplevel::State::Maximized);
+            pending.states.unset(xdg_toplevel::State::Fullscreen);
+            match mode {
+                WindowMode::Fullscreen => {
+                    pending.size = Some(area.size);
+                    pending.bounds = None;
+                    pending.states.set(xdg_toplevel::State::Fullscreen);
+                }
+                WindowMode::Floating => {
+                    pending.size = None;
+                    pending.bounds = Some(area.size);
+                }
+                WindowMode::Maximized => {
+                    pending.size = Some(area.size);
+                    pending.bounds = None;
+                    pending.states.set(xdg_toplevel::State::Maximized);
+                }
+            }
+        });
+    }
+
+    /// The placement a toplevel's mode implies: fullscreen, dialog, or maximized.
+    pub(crate) fn placement_mode(
+        &self,
+        surface: &WlSurface,
+        toplevel: &ToplevelSurface,
+    ) -> WindowMode {
+        if self
+            .toplevels
+            .get(surface)
+            .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
+        {
+            WindowMode::Fullscreen
+        } else if is_dialog(toplevel) {
+            WindowMode::Floating
+        } else {
+            WindowMode::Maximized
+        }
+    }
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
@@ -123,12 +159,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .and_then(|t| t.parent())
     }
 
-    #[cfg(feature = "session")]
     fn window_for(&self, surface: &WlSurface) -> Option<Window> {
         self.toplevels.get(surface).map(|ws| ws.window.clone())
     }
 
-    #[cfg(feature = "session")]
     fn layout_mut(&mut self, output: &Output) -> &mut Layout {
         self.layouts.entry(output.clone()).or_default()
     }
@@ -139,7 +173,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     /// Size, position, xdg state, and Space z-order from the Comet model.
-    #[cfg(feature = "session")]
     pub fn apply_layout(&mut self, output: &Output) {
         let zone = layer_map_for_output(output).non_exclusive_zone();
         if let Some(focused) = self.active_window.clone() {
@@ -149,6 +182,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.layout_mut(output).set_zone(zone);
 
         let stack: Vec<WlSurface> = self.layout_mut(output).stack().to_vec();
+        let output_geo = self.space.output_geometry(output);
         for surface in &stack {
             let Some(window) = self.window_for(surface) else {
                 continue;
@@ -156,60 +190,43 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             let Some(toplevel) = window.toplevel() else {
                 continue;
             };
-            if self
-                .toplevels
-                .get(surface)
-                .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
-            {
-                continue;
-            }
 
-            let dialog = is_dialog(toplevel);
-            let placement = if dialog {
-                let loc = toplevel
-                    .parent()
-                    .and_then(|parent| self.window_for(&parent))
-                    .and_then(|parent| self.space.element_geometry(&parent))
-                    .map(|parent_geo| {
-                        Point::from((
-                            parent_geo.loc.x + (parent_geo.size.w - window.geometry().size.w) / 2,
-                            parent_geo.loc.y + (parent_geo.size.h - window.geometry().size.h) / 2,
-                        ))
-                    })
-                    .unwrap_or_else(|| centered_loc(zone, window.geometry()));
-                Placement {
-                    loc,
-                    size: None,
-                    bounds: Some(zone.size),
-                    maximized: false,
-                    reported: WindowMode::Floating,
+            // Fullscreen covers the output; dialogs center over their parent; else the work zone.
+            let mode = self.placement_mode(surface, toplevel);
+            let (area, loc) = match mode {
+                WindowMode::Fullscreen => {
+                    let Some(geo) = output_geo else {
+                        continue;
+                    };
+                    (geo, geo.loc)
                 }
-            } else {
-                Placement {
-                    loc: zone.loc,
-                    size: Some(zone.size),
-                    bounds: None,
-                    maximized: true,
-                    reported: WindowMode::Maximized,
+                WindowMode::Floating => {
+                    let loc = toplevel
+                        .parent()
+                        .and_then(|parent| self.window_for(&parent))
+                        .and_then(|parent| self.space.element_geometry(&parent))
+                        .map(|parent_geo| {
+                            Point::from((
+                                parent_geo.loc.x
+                                    + (parent_geo.size.w - window.geometry().size.w) / 2,
+                                parent_geo.loc.y
+                                    + (parent_geo.size.h - window.geometry().size.h) / 2,
+                            ))
+                        })
+                        .unwrap_or_else(|| centered_loc(zone, window.geometry()));
+                    (zone, loc)
                 }
+                WindowMode::Maximized => (zone, zone.loc),
             };
 
             if let Some(ws) = self.toplevels.get_mut(surface) {
-                ws.mode = placement.reported;
+                ws.mode = mode;
             }
-            toplevel.with_pending_state(|pending| {
-                pending.size = placement.size;
-                pending.bounds = placement.bounds;
-                if placement.maximized {
-                    pending.states.set(xdg_toplevel::State::Maximized);
-                } else {
-                    pending.states.unset(xdg_toplevel::State::Maximized);
-                }
-            });
+            self.set_toplevel_placement(toplevel, area, mode);
             if toplevel.is_initial_configure_sent() {
                 toplevel.send_pending_configure();
             }
-            self.space.relocate_element(&window, placement.loc);
+            self.space.relocate_element(&window, loc);
         }
 
         // Space z-order is the stack, back → front.

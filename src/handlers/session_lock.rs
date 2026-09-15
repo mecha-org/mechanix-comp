@@ -10,7 +10,7 @@ use smithay::wayland::session_lock::{
 
 impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
     fn lock_state(&mut self) -> &mut SessionLockManagerState {
-        &mut self.session.session_lock_state
+        &mut self.session_lock_state
     }
 
     fn lock(&mut self, confirmation: SessionLocker) {

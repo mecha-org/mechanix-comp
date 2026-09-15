@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +26,7 @@ use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, ObjectId,
 };
-use smithay::reexports::wayland_server::{BindError, Client, Display, DisplayHandle};
+use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
 use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Time};
 use smithay::wayland::commit_timing::{
     CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
@@ -48,9 +48,24 @@ use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 
+use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
+use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
+use smithay::wayland::idle_notify::IdleNotifierState;
+use smithay::wayland::input_method::InputMethodManagerState;
+use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::wlr_data_control::DataControlState;
+use smithay::wayland::session_lock::SessionLockManagerState;
+use smithay::wayland::shell::xdg::dialog::XdgDialogState;
+use smithay::wayland::text_input::TextInputManagerState;
+use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
+use smithay::wayland::xdg_activation::XdgActivationState;
+use smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager;
+
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::backend::Backend;
+use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
+use crate::handlers::output_power::OutputPowerManagerState;
 use crate::layout::Layout;
 
 /// How a toplevel is arranged right now.
@@ -127,8 +142,6 @@ fn set_output_lock_frame(output: &Output, frame: LockFrame) {
 
 pub struct State<BackendData: Backend + 'static> {
     pub socket_name: OsString,
-    #[cfg(feature = "session")]
-    pub session: crate::session::Session<BackendData>,
     pub display_handle: DisplayHandle,
 
     pub space: Space<Window>,
@@ -142,12 +155,19 @@ pub struct State<BackendData: Backend + 'static> {
     // Smithay State
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
-    pub xdg_decoration_state: XdgDecorationState,
     pub layer_shell_state: WlrLayerShellState,
     pub shm_state: ShmState,
-    pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<State<BackendData>>,
     pub popups: PopupManager,
+    pub xdg_activation_state: XdgActivationState,
+    pub data_device_state: DataDeviceState,
+    pub data_control_state: DataControlState,
+    pub session_lock_state: SessionLockManagerState,
+    pub foreign_toplevel: ForeignToplevelManagerState,
+    pub foreign_toplevel_list: ForeignToplevelListState,
+    pub idle_notifier_state: IdleNotifierState<State<BackendData>>,
+    pub idle_inhibiting_surfaces: HashSet<WlSurface>,
+    pub output_power: OutputPowerManagerState,
 
     pub seat: Seat<Self>,
     pub suppressed_keys: Vec<Keysym>,
@@ -164,17 +184,9 @@ pub struct State<BackendData: Backend + 'static> {
     pub backend_data: BackendData,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
-    /// `wp_commit_timing`: holds client commits until their requested time.
-    pub commit_timing: CommitTimingManagerState,
-    /// `wp_fifo`: holds commits until the previous frame was presented.
-    pub fifo: FifoManagerState,
-    /// `wp_presentation`: reports when a frame was actually presented.
-    pub presentation_state: PresentationState,
     pub lock_phase: LockPhase,
     pub lock_surfaces: Vec<LockSurface>,
     pub lock_surface_outputs: HashMap<ObjectId, Output>,
-    pub viewporter_state: ViewporterState,
-    pub fractional_scale_manager_state: FractionalScaleManagerState,
     /// One layout model per output; the source of truth for window stacking.
     #[allow(clippy::mutable_key_type)] // `Output` is interior-mutable, but stable as a key.
     pub layouts: HashMap<Output, Layout>,
@@ -187,21 +199,11 @@ pub struct State<BackendData: Backend + 'static> {
     pub active_window: Option<WlSurface>,
 }
 
-/// Which well-known name to bind. Does not change layout or protocols.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SocketName {
-    /// `wayland-1` … `wayland-32`.
-    Session,
-    /// `wayland-nest-0` … `wayland-nest-7`.
-    Nest,
-}
-
 impl<BackendData: Backend + 'static> State<BackendData> {
-    pub fn new_with_socket(
+    pub fn new(
         event_loop: &mut EventLoop<'static, Self>,
         display: Display<Self>,
         backend_data: BackendData,
-        socket: SocketName,
     ) -> Self {
         let dh = display.handle();
         let clock = Clock::new();
@@ -210,9 +212,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         // its renderer's format list is available. Dispatch is handled by the
         // blanket `delegate_dispatch2!`.
         let dmabuf_state = DmabufState::new();
-        let commit_timing = CommitTimingManagerState::new::<Self>(&dh);
-        let fifo = FifoManagerState::new::<Self>(&dh);
-        let presentation_state = PresentationState::new::<Self>(&dh, clock.id() as u32);
+        // `wp_commit_timing`: holds client commits until their requested time.
+        CommitTimingManagerState::new::<Self>(&dh);
+        // `wp_fifo`: holds commits until the previous frame was presented.
+        FifoManagerState::new::<Self>(&dh);
+        // `wp_presentation`: reports when a frame was actually presented.
+        PresentationState::new::<Self>(&dh, clock.id() as u32);
 
         let seat_name = backend_data.seat_name();
 
@@ -224,10 +229,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 xdg_toplevel::WmCapabilities::Fullscreen,
             ],
         );
-        let xdg_decoration_state = XdgDecorationState::new::<Self>(&dh);
+        XdgDecorationState::new::<Self>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
-        let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
+        OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let space = Space::default();
         let popups = PopupManager::default();
         let mut seat_state = SeatState::new();
@@ -235,31 +240,49 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         seat.add_keyboard(Default::default(), 200, 25).unwrap();
         let pointer = seat.add_pointer();
 
-        let viewporter_state = ViewporterState::new::<Self>(&dh);
-        let fractional_scale_manager_state = FractionalScaleManagerState::new::<Self>(&dh);
+        ViewporterState::new::<Self>(&dh);
+        FractionalScaleManagerState::new::<Self>(&dh);
         #[allow(clippy::mutable_key_type)] // `Output` is interior-mutable, but stable as a key.
         let layouts: HashMap<Output, Layout> = HashMap::new();
         CursorShapeManagerState::new::<Self>(&dh);
-        #[cfg(feature = "session")]
-        let session = crate::session::Session::new(&dh, event_loop);
+        let mut xdg_toplevel_icon = XdgToplevelIconManager::new::<Self>(&dh);
+        xdg_toplevel_icon.add_icon_size(64);
+        TextInputManagerState::new::<Self>(&dh);
+        InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
+        VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
+        let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
+        let data_device_state = DataDeviceState::new::<Self>(&dh);
+        let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
+        let foreign_toplevel = ForeignToplevelManagerState::new::<Self>(&dh);
+        let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
+        XdgDialogState::new::<Self>(&dh);
+        let idle_notifier_state = IdleNotifierState::new(&dh, event_loop.handle());
+        IdleInhibitManagerState::new::<Self>(&dh);
+        let data_control_state = DataControlState::new::<Self, _>(&dh, None, |_| true);
+        let output_power = OutputPowerManagerState::new::<Self>(&dh);
 
-        let socket_name = Self::init_wayland_listener(display, event_loop, socket);
+        let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
 
         Self {
             socket_name,
-            #[cfg(feature = "session")]
-            session,
+            xdg_activation_state,
+            data_device_state,
+            session_lock_state,
+            foreign_toplevel,
+            foreign_toplevel_list,
+            idle_notifier_state,
+            data_control_state,
+            output_power,
+            idle_inhibiting_surfaces: HashSet::new(),
             display_handle: dh,
             space,
             toplevels: HashMap::new(),
             loop_signal,
             compositor_state,
             xdg_shell_state,
-            xdg_decoration_state,
             layer_shell_state,
             shm_state,
-            output_manager_state,
             seat_state,
             popups,
             seat,
@@ -272,42 +295,17 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             backend_data,
             dmabuf_state,
             dmabuf_global: None,
-            commit_timing,
-            fifo,
-            presentation_state,
             lock_phase: LockPhase::Unlocked,
             lock_surfaces: Vec::new(),
             lock_surface_outputs: HashMap::new(),
-            viewporter_state,
-            fractional_scale_manager_state,
             layouts,
             layer_shell_on_demand_focus: None,
             active_window: None,
         }
     }
 
-    fn bind_socket(socket: SocketName) -> ListeningSocketSource {
-        match socket {
-            SocketName::Session => ListeningSocketSource::new_auto().unwrap(),
-            SocketName::Nest => {
-                for i in 0..8 {
-                    match ListeningSocketSource::with_name(&format!("wayland-nest-{i}")) {
-                        Ok(source) => return source,
-                        Err(BindError::AlreadyInUse) => {}
-                        Err(err) => panic!("failed to bind nest socket: {err}"),
-                    }
-                }
-                panic!("wayland-nest-0..7 all in use");
-            }
-        }
-    }
-
-    fn init_wayland_listener(
-        display: Display<Self>,
-        event_loop: &mut EventLoop<Self>,
-        socket: SocketName,
-    ) -> OsString {
-        let listening_socket = Self::bind_socket(socket);
+    fn init_wayland_listener(display: Display<Self>, event_loop: &mut EventLoop<Self>) -> OsString {
+        let listening_socket = ListeningSocketSource::new_auto().unwrap();
         let socket_name = listening_socket.socket_name().to_os_string();
 
         let loop_handle = event_loop.handle();
@@ -352,8 +350,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Queue a redraw on every output; the backend skips ones already pending.
     pub fn schedule_render(&mut self) {
-        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
-        for output in &outputs {
+        for output in self.space.outputs() {
             self.backend_data.schedule_render(output);
         }
     }
@@ -413,17 +410,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let done = self
             .space
             .outputs()
-            .filter(|output| {
-                #[cfg(feature = "session")]
-                {
-                    !self.session.output_power.is_off(output)
-                }
-                #[cfg(not(feature = "session"))]
-                {
-                    let _ = output;
-                    true
-                }
-            })
+            .filter(|output| !self.output_power.is_off(output))
             .all(|output| output_lock_frame(output) == LockFrame::Presented);
         if done
             && let LockPhase::Locking(locker) =
@@ -805,24 +792,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             })
         })
     }
-}
-
-#[cfg(feature = "session")]
-impl<B: Backend + 'static> State<B> {
-    pub fn new(
-        event_loop: &mut EventLoop<'static, Self>,
-        display: Display<Self>,
-        backend_data: B,
-    ) -> Self {
-        Self::new_with_socket(event_loop, display, backend_data, SocketName::Session)
-    }
 
     pub fn update_idle_inhibit(&mut self) {
-        self.session
-            .idle_inhibiting_surfaces
+        self.idle_inhibiting_surfaces
             .retain(|surface| surface.is_alive());
-        let inhibited = !self.session.idle_inhibiting_surfaces.is_empty();
-        self.session.idle_notifier_state.set_is_inhibited(inhibited);
+        let inhibited = !self.idle_inhibiting_surfaces.is_empty();
+        self.idle_notifier_state.set_is_inhibited(inhibited);
     }
 }
 

@@ -11,9 +11,7 @@ use smithay::wayland::dmabuf::DmabufFeedback;
 
 use crate::state::State;
 
-#[cfg(feature = "session")]
 pub mod udev;
-#[cfg(feature = "session")]
 pub mod winit;
 
 /// 2x only for clearly HiDPI panels: tall enough, real physical size, >192 DPI on both axes.

@@ -782,7 +782,7 @@ impl State<UdevData> {
             .remove_global::<State<UdevData>>(surface.global);
         if let Some(output) = self.output_for_crtc(node, crtc) {
             self.release_fifo_barriers(&output);
-            self.session.output_power.output_removed(&output);
+            self.output_power.output_removed(&output);
             self.space.unmap_output(&output);
             self.maybe_send_locked();
         }
@@ -819,7 +819,7 @@ impl State<UdevData> {
             return;
         };
 
-        if self.session.output_power.is_off(&output) {
+        if self.output_power.is_off(&output) {
             return;
         }
         if self.backend_data.paused {

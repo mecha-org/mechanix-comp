@@ -36,5 +36,6 @@ default-features = false
 
 [dependencies]
 thiserror = "2.0.20"
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_debug"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xcursor = "0.3.11"

@@ -1,6 +1,8 @@
 use compositor::backend;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_logging();
+
     // Backend selection: an explicit `MECHA_BACKEND` wins; otherwise we assume
     // we're nested (winit) when a parent display server is present, and drive
     // KMS/DRM directly (udev) when running from a bare VT.
@@ -19,6 +21,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         backend::udev::run()
     }
+}
+
+/// Install a stderr subscriber only when `MECHANIX_COMP_LOG` is set.
+fn init_logging() {
+    let Ok(filter) = std::env::var("MECHANIX_COMP_LOG") else {
+        return;
+    };
+    let filter = if filter.trim().is_empty() {
+        "compositor=info,smithay=warn".to_owned()
+    } else {
+        filter
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 /// True when a parent Wayland or X11 display is already running.

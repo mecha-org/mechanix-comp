@@ -26,16 +26,6 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface.clone());
 
-        #[cfg(feature = "session")]
-        if let Some(output) = self.space.outputs().next().cloned() {
-            // `set_parent` hasn't arrived yet, so only set bounds here; the first
-            // commit decides sizing/mapping in `handle_commit`.
-            let zone = layer_map_for_output(&output).non_exclusive_zone();
-            surface.with_pending_state(|state| {
-                state.bounds = Some(zone.size);
-            });
-        }
-
         self.toplevels.insert(
             surface.wl_surface().clone(),
             WindowState {
@@ -326,7 +316,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     /// Unmap a toplevel whose buffer went away and move focus to the next window.
     #[cfg(feature = "session")]
     fn unmap_toplevel(&mut self, surface: &WlSurface, window: &Window) {
-        self.toplevels.get_mut(surface).unwrap().mapped = false;
+        let ws = self.toplevels.get_mut(surface).unwrap();
+        ws.mapped = false;
+        // A remap is a fresh mapping: reset the mode so it is re-evaluated.
+        ws.mode = WindowMode::Floating;
         for layout in self.layouts.values_mut() {
             layout.remove(surface);
         }
@@ -413,6 +406,7 @@ pub fn handle_commit<BackendData: Backend + 'static>(
         let ws = &state.toplevels[surface];
         let window = ws.window.clone();
         let mapped = ws.mapped;
+        let mode = ws.mode;
         let buffered = with_renderer_surface_state(surface, |states| states.buffer().is_some())
             .unwrap_or(false);
 
@@ -422,7 +416,25 @@ pub fn handle_commit<BackendData: Backend + 'static>(
             // Unmapped and bufferless: the client is (re)initializing, configure it.
             (false, false) => {
                 if let Some(toplevel) = window.toplevel() {
-                    toplevel.send_configure();
+                    if mode != WindowMode::Fullscreen
+                        && let Some(zone) = state
+                            .primary_output()
+                            .map(|output| layer_map_for_output(&output).non_exclusive_zone())
+                    {
+                        let dialog = is_dialog(toplevel);
+                        toplevel.with_pending_state(|pending| {
+                            if dialog {
+                                pending.size = None;
+                                pending.bounds = Some(zone.size);
+                                pending.states.unset(xdg_toplevel::State::Maximized);
+                            } else {
+                                pending.size = Some(zone.size);
+                                pending.bounds = None;
+                                pending.states.set(xdg_toplevel::State::Maximized);
+                            }
+                        });
+                    }
+                    toplevel.send_pending_configure();
                 }
             }
             (true, true) => {}

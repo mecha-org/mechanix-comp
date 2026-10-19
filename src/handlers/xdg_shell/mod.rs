@@ -45,6 +45,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
             layout.remove(wl);
         }
         self.toplevels.remove(wl);
+        self.stop_captures_for_toplevel(wl);
         let window = self
             .space
             .elements()
@@ -76,6 +77,13 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         }
         self.unconstrain_popup(&surface);
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
+    }
+
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        // A closed popup damages the window it belonged to.
+        if let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(surface)) {
+            self.capture_commit(&root);
+        }
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
@@ -295,6 +303,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             layout.remove(surface);
         }
         self.space.unmap_elem(window);
+        self.stop_captures_for_toplevel(surface);
         self.focus_topmost();
         self.schedule_render();
     }

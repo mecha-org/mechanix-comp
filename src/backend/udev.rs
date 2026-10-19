@@ -54,6 +54,7 @@ use tracing::{error, info, warn};
 
 use crate::backend::{Backend, Wakeups, output_refresh};
 use crate::drawing::{PointerElement, cached_pointer_buffer};
+use crate::handlers::image_copy_capture::{OutputFrame, capture_output};
 use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
 
@@ -806,6 +807,7 @@ impl State<UdevData> {
         self.display_handle
             .remove_global::<State<UdevData>>(surface.global);
         if let Some(output) = self.output_for_crtc(node, crtc) {
+            self.stop_captures_for_output(&output);
             self.release_fifo_barriers(&output);
             self.output_power.output_removed(&output);
             self.space.unmap_output(&output);
@@ -862,6 +864,7 @@ impl State<UdevData> {
 
         let visible = self.visible_surfaces(&output);
         let locked = self.is_locked();
+        let presented: Duration = self.clock.now().into();
 
         let mut queued = false;
         let mut render_failed = false;
@@ -983,8 +986,21 @@ impl State<UdevData> {
                 clear_color,
                 FrameFlags::DEFAULT,
             ) {
-                Ok(result) if !result.is_empty => Some(result.states),
-                Ok(_) => None,
+                Ok(result) => {
+                    capture_output(
+                        &mut self.capture_sessions,
+                        renderer,
+                        &self.loop_handle,
+                        OutputFrame {
+                            output: &output,
+                            elements: &elements,
+                            clear_color,
+                            composited: Some(&result),
+                            presented,
+                        },
+                    );
+                    (!result.is_empty).then_some(result.states)
+                }
                 Err(err) => {
                     warn!("Rendering failed: {err}");
                     render_failed = true;

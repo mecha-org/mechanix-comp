@@ -39,6 +39,10 @@ use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::drm_syncobj::DrmSyncobjState;
 use smithay::wayland::fifo::{FifoBarrierCachedState, FifoManagerState};
 use smithay::wayland::fractional_scale::{FractionalScaleManagerState, with_fractional_scale};
+use smithay::wayland::image_capture_source::{
+    OutputCaptureSourceState, ToplevelCaptureSourceState,
+};
+use smithay::wayland::image_copy_capture::ImageCopyCaptureState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::presentation::{PresentationState, Refresh};
 use smithay::wayland::session_lock::{LockSurface, SessionLocker};
@@ -69,6 +73,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::backend::Backend;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
+use crate::handlers::image_copy_capture::CaptureSession;
 use crate::handlers::output_power::OutputPowerManagerState;
 use crate::layout::Layout;
 
@@ -176,6 +181,13 @@ pub struct State<BackendData: Backend + 'static> {
     pub idle_inhibiting_surfaces: HashSet<WlSurface>,
     pub output_power: OutputPowerManagerState,
 
+    /// Screen capture (ext-image-capture-source, ext-image-copy-capture).
+    pub output_capture_source_state: OutputCaptureSourceState,
+    pub toplevel_capture_source_state: ToplevelCaptureSourceState,
+    pub image_copy_capture_state: ImageCopyCaptureState,
+    /// Live capture sessions and their in-flight frames.
+    pub capture_sessions: Vec<CaptureSession>,
+
     pub seat: Seat<Self>,
     pub suppressed_keys: Vec<Keysym>,
     pub cursor_status: CursorImageStatus,
@@ -274,6 +286,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let idle_notifier_state = IdleNotifierState::new(&dh, event_loop.handle());
         IdleInhibitManagerState::new::<Self>(&dh);
         let output_power = OutputPowerManagerState::new::<Self>(&dh);
+        let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
+        let toplevel_capture_source_state = ToplevelCaptureSourceState::new::<Self>(&dh);
+        let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
@@ -290,6 +305,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             idle_notifier_state,
             data_control_state,
             output_power,
+            output_capture_source_state,
+            toplevel_capture_source_state,
+            image_copy_capture_state,
+            capture_sessions: Vec::new(),
             idle_inhibiting_surfaces: HashSet::new(),
             display_handle: dh,
             space,

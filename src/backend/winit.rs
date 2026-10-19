@@ -23,6 +23,7 @@ use tracing::warn;
 
 use crate::backend::{Backend, Wakeups};
 use crate::drawing::{PointerElement, cached_pointer_buffer};
+use crate::handlers::image_copy_capture::{OutputFrame, capture_output};
 use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
 
@@ -175,6 +176,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 // the (possibly changed) non-exclusive zone.
                 layer_map_for_output(&output).arrange();
                 state.apply_layout(&output);
+                state.update_capture_constraints(&output);
 
                 if state.is_locked() {
                     let logical_size = state.space.output_geometry(&output).map(|geo| geo.size);
@@ -211,7 +213,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 let visible = state.visible_surfaces(&output);
                 let locked = state.is_locked();
-                let result = {
+                let (result, elements, clear_color) = {
                     let (renderer, mut framebuffer) = state.backend_data.backend.bind().unwrap();
                     let scale =
                         smithay::utils::Scale::from(output.current_scale().fractional_scale());
@@ -295,13 +297,29 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &visible,
                         custom_elements,
                     );
-                    damage_tracker
+                    let result = damage_tracker
                         .render_output(renderer, &mut framebuffer, 0, &elements, clear_color)
-                        .unwrap()
+                        .unwrap();
+                    (result, elements, clear_color)
                 };
                 state.update_surface_scanout(&output, &result.states);
                 let feedback = state.take_presentation_feedback(&output, &result.states);
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
+
+                // After the swap: capturing unbinds the window's surface.
+                let presented: Duration = state.clock.now().into();
+                capture_output(
+                    &mut state.capture_sessions,
+                    state.backend_data.backend.renderer(),
+                    &state.loop_handle,
+                    OutputFrame {
+                        output: &output,
+                        elements: &elements,
+                        clear_color,
+                        composited: None,
+                        presented,
+                    },
+                );
 
                 state.send_frame_callbacks(&output, Duration::from(state.clock.now()));
                 state.lock_frame_queued(&output);

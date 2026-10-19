@@ -6,6 +6,7 @@ pub mod drm_syncobj;
 pub mod foreign_toplevel;
 pub mod fractional_scale;
 pub mod idle;
+pub mod image_copy_capture;
 pub mod layer_shell;
 pub mod output;
 pub mod output_power;

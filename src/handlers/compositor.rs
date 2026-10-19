@@ -107,17 +107,26 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        if !is_sync_subsurface(surface) {
+        let root = (!is_sync_subsurface(surface)).then(|| {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            if let Some(window) = self.toplevels.get(&root).map(|ws| ws.window.clone()) {
-                window.on_commit();
-            }
+            root
+        });
+        if let Some(window) = root
+            .as_ref()
+            .and_then(|root| self.toplevels.get(root))
+            .map(|ws| ws.window.clone())
+        {
+            window.on_commit();
         }
 
         self.popups.commit(surface);
+        if let Some(root) = &root {
+            self.capture_commit(root);
+        }
+
         self.ensure_initial_configure(surface);
         // A commit is new damage; render on demand instead of polling.
         self.schedule_render();

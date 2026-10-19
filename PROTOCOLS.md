@@ -38,6 +38,8 @@ Smithay: ❌ means we hand-roll it.
 | `wp_linux_drm_syncobj_manager_v1` | ✅ | 1 / 1 | ✅ | |
 | `ext_foreign_toplevel_list_v1` | ✅ | 1 / 1 | ✅ | |
 | `ext_idle_notifier_v1` | ✅ | 2 / 2 | ✅ | |
+| `ext_image_capture_source_v1` | ✅ | 1 / 1 | ✅ | |
+| `ext_image_copy_capture_v1` | 🟡 | 1 / 1 | ✅ | recorders can't capture the cursor separately |
 | `ext_session_lock_manager_v1` | ✅ | 1 / 1 | ✅ | |
 | `xdg_activation_v1` | 🟡 | 1 / 1 | ✅ | ignores `app_id`/`serial` |
 | `xdg_wm_dialog_v1` | ✅ | 1 / 1 | ✅ | |
@@ -74,7 +76,6 @@ Smithay: ❌ means we hand-roll it.
 | --- | --- |
 | `xwayland_shell_v1` | ✅ |
 | `wl_drm` | ❌ |
-| `ext_image_copy_capture_v1` / `ext_image_capture_source_v1` | ✅ |
 | `wp_keyboard_shortcuts_inhibit_v1` | ✅ |
 | `wp_pointer_warp_v1` | ✅ |
 | `wp_pointer_gestures_v1` | ✅ |

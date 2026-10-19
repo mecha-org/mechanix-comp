@@ -408,20 +408,54 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         }
         let scale = output.current_scale().fractional_scale();
-        // Visible surfaces are acked every presented frame; hidden ones get
-        // one ack per second so their frame clocks keep running (1Hz).
-        let throttle = Some(Duration::from_secs(1));
+        // Only presented surfaces are acked; hidden ones are suspended instead.
         for window in self.space.elements() {
-            window.send_frame(output, now, throttle, |surface, data| {
+            window.send_frame(output, now, None, |surface, data| {
                 surface_primary_scanout_output(surface, data)
             });
             self.push_fractional_scale(window.toplevel().unwrap().wl_surface(), scale);
         }
         for layer_surface in layer_map_for_output(output).layers() {
-            layer_surface.send_frame(output, now, throttle, |surface, data| {
+            layer_surface.send_frame(output, now, None, |surface, data| {
                 surface_primary_scanout_output(surface, data)
             });
             self.push_fractional_scale(layer_surface.wl_surface(), scale);
+        }
+    }
+
+    /// Suspend mapped toplevels nothing shows, unless they are being recorded.
+    pub fn update_suspended(&mut self) {
+        let visible: HashSet<WlSurface> = if self.is_locked() {
+            HashSet::new()
+        } else {
+            self.space
+                .outputs()
+                .filter(|output| !self.output_power.is_off(output))
+                .flat_map(|output| self.visible_surfaces(output))
+                .collect()
+        };
+        for (surface, window_state) in &self.toplevels {
+            let Some(toplevel) = window_state.window.toplevel() else {
+                continue;
+            };
+            // Unmapped windows still have to draw their first buffer.
+            let suspend = window_state.mapped
+                && !visible.contains(surface)
+                && !self.is_toplevel_recorded(surface);
+            let changed = toplevel.with_pending_state(|pending| {
+                if pending.states.contains(xdg_toplevel::State::Suspended) == suspend {
+                    return false;
+                }
+                if suspend {
+                    pending.states.set(xdg_toplevel::State::Suspended);
+                } else {
+                    pending.states.unset(xdg_toplevel::State::Suspended);
+                }
+                true
+            });
+            if changed && toplevel.is_initial_configure_sent() {
+                toplevel.send_pending_configure();
+            }
         }
     }
 

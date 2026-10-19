@@ -468,7 +468,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         if !surface.alive() {
             return;
         }
-        // Recording ended meanwhile: back to the 1Hz hidden clock.
+        // Recording ended meanwhile: the window gets suspended again.
         let recorded = self.is_toplevel_recorded(surface);
         let now: Duration = self.clock.now().into();
         with_states(surface, |states| {

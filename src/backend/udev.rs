@@ -476,6 +476,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     event_loop.run(None, &mut state, move |state| {
         state.refresh_space();
         state.foreign_toplevel_refresh();
+        state.update_suspended();
         state.update_idle_inhibit();
         let _ = state.display_handle.flush_clients();
     })?;

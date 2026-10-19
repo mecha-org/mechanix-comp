@@ -127,11 +127,8 @@ pub struct UdevData {
     renderer_node: Option<DrmNode>,
     devices: HashMap<DrmNode, DeviceData>,
     keyboards: Vec<smithay::reexports::input::Device>,
-    /// Connected pointer devices; the software cursor renders only while non-empty.
-    pointers: Vec<smithay::reexports::input::Device>,
-    /// True once a pointer device has actually moved; a phantom pointer (e.g.
-    /// the HDMI controller) must not summon a cursor stuck at (0,0).
-    pointer_moved: bool,
+    /// Cursor shown: pointer activity shows it, touch hides it.
+    cursor_visible: bool,
     /// Loaded xcursor theme used to pick the current cursor frame.
     pointer_image: crate::cursor::Cursor,
     /// Cache of imported cursor frames, keyed by the raw xcursor image.
@@ -326,8 +323,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         renderer_node: None,
         devices: HashMap::new(),
         keyboards: Vec::new(),
-        pointers: Vec::new(),
-        pointer_moved: false,
+        cursor_visible: false,
         pointer_image: crate::cursor::Cursor::load(),
         pointer_images: Vec::new(),
         pointer_element: PointerElement::default(),
@@ -372,28 +368,26 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = device.config_accel_set_profile(AccelProfile::Adaptive);
                         let _ = device.config_accel_set_speed(0.0);
                     }
-                    data.backend_data.pointers.push(device.clone());
-                    data.backend_data.pointer_moved = false;
                 }
-            } else if let InputEvent::DeviceRemoved { ref device } = event {
-                if device.has_capability(DeviceCapability::Keyboard) {
-                    data.backend_data.keyboards.retain(|item| item != device);
-                }
-                if device.has_capability(DeviceCapability::Pointer) {
-                    data.backend_data.pointers.retain(|item| item != device);
-                    if data.backend_data.pointers.is_empty() {
-                        data.backend_data.pointer_moved = false;
-                    }
-                }
+            } else if let InputEvent::DeviceRemoved { ref device } = event
+                && device.has_capability(DeviceCapability::Keyboard)
+            {
+                data.backend_data.keyboards.retain(|item| item != device);
             }
 
-            // A real pointer moving is what summons the cursor; touch and the
-            // phantom HDMI "pointer" never move it.
-            if matches!(
-                event,
-                InputEvent::PointerMotion { .. } | InputEvent::PointerMotionAbsolute { .. }
-            ) {
-                data.backend_data.pointer_moved = true;
+            let cursor_visible = match event {
+                InputEvent::PointerMotion { .. }
+                | InputEvent::PointerMotionAbsolute { .. }
+                | InputEvent::PointerButton { .. }
+                | InputEvent::PointerAxis { .. } => Some(true),
+                InputEvent::TouchDown { .. } => Some(false),
+                _ => None,
+            };
+            if let Some(visible) = cursor_visible
+                && visible != data.backend_data.cursor_visible
+            {
+                data.backend_data.cursor_visible = visible;
+                data.schedule_render();
             }
 
             data.process_input_event(event)
@@ -886,11 +880,9 @@ impl State<UdevData> {
                 let pointer_location = self.pointer.current_location();
 
                 let mut custom_elements: Vec<Element> = Vec::new();
-                // Render the cursor only after a real pointer has moved; the
-                // touch-only panel (and phantom devices) never summon it.
-                let pointer_present =
-                    self.backend_data.pointer_moved && !self.backend_data.pointers.is_empty();
-                if pointer_present && output_geometry.to_f64().contains(pointer_location) {
+                if self.backend_data.cursor_visible
+                    && output_geometry.to_f64().contains(pointer_location)
+                {
                     let cursor_hotspot =
                         if let CursorImageStatus::Surface(surface) = &self.cursor_status {
                             with_states(surface, |states| {

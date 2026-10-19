@@ -58,6 +58,7 @@ use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
 use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::idle_notify::IdleNotifierState;
 use smithay::wayland::input_method::InputMethodManagerState;
+use smithay::wayland::security_context::SecurityContextState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
@@ -250,7 +251,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             ],
         );
         XdgDecorationState::new::<Self>(&dh);
-        let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        let layer_shell_state =
+            WlrLayerShellState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let space = Space::default();
@@ -270,25 +272,34 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         xdg_toplevel_icon.add_icon_size(64);
         xdg_toplevel_icon.add_icon_size(128);
         TextInputManagerState::new::<Self>(&dh);
-        InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
-        VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
+        InputMethodManagerState::new::<Self, _>(&dh, client_is_unrestricted);
+        VirtualKeyboardManagerState::new::<Self, _>(&dh, client_is_unrestricted);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
-        let data_control_state =
-            DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        let data_control_state = DataControlState::new::<Self, _>(
+            &dh,
+            Some(&primary_selection_state),
+            client_is_unrestricted,
+        );
         let xdg_foreign_state = XdgForeignState::new::<Self>(&dh);
         SinglePixelBufferState::new::<Self>(&dh);
-        let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
+        let session_lock_state =
+            SessionLockManagerState::new::<Self, _>(&dh, client_is_unrestricted);
         let foreign_toplevel = ForeignToplevelManagerState::new::<Self>(&dh);
-        let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
+        let foreign_toplevel_list =
+            ForeignToplevelListState::new_with_filter::<Self>(&dh, client_is_unrestricted);
         XdgDialogState::new::<Self>(&dh);
         let idle_notifier_state = IdleNotifierState::new(&dh, event_loop.handle());
         IdleInhibitManagerState::new::<Self>(&dh);
         let output_power = OutputPowerManagerState::new::<Self>(&dh);
-        let output_capture_source_state = OutputCaptureSourceState::new::<Self>(&dh);
-        let toplevel_capture_source_state = ToplevelCaptureSourceState::new::<Self>(&dh);
-        let image_copy_capture_state = ImageCopyCaptureState::new::<Self>(&dh);
+        SecurityContextState::new::<Self, _>(&dh, client_is_unrestricted);
+        let output_capture_source_state =
+            OutputCaptureSourceState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
+        let toplevel_capture_source_state =
+            ToplevelCaptureSourceState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
+        let image_copy_capture_state =
+            ImageCopyCaptureState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
@@ -875,6 +886,15 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
+    /// Connected through a security context (e.g. a Flatpak app).
+    pub restricted: bool,
+}
+
+/// Whether `client` may see privileged globals (not sandboxed).
+pub fn client_is_unrestricted(client: &Client) -> bool {
+    client
+        .get_data::<ClientState>()
+        .is_some_and(|data| !data.restricted)
 }
 
 impl ClientData for ClientState {

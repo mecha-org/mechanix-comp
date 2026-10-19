@@ -142,6 +142,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 impl<BackendData: Backend + 'static> GlobalDispatch2<ZwlrOutputPowerManagerV1, State<BackendData>>
     for OutputPowerManagerUdata
 {
+    fn can_view(&self, client: &Client) -> bool {
+        crate::state::client_is_unrestricted(client)
+    }
+
     fn bind(
         &self,
         _state: &mut State<BackendData>,

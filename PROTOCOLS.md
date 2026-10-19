@@ -36,6 +36,7 @@ Smithay: ❌ means we hand-roll it.
 | `wp_fifo_manager_v1` | ✅ | 1 / 1 | ✅ | |
 | `wp_fractional_scale_manager_v1` | ✅ | 1 / 1 | ✅ | |
 | `wp_linux_drm_syncobj_manager_v1` | ✅ | 1 / 1 | ✅ | |
+| `wp_security_context_v1` | ✅ | 1 / 1 | ✅ | |
 | `ext_foreign_toplevel_list_v1` | ✅ | 1 / 1 | ✅ | |
 | `ext_idle_notifier_v1` | ✅ | 2 / 2 | ✅ | |
 | `ext_image_capture_source_v1` | ✅ | 1 / 1 | ✅ | |
@@ -80,7 +81,6 @@ Smithay: ❌ means we hand-roll it.
 | `wp_pointer_warp_v1` | ✅ |
 | `wp_pointer_gestures_v1` | ✅ |
 | `wp_drm_lease_v1` | ✅ |
-| `wp_security_context_v1` | ✅ |
 | `wp_content_type_v1` | ✅ |
 | `wp_alpha_modifier_v1` | ✅ |
 | `ext_background_effect_v1` | ✅ |

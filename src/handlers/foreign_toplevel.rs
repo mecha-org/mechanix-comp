@@ -507,6 +507,10 @@ impl<BackendData: Backend + 'static> ForeignToplevelListHandler for State<Backen
 impl<BackendData: Backend + 'static>
     GlobalDispatch2<ZwlrForeignToplevelManagerV1, State<BackendData>> for ForeignToplevelUdata
 {
+    fn can_view(&self, client: &Client) -> bool {
+        crate::state::client_is_unrestricted(client)
+    }
+
     fn bind(
         &self,
         state: &mut State<BackendData>,

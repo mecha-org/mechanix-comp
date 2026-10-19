@@ -11,6 +11,7 @@ pub mod layer_shell;
 pub mod output;
 pub mod output_power;
 pub mod seat;
+pub mod security_context;
 pub mod session_lock;
 pub mod shm;
 pub mod xdg_activation;

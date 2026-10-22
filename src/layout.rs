@@ -87,18 +87,6 @@ impl Layout {
     pub fn top(&self) -> Option<&WlSurface> {
         self.stack.last()
     }
-
-    /// What is on screen when `focused` leads the group: the ancestor chain.
-    pub fn visible(
-        &self,
-        focused: Option<&WlSurface>,
-        parent_of: impl Fn(&WlSurface) -> Option<WlSurface>,
-    ) -> HashSet<WlSurface> {
-        match focused {
-            Some(focused) => ancestor_chain(focused, parent_of).into_iter().collect(),
-            None => HashSet::new(),
-        }
-    }
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
@@ -255,10 +243,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let Some(layout) = self.layouts.get(output) else {
             return HashSet::new();
         };
-        layout
-            .visible(self.active_window.as_ref(), |s| self.parent_of(s))
-            .into_iter()
-            .filter(|s| layout.contains(s))
-            .collect()
+        let mut visible = self.active_group();
+        visible.retain(|s| layout.contains(s));
+        visible
     }
 }

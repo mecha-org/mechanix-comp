@@ -114,33 +114,40 @@ pub fn output_elements(
             );
         }
 
-        let is_fullscreen = |window: &Window| {
-            window.toplevel().is_some_and(|toplevel| {
-                toplevels
-                    .get(toplevel.wl_surface())
-                    .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
-            })
+        let windows = |renderer: &mut GlesRenderer, fullscreen: bool| -> Vec<Element> {
+            let Some(output_geo) = space.output_geometry(output) else {
+                return Vec::new();
+            };
+            let wanted = |window: &Window| {
+                window.toplevel().is_some_and(|toplevel| {
+                    let surface = toplevel.wl_surface();
+                    visible.contains(surface)
+                        && toplevels
+                            .get(surface)
+                            .is_some_and(|ws| (ws.mode == WindowMode::Fullscreen) == fullscreen)
+                })
+            };
+            space
+                .elements()
+                .rev()
+                .filter(|window| wanted(window))
+                .flat_map(|window| {
+                    let loc = space.element_location(window).unwrap()
+                        - window.geometry().loc
+                        - output_geo.loc;
+                    window.render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                        renderer,
+                        loc.to_physical_precise_round(scale),
+                        Scale::from(scale),
+                        1.0,
+                    )
+                })
+                .map(|e| OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e))))
+                .collect()
         };
 
-        // Fullscreen windows, topmost first (their own popups included).
-        if let Some(output_geo) = space.output_geometry(output) {
-            for window in space.elements().rev().filter(|w| is_fullscreen(w)) {
-                let loc = space.element_location(window).unwrap() - output_geo.loc;
-                elements.extend(
-                    window
-                        .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                            renderer,
-                            loc.to_physical_precise_round(scale),
-                            Scale::from(scale),
-                            1.0,
-                        )
-                        .into_iter()
-                        .map(|e| {
-                            OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
-                        }),
-                );
-            }
-        }
+        // Fullscreen windows above the Top layer.
+        elements.extend(windows(renderer, true));
 
         // Top layers (and their popups) above the non-fullscreen windows.
         for surface in &top {
@@ -188,70 +195,8 @@ pub fn output_elements(
             }
         }
 
-        // The windows. Hidden (non-visible) windows are skipped.
-        if let Some(output_geo) = space.output_geometry(output) {
-            let in_visible = |window: &Window| {
-                window
-                    .toplevel()
-                    .is_some_and(|t| visible.contains(t.wl_surface()))
-            };
-            if space.elements().any(is_fullscreen) {
-                // Fullscreen windows were rendered above; render the rest
-                // individually so they stay below the Top layer.
-                for window in space.elements().rev().filter(|w| !is_fullscreen(w)) {
-                    if !in_visible(window) {
-                        continue;
-                    }
-                    let loc = space.element_location(window).unwrap() - output_geo.loc;
-                    elements.extend(
-                        window
-                            .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                                renderer,
-                                loc.to_physical_precise_round(scale),
-                                Scale::from(scale),
-                                1.0,
-                            )
-                            .into_iter()
-                            .map(|e| {
-                                OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
-                            }),
-                    );
-                }
-            } else if visible.len() == space.elements().count() {
-                // Fast path: every window is visible, render the whole space at
-                // once.
-                elements.extend(
-                    space
-                        .render_elements_for_region(renderer, &output_geo, scale, 1.0)
-                        .into_iter()
-                        .map(|e| {
-                            OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
-                        }),
-                );
-            } else {
-                // Only a subset is visible (e.g. the active group): render
-                // those individually so the rest stay hidden.
-                for window in space.elements().rev() {
-                    if !in_visible(window) {
-                        continue;
-                    }
-                    let loc = space.element_location(window).unwrap() - output_geo.loc;
-                    elements.extend(
-                        window
-                            .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                                renderer,
-                                loc.to_physical_precise_round(scale),
-                                Scale::from(scale),
-                                1.0,
-                            )
-                            .into_iter()
-                            .map(|e| {
-                                OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
-                            }),
-                    );
-                }
-            }
-        }
+        // The other windows, below the Top layer.
+        elements.extend(windows(renderer, false));
 
         // Background/Bottom layer surfaces (the bars), below the windows.
         // Their popups were hoisted above the windows already.

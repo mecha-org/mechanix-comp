@@ -30,7 +30,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{
     Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
-use smithay::wayland::compositor::with_states;
+use smithay::wayland::compositor::{get_parent, with_states};
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelHandle;
 use smithay::wayland::image_capture_source::{
@@ -384,17 +384,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         {
             return;
         }
-        let toplevel = if self.toplevels.contains_key(root) {
-            root.clone()
-        } else {
-            match self
-                .popups
-                .find_popup(root)
-                .map(|popup| find_popup_root_surface(&popup))
-            {
-                Some(Ok(toplevel)) => toplevel,
-                _ => return,
-            }
+        let Some(toplevel) = self.toplevel_of(root) else {
+            return;
         };
         let mut recorded = false;
         for index in 0..self.capture_sessions.len() {
@@ -406,6 +397,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         if recorded {
             self.wake_recorded_toplevel(&toplevel);
         }
+    }
+
+    /// The toplevel a surface belongs to, through subsurfaces and popups.
+    fn toplevel_of(&self, surface: &WlSurface) -> Option<WlSurface> {
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        if self.toplevels.contains_key(&root) {
+            return Some(root);
+        }
+        find_popup_root_surface(&self.popups.find_popup(&root)?).ok()
     }
 
     /// Give a recorded hidden toplevel one frame callback per refresh.
@@ -515,14 +518,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         })
     }
 
-    /// The cursor's position in `window`'s capture, if it's over the window.
-    fn cursor_over(&self, window: &Window) -> Option<Point<i32, Logical>> {
-        let pointer = self.pointer.current_location();
-        let (under, _) = self.space.element_under(pointer)?;
-        let origin = self.space.element_location(window)?;
-        (under == window).then(|| pointer.to_i32_round() - origin - self.cursor_hotspot())
-    }
-
     /// Re-check toplevel captures that paint the cursor; it may have moved.
     pub fn refresh_cursor_captures(&mut self) {
         for index in 0..self.capture_sessions.len() {
@@ -545,13 +540,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let Some(target) = self.toplevel_target(surface) else {
             return;
         };
-        let presented: Duration = self.clock.now().into();
-        let canvas = Canvas {
-            size: (target.size.w, target.size.h).into(),
-            scale: Scale::from(target.scale),
-            transform: Transform::Normal,
-            clear: TRANSPARENT,
-        };
+        let focus = self.pointer.current_focus();
+        let has_pointer =
+            focus.and_then(|focus| self.toplevel_of(&focus)).as_ref() == Some(surface);
         let capture = &mut self.capture_sessions[index];
         // Track damage only while a frame waits, i.e. since the last delivery.
         if !capture.ensure_size(target.size, self.backend_data.renderer())
@@ -560,23 +551,28 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         }
 
+        let scale = Scale::from(target.scale);
         let mut elements: Vec<Element> = Vec::new();
         if capture.session.draw_cursor()
-            && let Some(cursor) = self.cursor_over(&target.window)
+            && has_pointer
+            && let Some(origin) = self.space.element_location(&target.window)
         {
-            let location = cursor.to_physical_precise_round(canvas.scale);
-            elements = self.backend_data.cursor_elements(location, canvas.scale);
+            let cursor =
+                self.pointer.current_location().to_i32_round() - origin - self.cursor_hotspot();
+            let location = cursor.to_physical_precise_round(scale);
+            elements = self.backend_data.cursor_elements(location, scale);
         }
         let renderer = self.backend_data.renderer();
-        let location =
-            Point::<i32, Logical>::from((-target.geometry.loc.x, -target.geometry.loc.y))
-                .to_physical_precise_round(canvas.scale);
-        elements.extend(target.window.render_elements::<Element>(
-            renderer,
-            location,
-            canvas.scale,
-            1.0,
-        ));
+        // The window's geometry origin is the capture's top left.
+        let offset = (Point::default() - target.geometry.loc).to_physical_precise_round(scale);
+        elements.extend(target.window.render_elements(renderer, offset, scale, 1.0));
+        let canvas = Canvas {
+            size: (target.size.w, target.size.h).into(),
+            scale,
+            transform: Transform::Normal,
+            clear: TRANSPARENT,
+        };
+        let presented = self.clock.now().into();
         self.capture_sessions[index].update(
             renderer,
             &self.loop_handle,

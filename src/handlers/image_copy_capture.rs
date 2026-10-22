@@ -8,7 +8,6 @@ use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::drm::compositor::RenderFrameResult;
 use smithay::backend::drm::gbm::GbmFramebuffer;
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{
     AsRenderElements, Element as _, Id, Kind, RenderElement, RenderElementPresentationState,
 };
@@ -445,10 +444,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let Some(delay) = delay else {
             return;
         };
-        let surface = surface.clone();
+        let target = surface.clone();
         let timer = Timer::from_duration(delay);
         let inserted = self.loop_handle.insert_source(timer, move |_, _, state| {
-            state.send_recorded_frame_callback(&surface, &window, &output);
+            state.send_recorded_frame_callback(&target, &window, &output);
             TimeoutAction::Drop
         });
         if let Err(err) = inserted {
@@ -456,6 +455,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 "failed to schedule frame callback for a recorded window: {}",
                 err.error
             );
+            // Let a later commit arm it again.
+            with_states(surface, |states| {
+                if let Some(clock) = states.data_map.get::<RefCell<RecordedFrameClock>>() {
+                    clock.borrow_mut().armed = false;
+                }
+            });
         }
     }
 
@@ -510,6 +515,27 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         })
     }
 
+    /// The cursor's position in `window`'s capture, if it's over the window.
+    fn cursor_over(&self, window: &Window) -> Option<Point<i32, Logical>> {
+        let pointer = self.pointer.current_location();
+        let (under, _) = self.space.element_under(pointer)?;
+        let origin = self.space.element_location(window)?;
+        (under == window).then(|| pointer.to_i32_round() - origin - self.cursor_hotspot())
+    }
+
+    /// Re-check toplevel captures that paint the cursor; it may have moved.
+    pub fn refresh_cursor_captures(&mut self) {
+        for index in 0..self.capture_sessions.len() {
+            let capture = &self.capture_sessions[index];
+            if matches!(capture.source, CaptureSource::Toplevel(_))
+                && capture.pending.is_some()
+                && capture.session.draw_cursor()
+            {
+                self.capture_toplevel(index);
+            }
+        }
+    }
+
     /// Track a toplevel session's damage; draw the window into its buffer.
     fn capture_toplevel(&mut self, index: usize) {
         let CaptureSource::Toplevel(surface) = &self.capture_sessions[index].source else {
@@ -520,26 +546,38 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         };
         let presented: Duration = self.clock.now().into();
-        let renderer = self.backend_data.renderer();
-        let capture = &mut self.capture_sessions[index];
-        // Track damage only while a frame waits, i.e. since the last delivery.
-        if !capture.ensure_size(target.size, renderer) || capture.pending.is_none() {
-            return;
-        }
-
         let canvas = Canvas {
             size: (target.size.w, target.size.h).into(),
             scale: Scale::from(target.scale),
             transform: Transform::Normal,
             clear: TRANSPARENT,
         };
+        let capture = &mut self.capture_sessions[index];
+        // Track damage only while a frame waits, i.e. since the last delivery.
+        if !capture.ensure_size(target.size, self.backend_data.renderer())
+            || capture.pending.is_none()
+        {
+            return;
+        }
+
+        let mut elements: Vec<Element> = Vec::new();
+        if capture.session.draw_cursor()
+            && let Some(cursor) = self.cursor_over(&target.window)
+        {
+            let location = cursor.to_physical_precise_round(canvas.scale);
+            elements = self.backend_data.cursor_elements(location, canvas.scale);
+        }
+        let renderer = self.backend_data.renderer();
         let location =
             Point::<i32, Logical>::from((-target.geometry.loc.x, -target.geometry.loc.y))
                 .to_physical_precise_round(canvas.scale);
-        let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = target
-            .window
-            .render_elements(renderer, location, canvas.scale, 1.0);
-        capture.update(
+        elements.extend(target.window.render_elements::<Element>(
+            renderer,
+            location,
+            canvas.scale,
+            1.0,
+        ));
+        self.capture_sessions[index].update(
             renderer,
             &self.loop_handle,
             canvas,

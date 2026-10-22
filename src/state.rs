@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use smithay::backend::renderer::element::{
@@ -14,7 +14,7 @@ use smithay::desktop::utils::{
 };
 use smithay::desktop::{PopupManager, Space, Window, layer_map_for_output};
 use smithay::input::keyboard::Keysym;
-use smithay::input::pointer::{CursorImageStatus, PointerHandle};
+use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::{
@@ -432,6 +432,22 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             });
             self.push_fractional_scale(layer_surface.wl_surface(), scale);
         }
+    }
+
+    /// The cursor's hotspot: the client surface's, or the origin for shapes.
+    pub fn cursor_hotspot(&self) -> Point<i32, Logical> {
+        let CursorImageStatus::Surface(surface) = &self.cursor_status else {
+            return (0, 0).into();
+        };
+        with_states(surface, |states| {
+            states
+                .data_map
+                .get::<Mutex<CursorImageAttributes>>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .hotspot
+        })
     }
 
     /// Suspend mapped toplevels nothing shows, unless they are being recorded.

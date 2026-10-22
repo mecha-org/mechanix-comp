@@ -1,4 +1,3 @@
-use std::sync::Mutex;
 use std::time::Duration;
 
 use smithay::backend::renderer::ImportDma;
@@ -12,12 +11,11 @@ use smithay::backend::renderer::element::surface::{
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{WinitEvent, WinitGraphicsBackend};
 use smithay::desktop::layer_map_for_output;
-use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::{IsAlive, Rectangle, Transform};
-use smithay::wayland::compositor::with_states;
+use smithay::utils::{IsAlive, Physical, Point, Rectangle, Transform};
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use tracing::warn;
 
@@ -60,6 +58,16 @@ impl Backend for WinitData {
 
     fn arm_commit_timer(&mut self, delay: Duration) {
         self.wakeups.arm_commit(delay);
+    }
+
+    fn cursor_elements(
+        &mut self,
+        location: Point<i32, Physical>,
+        scale: smithay::utils::Scale<f64>,
+    ) -> Vec<Element> {
+        let renderer = self.backend.renderer();
+        self.pointer_element
+            .render_elements(renderer, location, scale, 1.0)
     }
 
     fn touch_transform(&self, _output: &Output) -> Transform {
@@ -213,26 +221,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 let visible = state.visible_surfaces(&output);
                 let locked = state.is_locked();
+                let cursor_hotspot = state.cursor_hotspot();
                 let (result, elements, clear_color) = {
                     let (renderer, mut framebuffer) = state.backend_data.backend.bind().unwrap();
                     let scale =
                         smithay::utils::Scale::from(output.current_scale().fractional_scale());
 
                     let cursor_pos = state.pointer.current_location();
-                    let cursor_hotspot =
-                        if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
-                            with_states(surface, |states| {
-                                states
-                                    .data_map
-                                    .get::<Mutex<CursorImageAttributes>>()
-                                    .unwrap()
-                                    .lock()
-                                    .unwrap()
-                                    .hotspot
-                            })
-                        } else {
-                            (0, 0).into()
-                        };
 
                     let cursor_scale =
                         output.current_scale().fractional_scale().round().max(1.0) as u32;
@@ -320,6 +315,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         presented,
                     },
                 );
+                state.refresh_cursor_captures();
 
                 state.send_frame_callbacks(&output, Duration::from(state.clock.now()));
                 state.lock_frame_queued(&output);

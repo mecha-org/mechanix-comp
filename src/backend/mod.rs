@@ -6,9 +6,10 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
-use smithay::utils::{Physical, Size, Transform};
+use smithay::utils::{Physical, Point, Scale, Size, Transform};
 use smithay::wayland::dmabuf::DmabufFeedback;
 
+use crate::render::Element;
 use crate::state::State;
 
 pub mod udev;
@@ -110,6 +111,15 @@ pub trait Backend {
 
     /// Queue a redraw of `output` after `delay`.
     fn schedule_render_after(&mut self, _output: &Output, _delay: Duration) {}
+
+    /// The cursor as outputs draw it; empty while hidden.
+    fn cursor_elements(
+        &mut self,
+        _location: Point<i32, Physical>,
+        _scale: Scale<f64>,
+    ) -> Vec<Element> {
+        Vec::new()
+    }
 
     /// Transform to apply to absolute (touch) input positions for `output`.
     /// Nested winit windows already report positions in window space, so they

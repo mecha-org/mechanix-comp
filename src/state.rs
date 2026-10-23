@@ -807,6 +807,16 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         find_popup_root_surface(&self.popups.find_popup(&root)?).ok()
     }
 
+    /// Whether `surface` belongs to a mapped window that no output draws.
+    pub fn in_hidden_window(&self, surface: &WlSurface) -> bool {
+        let Some(toplevel) = self.toplevel_of(surface) else {
+            return false;
+        };
+        self.toplevels.get(&toplevel).is_some_and(|ws| ws.mapped)
+            && !(self.space.outputs())
+                .any(|output| self.visible_surfaces(output).contains(&toplevel))
+    }
+
     /// Prune bookkeeping for toplevels whose client went away without the
     /// `toplevel_destroyed` path (e.g. a crash); dropping the entry also drops
     /// its foreign-toplevel handle.

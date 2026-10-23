@@ -401,13 +401,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     /// Re-target the pointer when what's under it changed while it stood still.
-    fn refresh_pointer_focus(&mut self) {
+    pub fn refresh_pointer_focus(&mut self) {
         let pointer = self.pointer.clone();
-        if !self.backend_data.pointer_visible() || pointer.is_grabbed() {
+        if pointer.is_grabbed() {
             return;
         }
         let location = pointer.current_location();
-        let under = self.surface_under(location);
+        // A hidden cursor points at nothing.
+        let under = self
+            .backend_data
+            .pointer_visible()
+            .then(|| self.surface_under(location))
+            .flatten();
         if under.as_ref().map(|(surface, _)| surface) == pointer.current_focus().as_ref() {
             return;
         }

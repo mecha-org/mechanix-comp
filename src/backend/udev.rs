@@ -414,6 +414,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 && visible != data.backend_data.cursor_visible
             {
                 data.backend_data.cursor_visible = visible;
+                // Re-target before delivering the event that unhid the cursor.
+                if visible {
+                    data.refresh_pointer_focus();
+                }
                 data.schedule_render();
             }
 

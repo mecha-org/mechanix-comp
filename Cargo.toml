@@ -8,7 +8,7 @@ members = ["."]
 
 [dependencies.smithay]
 git = "https://github.com/mecha-org/smithay"
-rev = "bb3be182f5d80e00f797e9efdeb63e7aa8b8925e"
+rev = "60aafc2b1a64395bd32ec93f41e6712a07544c34"
 default-features = false
 features = [
   "backend_winit",
@@ -25,7 +25,7 @@ features = [
 
 [dependencies.smithay-drm-extras]
 git = "https://github.com/mecha-org/smithay"
-rev = "bb3be182f5d80e00f797e9efdeb63e7aa8b8925e"
+rev = "60aafc2b1a64395bd32ec93f41e6712a07544c34"
 default-features = false
 
 [dependencies]

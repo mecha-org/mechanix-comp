@@ -1276,7 +1276,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/mecha-org/smithay?rev=bb3be182f5d80e00f797e9efdeb63e7aa8b8925e#bb3be182f5d80e00f797e9efdeb63e7aa8b8925e"
+source = "git+https://github.com/mecha-org/smithay?rev=60aafc2b1a64395bd32ec93f41e6712a07544c34#60aafc2b1a64395bd32ec93f41e6712a07544c34"
 dependencies = [
  "appendlist",
  "bitflags",
@@ -1350,7 +1350,7 @@ dependencies = [
 [[package]]
 name = "smithay-drm-extras"
 version = "0.1.0"
-source = "git+https://github.com/mecha-org/smithay?rev=bb3be182f5d80e00f797e9efdeb63e7aa8b8925e#bb3be182f5d80e00f797e9efdeb63e7aa8b8925e"
+source = "git+https://github.com/mecha-org/smithay?rev=60aafc2b1a64395bd32ec93f41e6712a07544c34#60aafc2b1a64395bd32ec93f41e6712a07544c34"
 dependencies = [
  "drm",
 ]

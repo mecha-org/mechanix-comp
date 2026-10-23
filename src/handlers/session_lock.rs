@@ -35,6 +35,10 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
     fn unlock(&mut self) {
         self.lock_phase = LockPhase::Unlocked;
         self.reset_lock_frames();
+        // Lock surfaces may outlive the lock.
+        for lock_surface in &self.lock_surfaces {
+            self.idle_inhibitors.remove(lock_surface.wl_surface());
+        }
         self.lock_surfaces.clear();
         self.lock_surface_outputs.clear();
         self.focus_topmost();

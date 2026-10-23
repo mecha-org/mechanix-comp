@@ -8,6 +8,7 @@ use smithay::backend::input::InputTime;
 use smithay::backend::renderer::element::{
     RenderElementStates, default_primary_scanout_output_compare,
 };
+use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::desktop::utils::{
     OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
     surface_primary_scanout_output, take_presentation_feedback_surface_tree,
@@ -792,6 +793,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 );
             });
         }
+        self.update_idle_inhibit();
     }
 
     /// Push the preferred fractional scale to `surface` (no-op for surfaces
@@ -922,8 +924,17 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         })
     }
 
+    /// Inhibit idle while a surface holding an inhibitor is on screen.
     pub fn update_idle_inhibit(&mut self) {
-        let inhibited = !self.idle_inhibitors.is_empty();
+        let inhibited = self.idle_inhibitors.keys().any(|surface| {
+            // Unmapped surfaces keep a stale scanout output.
+            let mapped = with_renderer_surface_state(surface, |state| state.buffer().is_some())
+                .unwrap_or(false);
+            mapped
+                && with_states(surface, |states| {
+                    surface_primary_scanout_output(surface, states).is_some()
+                })
+        });
         self.idle_notifier_state.set_is_inhibited(inhibited);
     }
 }

@@ -76,6 +76,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
         if self.is_locked() {
+            surface.send_popup_done();
             return;
         }
         let seat = Seat::from_resource(&seat).unwrap();

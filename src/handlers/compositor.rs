@@ -129,6 +129,7 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
     }
 
     fn destroyed(&mut self, surface: &WlSurface) {
+        self.schedule_render();
         self.popups.cleanup();
         self.forget_toplevel(surface);
         if self.idle_inhibiting_surfaces.remove(surface) {

@@ -67,6 +67,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     fn popup_destroyed(&mut self, surface: PopupSurface) {
         self.popups.cleanup();
         // A closed popup damages the window it belonged to.
+        self.schedule_render();
         if let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(surface)) {
             self.capture_commit(&root);
         }

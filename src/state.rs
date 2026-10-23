@@ -32,7 +32,7 @@ use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, ObjectId,
 };
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Time};
+use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Size, Time};
 use smithay::wayland::commit_timing::{
     CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
 };
@@ -103,6 +103,8 @@ pub struct WindowState {
     /// The xdg-dialog modal hint, cached so input handling needn't lock
     /// surface data on every click.
     pub modal: bool,
+    /// Size at the last layout.
+    pub layout_size: Size<i32, Logical>,
 }
 
 /// The icon surface a client sets for an active drag-and-drop, drawn next to

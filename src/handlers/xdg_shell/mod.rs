@@ -13,7 +13,7 @@ use smithay::desktop::{
 use smithay::input::{Seat, pointer::Focus};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::{wl_output, wl_seat, wl_surface::WlSurface};
-use smithay::utils::{SERIAL_COUNTER, Serial};
+use smithay::utils::{SERIAL_COUNTER, Serial, Size};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -33,6 +33,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
                 mode: WindowMode::Floating,
                 mapped: false,
                 modal: false,
+                layout_size: Size::default(),
             },
         );
     }
@@ -437,7 +438,16 @@ pub fn handle_commit<BackendData: Backend + 'static>(
             (true, false) => state.map_toplevel(surface, &window),
             (false, true) => state.unmap_toplevel(surface, &window),
             (false, false) => state.configure_toplevel(surface, &window),
-            (true, true) => {}
+            (true, true) => {
+                // Keep floating windows centred.
+                let ws = &state.toplevels[surface];
+                if ws.mode == WindowMode::Floating
+                    && ws.layout_size != window.geometry().size
+                    && let Some(output) = state.primary_output()
+                {
+                    state.apply_layout(&output);
+                }
+            }
         }
     }
     true

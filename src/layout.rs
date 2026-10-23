@@ -205,6 +205,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
             if let Some(ws) = self.toplevels.get_mut(surface) {
                 ws.mode = mode;
+                ws.layout_size = window.geometry().size;
             }
             self.set_toplevel_placement(toplevel, area, mode);
             if toplevel.is_initial_configure_sent() {

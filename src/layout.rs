@@ -65,10 +65,6 @@ impl Layout {
         self.stack.retain(|s| s != surface);
     }
 
-    pub fn retain(&mut self, f: impl Fn(&WlSurface) -> bool) {
-        self.stack.retain(f);
-    }
-
     pub fn set_zone(&mut self, zone: Rectangle<i32, Logical>) {
         self.zone = zone;
     }

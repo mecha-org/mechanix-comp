@@ -40,22 +40,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         // The foreign-toplevel `closed` event is sent by
         // `foreign_toplevel_refresh` on the next idle callback.
-        let wl = surface.wl_surface();
-        for layout in self.layouts.values_mut() {
-            layout.remove(wl);
-        }
-        self.toplevels.remove(wl);
-        self.stop_captures_for_toplevel(wl);
-        let window = self
-            .space
-            .elements()
-            .find(|w| w.toplevel() == Some(&surface))
-            .cloned();
-        if let Some(window) = window {
-            self.space.unmap_elem(&window);
-            self.focus_topmost();
-            self.schedule_render();
-        }
+        self.forget_toplevel(surface.wl_surface());
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {
@@ -80,6 +65,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     }
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
+        self.popups.cleanup();
         // A closed popup damages the window it belonged to.
         if let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(surface)) {
             self.capture_commit(&root);
@@ -306,6 +292,22 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.stop_captures_for_toplevel(surface);
         self.focus_topmost();
         self.schedule_render();
+    }
+
+    /// Drop a toplevel once its xdg_toplevel or wl_surface is gone.
+    pub fn forget_toplevel(&mut self, surface: &WlSurface) {
+        let Some(ws) = self.toplevels.remove(surface) else {
+            return;
+        };
+        for layout in self.layouts.values_mut() {
+            layout.remove(surface);
+        }
+        self.stop_captures_for_toplevel(surface);
+        if self.space.elements().any(|window| window == &ws.window) {
+            self.space.unmap_elem(&ws.window);
+            self.focus_topmost();
+            self.schedule_render();
+        }
     }
 
     /// Apply a mode change: reposition a mapped window, or reply to an unmapped one.

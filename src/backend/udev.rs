@@ -503,7 +503,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.refresh_space();
         state.foreign_toplevel_refresh();
         state.update_suspended();
-        state.update_idle_inhibit();
         let _ = state.display_handle.flush_clients();
     })?;
 

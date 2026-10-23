@@ -388,12 +388,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         socket_name
     }
 
-    /// Refresh the space, popups, dead toplevels, and input focus.
+    /// Refresh the space and input focus.
     /// Callers flush after any work that still queues client events.
     pub fn refresh_space(&mut self) {
         self.space.refresh();
-        self.popups.cleanup();
-        self.cleanup_toplevels();
         self.update_keyboard_focus();
         self.refresh_pointer_focus();
     }
@@ -841,21 +839,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 .any(|output| self.visible_surfaces(output).contains(&toplevel))
     }
 
-    /// Prune bookkeeping for toplevels whose client went away without the
-    /// `toplevel_destroyed` path (e.g. a crash); dropping the entry also drops
-    /// its foreign-toplevel handle.
-    pub fn cleanup_toplevels(&mut self) {
-        let before = self.toplevels.len();
-        self.toplevels
-            .retain(|_, ws| ws.window.toplevel().unwrap().wl_surface().is_alive());
-        for layout in self.layouts.values_mut() {
-            layout.retain(|s| s.is_alive());
-        }
-        if self.toplevels.len() != before {
-            self.schedule_render();
-        }
-    }
-
     /// The topmost window currently marked modal, if any. While open, input to
     /// every other window is blocked. Without the session xdg-dialog global the
     /// flag stays false.
@@ -937,8 +920,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     pub fn update_idle_inhibit(&mut self) {
-        self.idle_inhibiting_surfaces
-            .retain(|surface| surface.is_alive());
         let inhibited = !self.idle_inhibiting_surfaces.is_empty();
         self.idle_notifier_state.set_is_inhibited(inhibited);
     }

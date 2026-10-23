@@ -132,7 +132,7 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
         self.schedule_render();
         self.popups.cleanup();
         self.forget_toplevel(surface);
-        if self.idle_inhibiting_surfaces.remove(surface) {
+        if self.idle_inhibitors.remove(surface).is_some() {
             self.update_idle_inhibit();
         }
     }

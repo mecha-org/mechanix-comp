@@ -12,13 +12,17 @@ impl<BackendData: Backend + 'static> IdleNotifierHandler for State<BackendData> 
 
 impl<BackendData: Backend + 'static> IdleInhibitHandler for State<BackendData> {
     fn inhibit(&mut self, surface: WlSurface) {
-        if self.idle_inhibiting_surfaces.insert(surface) {
-            self.update_idle_inhibit();
-        }
+        *self.idle_inhibitors.entry(surface).or_default() += 1;
+        self.update_idle_inhibit();
     }
 
     fn uninhibit(&mut self, surface: WlSurface) {
-        if self.idle_inhibiting_surfaces.remove(&surface) {
+        let Some(count) = self.idle_inhibitors.get_mut(&surface) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            self.idle_inhibitors.remove(&surface);
             self.update_idle_inhibit();
         }
     }

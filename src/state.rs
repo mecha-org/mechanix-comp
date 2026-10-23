@@ -184,7 +184,8 @@ pub struct State<BackendData: Backend + 'static> {
     pub foreign_toplevel: ForeignToplevelManagerState,
     pub foreign_toplevel_list: ForeignToplevelListState,
     pub idle_notifier_state: IdleNotifierState<State<BackendData>>,
-    pub idle_inhibiting_surfaces: HashSet<WlSurface>,
+    /// Inhibitor count per surface.
+    pub idle_inhibitors: HashMap<WlSurface, usize>,
     pub output_power: OutputPowerManagerState,
 
     /// Screen capture (ext-image-capture-source, ext-image-copy-capture).
@@ -325,7 +326,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             toplevel_capture_source_state,
             image_copy_capture_state,
             capture_sessions: Vec::new(),
-            idle_inhibiting_surfaces: HashSet::new(),
+            idle_inhibitors: HashMap::new(),
             display_handle: dh,
             space,
             toplevels: HashMap::new(),
@@ -920,7 +921,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     pub fn update_idle_inhibit(&mut self) {
-        let inhibited = !self.idle_inhibiting_surfaces.is_empty();
+        let inhibited = !self.idle_inhibitors.is_empty();
         self.idle_notifier_state.set_is_inhibited(inhibited);
     }
 }

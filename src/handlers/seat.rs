@@ -125,11 +125,10 @@ impl<BackendData: Backend + 'static> InputMethodHandler for State<BackendData> {
     }
 
     fn parent_geometry(&self, parent: &WlSurface) -> Rectangle<i32, smithay::utils::Logical> {
-        self.space
-            .elements()
-            .find_map(|window| {
-                (window.wl_surface().as_deref() == Some(parent)).then(|| window.geometry())
-            })
+        self.toplevels
+            .get(parent)
+            .filter(|ws| ws.mapped)
+            .map(|ws| ws.window.geometry())
             .unwrap_or_default()
     }
 }

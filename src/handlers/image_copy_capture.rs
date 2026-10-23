@@ -18,8 +18,8 @@ use smithay::backend::renderer::{
     Bind, BufferType, Color32F, ExportMem, Frame as _, Offscreen, Renderer, RendererSuper,
     buffer_type,
 };
+use smithay::desktop::Window;
 use smithay::desktop::utils::surface_primary_scanout_output;
-use smithay::desktop::{Window, find_popup_root_surface};
 use smithay::output::{Output, WeakOutput};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
@@ -30,7 +30,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{
     Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
-use smithay::wayland::compositor::{get_parent, with_states};
+use smithay::wayland::compositor::with_states;
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::foreign_toplevel_list::ForeignToplevelHandle;
 use smithay::wayland::image_capture_source::{
@@ -397,18 +397,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         if recorded {
             self.wake_recorded_toplevel(&toplevel);
         }
-    }
-
-    /// The toplevel a surface belongs to, through subsurfaces and popups.
-    fn toplevel_of(&self, surface: &WlSurface) -> Option<WlSurface> {
-        let mut root = surface.clone();
-        while let Some(parent) = get_parent(&root) {
-            root = parent;
-        }
-        if self.toplevels.contains_key(&root) {
-            return Some(root);
-        }
-        find_popup_root_surface(&self.popups.find_popup(&root)?).ok()
     }
 
     /// Give a recorded hidden toplevel one frame callback per refresh.

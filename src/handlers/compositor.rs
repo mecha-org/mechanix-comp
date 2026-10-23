@@ -1,5 +1,5 @@
 use crate::backend::Backend;
-use crate::state::State;
+use crate::state::{State, root_surface};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::reexports::calloop::Interest;
 use smithay::reexports::wayland_server::Resource;
@@ -7,7 +7,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::commit_timing::CommitTimerStateUserData;
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorHandler, CompositorState, SurfaceAttributes, add_blocker,
-    add_pre_commit_hook, get_parent, is_sync_subsurface, with_states,
+    add_pre_commit_hook, is_sync_subsurface, with_states,
 };
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
@@ -107,13 +107,7 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        let root = (!is_sync_subsurface(surface)).then(|| {
-            let mut root = surface.clone();
-            while let Some(parent) = get_parent(&root) {
-                root = parent;
-            }
-            root
-        });
+        let root = (!is_sync_subsurface(surface)).then(|| root_surface(surface));
         if let Some(window) = root
             .as_ref()
             .and_then(|root| self.toplevels.get(root))

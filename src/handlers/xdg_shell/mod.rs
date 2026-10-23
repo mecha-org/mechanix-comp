@@ -354,11 +354,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        let Some(window) = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == &root)
-        else {
+        let Some(window) = self.toplevels.get(&root).map(|ws| &ws.window) else {
             return;
         };
 

@@ -12,7 +12,9 @@ use smithay::desktop::utils::{
     surface_primary_scanout_output, take_presentation_feedback_surface_tree,
     update_surface_primary_scanout_output, with_surfaces_surface_tree,
 };
-use smithay::desktop::{PopupManager, Space, Window, layer_map_for_output};
+use smithay::desktop::{
+    PopupManager, Space, Window, find_popup_root_surface, layer_map_for_output,
+};
 use smithay::input::keyboard::Keysym;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatState};
@@ -32,7 +34,7 @@ use smithay::wayland::commit_timing::{
     CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
 };
 use smithay::wayland::compositor::{
-    CompositorClientState, CompositorHandler, CompositorState, SurfaceData, with_states,
+    CompositorClientState, CompositorHandler, CompositorState, SurfaceData, get_parent, with_states,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
@@ -796,6 +798,15 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .cloned()
     }
 
+    /// The toplevel a surface belongs to, through subsurfaces and popups.
+    pub fn toplevel_of(&self, surface: &WlSurface) -> Option<WlSurface> {
+        let root = root_surface(surface);
+        if self.toplevels.contains_key(&root) {
+            return Some(root);
+        }
+        find_popup_root_surface(&self.popups.find_popup(&root)?).ok()
+    }
+
     /// Prune bookkeeping for toplevels whose client went away without the
     /// `toplevel_destroyed` path (e.g. a crash); dropping the entry also drops
     /// its foreign-toplevel handle.
@@ -904,6 +915,15 @@ pub struct ClientState {
     pub compositor_state: CompositorClientState,
     /// Connected through a security context (e.g. a Flatpak app).
     pub restricted: bool,
+}
+
+/// The root of `surface`'s subsurface tree.
+pub fn root_surface(surface: &WlSurface) -> WlSurface {
+    let mut root = surface.clone();
+    while let Some(parent) = get_parent(&root) {
+        root = parent;
+    }
+    root
 }
 
 /// Whether `client` may see privileged globals (not sandboxed).

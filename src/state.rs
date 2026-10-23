@@ -781,6 +781,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 );
             });
         }
+        for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
+            with_surfaces_surface_tree(lock_surface.wl_surface(), |surface, data| {
+                update_surface_primary_scanout_output(
+                    surface,
+                    output,
+                    data,
+                    None,
+                    states,
+                    default_primary_scanout_output_compare,
+                );
+            });
+        }
         if let Some(icon) = &self.dnd_icon {
             with_surfaces_surface_tree(&icon.surface, |surface, data| {
                 update_surface_primary_scanout_output(

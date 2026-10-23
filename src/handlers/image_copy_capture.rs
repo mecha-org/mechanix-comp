@@ -544,6 +544,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         if capture.session.draw_cursor()
             && has_pointer
             && let Some(origin) = self.space.element_location(&target.window)
+            // Focus outlasts a drag out of the window.
+            && Rectangle::new(origin, target.geometry.size)
+                .to_f64()
+                .contains(self.pointer.current_location())
         {
             let cursor =
                 self.pointer.current_location().to_i32_round() - origin - self.cursor_hotspot();

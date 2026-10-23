@@ -74,6 +74,9 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        if self.is_locked() {
+            return;
+        }
         let seat = Seat::from_resource(&seat).unwrap();
         let kind = PopupKind::Xdg(surface);
         let Ok(root) = find_popup_root_surface(&kind) else {
@@ -214,10 +217,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             self.set_activated_group(&group);
         }
 
-        self.seat
-            .get_keyboard()
-            .unwrap()
-            .set_focus(self, Some(focused_surface), serial);
+        if !self.is_locked() {
+            self.seat
+                .get_keyboard()
+                .unwrap()
+                .set_focus(self, Some(focused_surface), serial);
+        }
     }
 
     /// Set the xdg `activated` state on every toplevel in `group` and clear it
@@ -252,9 +257,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         } else {
             self.active_window = None;
             self.layer_shell_on_demand_focus = None;
-            let keyboard = self.seat.get_keyboard().unwrap();
-            let serial = SERIAL_COUNTER.next_serial();
-            keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+            if !self.is_locked() {
+                let keyboard = self.seat.get_keyboard().unwrap();
+                let serial = SERIAL_COUNTER.next_serial();
+                keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+            }
         }
     }
 

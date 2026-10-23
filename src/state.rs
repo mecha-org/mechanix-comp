@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use smithay::backend::input::InputTime;
 use smithay::backend::renderer::element::{
     RenderElementStates, default_primary_scanout_output_compare,
 };
@@ -16,7 +17,9 @@ use smithay::desktop::{
     PopupManager, Space, Window, find_popup_root_surface, layer_map_for_output,
 };
 use smithay::input::keyboard::Keysym;
-use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus, PointerHandle};
+use smithay::input::pointer::{
+    CursorImageAttributes, CursorImageStatus, MotionEvent, PointerHandle,
+};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::{
@@ -385,13 +388,34 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         socket_name
     }
 
-    /// Refresh the space, popups, dead toplevels, and keyboard focus.
+    /// Refresh the space, popups, dead toplevels, and input focus.
     /// Callers flush after any work that still queues client events.
     pub fn refresh_space(&mut self) {
         self.space.refresh();
         self.popups.cleanup();
         self.cleanup_toplevels();
         self.update_keyboard_focus();
+        self.refresh_pointer_focus();
+    }
+
+    /// Re-target the pointer when what's under it changed while it stood still.
+    fn refresh_pointer_focus(&mut self) {
+        let pointer = self.pointer.clone();
+        if !self.backend_data.pointer_visible() || pointer.is_grabbed() {
+            return;
+        }
+        let location = pointer.current_location();
+        let under = self.surface_under(location);
+        if under.as_ref().map(|(surface, _)| surface) == pointer.current_focus().as_ref() {
+            return;
+        }
+        let event = MotionEvent {
+            location,
+            serial: SERIAL_COUNTER.next_serial(),
+            time: InputTime::now(),
+        };
+        pointer.motion(self, under, &event);
+        pointer.frame(self);
     }
 
     pub fn is_locked(&self) -> bool {

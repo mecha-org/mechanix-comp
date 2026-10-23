@@ -188,6 +188,10 @@ impl Backend for UdevData {
         output.user_data().get::<OutputKey>().is_some()
     }
 
+    fn pointer_visible(&self) -> bool {
+        self.pointer_moved && !self.pointers.is_empty()
+    }
+
     fn cursor_elements(
         &mut self,
         location: Point<i32, Physical>,
@@ -310,10 +314,6 @@ impl Backend for UdevData {
 }
 
 impl UdevData {
-    fn pointer_visible(&self) -> bool {
-        self.pointer_moved && !self.pointers.is_empty()
-    }
-
     fn cancel_queued_frames(&mut self) {
         for device in self.devices.values_mut() {
             for surface in device.surfaces.values_mut() {

@@ -112,6 +112,11 @@ pub trait Backend {
     /// Queue a redraw of `output` after `delay`.
     fn schedule_render_after(&mut self, _output: &Output, _delay: Duration) {}
 
+    /// Whether a pointer is in use.
+    fn pointer_visible(&self) -> bool {
+        true
+    }
+
     /// The cursor as outputs draw it; empty while hidden.
     fn cursor_elements(
         &mut self,

@@ -207,6 +207,7 @@ dependencies = [
 name = "compositor"
 version = "1.0.0"
 dependencies = [
+ "sd-notify",
  "smithay",
  "smithay-drm-extras",
  "thiserror 2.0.20",
@@ -1182,6 +1183,15 @@ name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
+
+[[package]]
+name = "sd-notify"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e4ef7359e694bfaf1dd27a30f9d760b54c00dfae9f19bd0c05a39bc9128fe76"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "semver"

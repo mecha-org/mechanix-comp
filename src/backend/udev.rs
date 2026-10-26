@@ -497,6 +497,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.socket_name
     );
 
+    // Readiness for systemd's Type=notify.
+    if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
+        warn!("failed to signal readiness to systemd: {err}");
+    }
+
     event_loop.run(None, &mut state, move |state| {
         state.refresh_space();
         state.foreign_toplevel_refresh();

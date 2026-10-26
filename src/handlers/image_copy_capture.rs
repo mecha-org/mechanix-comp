@@ -538,19 +538,20 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         {
             return;
         }
+        let draw_cursor = capture.session.draw_cursor();
 
         let scale = Scale::from(target.scale);
+        let pointer = self.pointer.current_location();
         let mut elements: Vec<Element> = Vec::new();
-        if capture.session.draw_cursor()
+        if draw_cursor
             && has_pointer
             && let Some(origin) = self.space.element_location(&target.window)
-            // Focus outlasts a drag out of the window.
-            && Rectangle::new(origin, target.geometry.size)
+            // Focus can outlast a drag out of the window; require the pointer inside it.
+            && Rectangle::from_size(target.geometry.size)
                 .to_f64()
-                .contains(self.pointer.current_location())
+                .contains(pointer - origin.to_f64())
         {
-            let cursor =
-                self.pointer.current_location().to_i32_round() - origin - self.cursor_hotspot();
+            let cursor = pointer.to_i32_round() - origin - self.cursor_hotspot();
             let location = cursor.to_physical_precise_round(scale);
             elements = self.backend_data.cursor_elements(location, scale);
         }

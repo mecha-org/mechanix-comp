@@ -12,6 +12,8 @@
 | `mechanix-keyboard.service` | `/usr/lib/systemd/user/` |
 | `mechanix-waybar.service` | `/usr/lib/systemd/user/` |
 | `mechanix-drawer.service` | `/usr/lib/systemd/user/` |
+| `mechanix-portals.conf` | `/usr/share/xdg-desktop-portal/` |
+| `xdg-desktop-portal-wlr.conf` | `/etc/xdg/xdg-desktop-portal-wlr/mechanix` |
 
 `mechanix-waybar.service` and `mechanix-drawer.service` are temporary.
 

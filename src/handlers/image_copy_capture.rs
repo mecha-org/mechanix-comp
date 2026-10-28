@@ -546,7 +546,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         if draw_cursor
             && has_pointer
             && let Some(origin) = self.space.element_location(&target.window)
-            // Focus can outlast a drag out of the window; require the pointer inside it.
+            // A drag keeps focus after the pointer leaves the window.
             && Rectangle::from_size(target.geometry.size)
                 .to_f64()
                 .contains(pointer - origin.to_f64())

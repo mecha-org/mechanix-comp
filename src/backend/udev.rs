@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 use smithay::backend::allocator::Fourcc;
@@ -322,6 +323,23 @@ impl UdevData {
     }
 }
 
+/// Put `WAYLAND_DISPLAY` in the systemd and D-Bus activation environments.
+fn export_wayland_display() {
+    let status = Command::new("dbus-update-activation-environment")
+        .args(["--systemd", "WAYLAND_DISPLAY"])
+        .status()
+        .or_else(|_| {
+            Command::new("systemctl")
+                .args(["--user", "import-environment", "WAYLAND_DISPLAY"])
+                .status()
+        });
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => warn!("exporting WAYLAND_DISPLAY failed: {status}"),
+        Err(err) => warn!("exporting WAYLAND_DISPLAY failed: {err}"),
+    }
+}
+
 /// The first vblank after `now`, in whole refreshes from the last one.
 fn next_vblank(last: Duration, refresh: Duration, now: Duration) -> Duration {
     let periods = now.saturating_sub(last).as_nanos() / refresh.as_nanos().max(1) + 1;
@@ -362,6 +380,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut state = State::new(&mut event_loop, display, udev_data);
+
+    // Children need the real socket name.
+    // SAFETY: nothing else runs yet: no renderer, clients or other threads.
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
 
     // Initialize libinput backend
     let mut libinput_context = Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(
@@ -497,6 +519,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.socket_name
     );
 
+    // As a systemd service, hand user services the socket before READY.
+    if std::env::var_os("NOTIFY_SOCKET").is_some() {
+        export_wayland_display();
+    }
     // Readiness for systemd's Type=notify.
     if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
         warn!("failed to signal readiness to systemd: {err}");

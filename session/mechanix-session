@@ -1,0 +1,39 @@
+#!/bin/sh
+
+set -eu
+
+# The login manager ending the session must still run the shutdown below.
+trap : HUP INT TERM
+
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=mechanix
+export XDG_SESSION_DESKTOP=mechanix
+export DESKTOP_SESSION=mechanix
+
+# A compositor still running belongs to a session that ended without shutting down.
+if systemctl --user -q is-active mechanix-compositor.service; then
+    systemctl --user start --job-mode=replace-irreversibly mechanix-session-shutdown.target
+    systemctl --user stop mechanix-compositor.service
+fi
+
+systemctl --user reset-failed
+
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+    dbus-update-activation-environment --systemd \
+        XDG_SESSION_ID XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP DESKTOP_SESSION
+else
+    systemctl --user import-environment \
+        XDG_SESSION_ID XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP DESKTOP_SESSION
+fi
+
+systemctl --user start mechanix-compositor.service
+systemctl --user start mechanix-session.target
+
+# A signal interrupts `wait`, but not a command running in the foreground.
+systemctl --user start --wait mechanix-compositor.service &
+wait $! || status=$?
+
+systemctl --user start --job-mode=replace-irreversibly \
+    mechanix-session-shutdown.target 2>/dev/null || true
+
+exit "${status:-0}"

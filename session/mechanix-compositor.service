@@ -1,0 +1,14 @@
+[Unit]
+Description=Mechanix compositor
+PartOf=graphical-session.target
+After=graphical-session-pre.target
+Wants=graphical-session-pre.target
+
+[Service]
+Type=notify
+Environment=MECHA_BACKEND=udev
+Environment=MECHANIX_COMP_LOG=compositor=info,smithay=warn
+UnsetEnvironment=WAYLAND_DISPLAY DISPLAY
+ExecStart=/usr/bin/mechanix-compositor
+ExecStopPost=-/usr/bin/systemctl --user unset-environment WAYLAND_DISPLAY
+Slice=session.slice

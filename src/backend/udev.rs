@@ -104,16 +104,16 @@ enum RepaintState {
     Idle,
     RenderQueued,
     AwaitingVblank {
-        /// New damage arrived while the frame was scanning out.
-        damage_pending: bool,
+        /// New damage arrived, or frame callbacks were skipped.
+        render_again: bool,
     },
 }
 
 #[derive(Default)]
 struct Repaint {
     state: RepaintState,
-    /// When frame callbacks were last sent (pacing).
-    last_ack: Option<Time<Monotonic>>,
+    /// The vblank frame callbacks were last sent for.
+    acked_vblank: Option<Duration>,
     /// The last real vblank, to predict the next one.
     last_vblank: Option<Time<Monotonic>>,
     /// Pending paced redraw, if any.
@@ -273,8 +273,8 @@ impl Backend for UdevData {
                     state.render_surface(node, crtc);
                 });
             }
-            RepaintState::AwaitingVblank { damage_pending } => {
-                *damage_pending = true;
+            RepaintState::AwaitingVblank { render_again } => {
+                *render_again = true;
             }
             RepaintState::RenderQueued => {}
         }
@@ -1053,46 +1053,51 @@ impl State<UdevData> {
             }
         }
 
+        // Send frame callbacks once per vblank so a client cannot redraw faster than the output.
+        let already_acked = self
+            .backend_data
+            .repaints
+            .get(&(node, crtc))
+            .and_then(|frame| frame.acked_vblank)
+            .filter(|&acked| acked >= presented);
+
         if queued {
             self.lock_frame_queued(&output);
+            if already_acked.is_none() {
+                // Ack now, stamped with the vblank this frame should hit.
+                self.ack_frame(node, crtc, &output, presented);
+            }
             // The frame is on the CRTC; damage arriving before its vblank re-renders.
             if let Some(frame) = self.backend_data.repaints.get_mut(&(node, crtc)) {
                 frame.state = RepaintState::AwaitingVblank {
-                    damage_pending: false,
+                    render_again: already_acked.is_some(),
                 };
             }
         } else if render_failed {
             // Retry a failed render at the next refresh.
             self.backend_data.schedule_render_after(&output, refresh);
+        } else if let Some(acked) = already_acked {
+            // Nothing to present, and this vblank was acked: retry once it passes.
+            let now: Duration = self.clock.now().into();
+            self.backend_data
+                .schedule_render_after(&output, acked.saturating_sub(now));
         } else {
-            // Nothing to present. Deliver frame callbacks at most once per
-            // refresh so a client cannot redraw faster than the output.
-            let now = self.clock.now();
-            let deadline = self
-                .backend_data
-                .repaints
-                .get(&(node, crtc))
-                .and_then(|frame| frame.last_ack)
-                .map(|last| last + refresh);
-            match deadline {
-                Some(deadline) if now < deadline => {
-                    self.backend_data.schedule_render_after(
-                        &output,
-                        Duration::from(deadline) - Duration::from(now),
-                    );
-                }
-                _ => {
-                    if let Some(frame) = self.backend_data.repaints.get_mut(&(node, crtc)) {
-                        frame.last_ack = Some(now);
-                    }
-                    self.send_frame_callbacks(&output, Duration::from(now));
-                }
-            }
+            // Nothing to present.
+            self.ack_frame(node, crtc, &output, presented);
+            self.release_fifo_barriers(&output);
         }
 
         if cursor_animated && !self.is_locked() {
             self.backend_data.schedule_render_after(&output, refresh);
         }
+    }
+
+    /// Send frame callbacks timestamped with `vblank`, and remember it for pacing.
+    fn ack_frame(&mut self, node: DrmNode, crtc: crtc::Handle, output: &Output, vblank: Duration) {
+        if let Some(frame) = self.backend_data.repaints.get_mut(&(node, crtc)) {
+            frame.acked_vblank = Some(vblank);
+        }
+        self.send_frame_callbacks(output, vblank);
     }
 
     /// Vblank: retire the frame, notify clients, re-render if damage landed meanwhile.
@@ -1138,22 +1143,17 @@ impl State<UdevData> {
             .repaints
             .get_mut(&(node, crtc))
             .is_some_and(|frame| {
-                frame.last_ack = Some(vblank.unwrap_or(now));
-                frame.last_vblank = frame.last_ack;
-                let damage = matches!(
+                frame.last_vblank = Some(vblank.unwrap_or(now));
+                let again = matches!(
                     frame.state,
-                    RepaintState::AwaitingVblank {
-                        damage_pending: true
-                    }
+                    RepaintState::AwaitingVblank { render_again: true }
                 );
                 frame.state = RepaintState::Idle;
-                damage
+                again
             });
 
         if let Some(output) = self.output_for_crtc(node, crtc) {
             self.lock_frame_presented(&output);
-            // Ack with the vblank time so client frame-callback clocks match it.
-            self.send_frame_callbacks(&output, Duration::from(vblank.unwrap_or(now)));
             self.send_presentation_feedback(&output, submitted, vblank, now, seq);
             // Render before releasing FIFO waiters so a resumed commit only marks damage.
             if render_again {

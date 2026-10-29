@@ -10,7 +10,6 @@ use smithay::backend::renderer::element::surface::{
 };
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{WinitEvent, WinitGraphicsBackend};
-use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
@@ -45,6 +44,10 @@ impl Backend for WinitData {
 
     fn seat_name(&self) -> String {
         "winit".to_string()
+    }
+
+    fn default_scale(&self, _output: &Output) -> f64 {
+        crate::backend::snap_scale(self.backend.scale_factor())
     }
 
     fn reset_buffers(&mut self, _output: &Output) {
@@ -146,9 +149,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let _global = output.create_global::<State<WinitData>>(&state.display_handle);
-    // Follow the host's scale factor unless `MECHA_SCALE` overrides it.
-    let scale = crate::backend::env_scale()
-        .unwrap_or_else(|| crate::backend::snap_scale(state.backend_data.backend.scale_factor()));
+    let scale = state.output_scale(&output);
     output.change_current_state(
         Some(mode),
         Some(Transform::Flipped180),
@@ -165,37 +166,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     event_loop
         .handle()
         .insert_source(winit, move |event, _, state| match event {
-            WinitEvent::Resized { size, scale_factor } => {
-                // Follow the host's scale factor (unless overridden) when it changes.
-                let scale = (crate::backend::env_scale().is_none()
-                    && scale_factor != output.current_scale().fractional_scale())
-                .then(|| Scale::Fractional(crate::backend::snap_scale(scale_factor)));
-                output.change_current_state(
-                    Some(Mode {
-                        size,
-                        refresh: 60_000,
-                    }),
-                    None,
-                    scale,
-                    None,
-                );
-
-                // Re-arrange layers for the new size, keeping toplevels filling
-                // the (possibly changed) non-exclusive zone.
-                layer_map_for_output(&output).arrange();
-                state.apply_layout(&output);
-                state.update_capture_constraints(&output);
-
-                if state.is_locked() {
-                    let logical_size = state.space.output_geometry(&output).map(|geo| geo.size);
-                    for surface in &state.lock_surfaces {
-                        surface.with_pending_state(|pending| {
-                            pending.size =
-                                logical_size.map(|size| (size.w as u32, size.h as u32).into());
-                        });
-                        surface.send_configure();
-                    }
-                }
+            WinitEvent::Resized { size, .. } => {
+                let mode = Mode {
+                    size,
+                    refresh: 60_000,
+                };
+                state.reconfigure_output(&output, Some(mode));
             }
             WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => {

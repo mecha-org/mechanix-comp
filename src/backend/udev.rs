@@ -166,6 +166,10 @@ impl Backend for UdevData {
         self.login.seat()
     }
 
+    fn default_scale(&self, output: &Output) -> f64 {
+        crate::backend::guess_default_scale(output)
+    }
+
     fn reset_buffers(&mut self, output: &Output) {
         if let Some(id) = output.user_data().get::<OutputKey>()
             && let Some(device) = self.devices.get_mut(&id.node)
@@ -725,13 +729,6 @@ impl State<UdevData> {
         connector: connector::Info,
         crtc: crtc::Handle,
     ) {
-        let Some(device) = self.backend_data.devices.get_mut(&node) else {
-            return;
-        };
-        let Some(renderer) = self.backend_data.renderer.as_mut() else {
-            return;
-        };
-
         let mode_id = connector
             .modes()
             .iter()
@@ -760,13 +757,7 @@ impl State<UdevData> {
             },
         );
         output.set_preferred(wl_mode);
-        // Auto-detect the scale from the panel's physical size unless overridden.
-        let scale = crate::backend::env_scale().unwrap_or_else(|| {
-            crate::backend::snap_scale(crate::backend::guess_default_scale(
-                connector.size(),
-                wl_mode.size,
-            ))
-        });
+        let scale = self.output_scale(&output);
         // Extend: place each output to the right of the existing ones.
         let x = self
             .space
@@ -784,6 +775,12 @@ impl State<UdevData> {
             .user_data()
             .insert_if_missing(|| OutputKey { node, crtc });
 
+        let Some(device) = self.backend_data.devices.get_mut(&node) else {
+            return;
+        };
+        let Some(renderer) = self.backend_data.renderer.as_mut() else {
+            return;
+        };
         let global = output.create_global::<State<UdevData>>(&self.display_handle);
         self.space.map_output(&output, position);
 

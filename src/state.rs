@@ -79,6 +79,7 @@ use smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::backend::Backend;
+use crate::config::Config;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::image_copy_capture::CaptureSession;
 use crate::handlers::output_power::OutputPowerManagerState;
@@ -211,6 +212,7 @@ pub struct State<BackendData: Backend + 'static> {
     // Rendering backend + dmabuf import. The dmabuf global is created lazily by
     // each backend once its renderer (and thus its format list) exists.
     pub backend_data: BackendData,
+    pub config: Config,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
     pub drm_syncobj_state: Option<DrmSyncobjState>,
@@ -312,9 +314,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
+        let config = Config::load(&event_loop.handle());
 
         Self {
             socket_name,
+            config,
             xdg_activation_state,
             data_device_state,
             primary_selection_state,

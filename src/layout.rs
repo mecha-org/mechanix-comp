@@ -3,11 +3,13 @@
 use std::collections::HashSet;
 
 use smithay::desktop::{Window, layer_map_for_output};
-use smithay::output::Output;
+use smithay::output::{Mode, Output, Scale};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Point;
-use smithay::utils::{Logical, Rectangle};
+use smithay::utils::{Logical, Rectangle, Size};
+use smithay::wayland::session_lock::LockSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::backend::Backend;
@@ -154,6 +156,32 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     /// The single output of the space, if any.
     pub fn primary_output(&self) -> Option<Output> {
         self.space.outputs().next().cloned()
+    }
+
+    /// Give `output` `mode`, if any, and its scale, then refit everything on it.
+    pub fn reconfigure_output(&mut self, output: &Output, mode: Option<Mode>) {
+        let scale = self.output_scale(output);
+        let scale = (scale != output.current_scale().fractional_scale())
+            .then_some(Scale::Fractional(scale));
+        if mode.is_none() && scale.is_none() {
+            return;
+        }
+        output.change_current_state(mode, None, scale, None);
+        layer_map_for_output(output).arrange();
+        self.apply_layout(output);
+        self.update_capture_constraints(output);
+        if !self.is_locked() {
+            return;
+        }
+        let geometry = self.space.output_geometry(output);
+        let size = geometry.map(|geo| Size::from((geo.size.w as u32, geo.size.h as u32)));
+        let on_output = |surface: &&LockSurface| {
+            self.lock_surface_outputs.get(&surface.wl_surface().id()) == Some(output)
+        };
+        for surface in self.lock_surfaces.iter().filter(on_output) {
+            surface.with_pending_state(|pending| pending.size = size);
+            surface.send_configure();
+        }
     }
 
     /// Size, position, xdg state, and Space z-order from the Comet model.

@@ -484,8 +484,28 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// wlr `activate` request: raise the toplevel and give it keyboard focus,
     /// even over a fullscreen window (a shell switch is an explicit choice).
+    /// A toplevel with dialogs gets the one [`activation_target`] picks, so
+    /// switching back to it does not hide them.
     fn foreign_activate(&mut self, surface: &WlSurface) {
-        let Some(ws) = self.toplevels.get(surface) else {
+        if !self.toplevels.contains_key(surface) {
+            return;
+        }
+        let stack: Vec<Stacked<WlSurface>> = self
+            .space
+            .elements()
+            .filter_map(|window| {
+                let toplevel = window.toplevel()?;
+                let window = toplevel.wl_surface().clone();
+                let modal = self.toplevels.get(&window).is_some_and(|ws| ws.modal);
+                Some(Stacked {
+                    parent: toplevel.parent(),
+                    window,
+                    modal,
+                })
+            })
+            .collect();
+        let target = activation_target(surface, &stack);
+        let Some(ws) = self.toplevels.get(&target) else {
             return;
         };
         let window = ws.window.clone();
@@ -629,5 +649,103 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrForeignToplevelHandleV1, Stat
         resource: &ZwlrForeignToplevelHandleV1,
     ) {
         state.foreign_toplevel.remove_wlr_instance(resource);
+    }
+}
+
+/// One mapped window as [`activation_target`] sees it.
+struct Stacked<T> {
+    window: T,
+    parent: Option<T>,
+    modal: bool,
+}
+
+/// The window a shell's activate of `target` should focus, given every
+/// mapped window back to front. Only the focused window and its ancestors
+/// are shown, so activating a parent would hide its dialogs: a modal
+/// dialog of `target` (or of one of its dialogs) wins, the topmost if
+/// several; otherwise the topmost of `target` and its dialogs, which is
+/// the one focused last, since focusing raises.
+fn activation_target<T: Clone + PartialEq>(target: &T, stack: &[Stacked<T>]) -> T {
+    let parent_of = |w: &T| {
+        stack
+            .iter()
+            .find(|s| &s.window == w)
+            .and_then(|s| s.parent.as_ref())
+    };
+    // Bounded by the stack's length, in case parents ever form a cycle.
+    let below_target = |s: &Stacked<T>| {
+        let mut parent = s.parent.as_ref();
+        for _ in 0..stack.len() {
+            match parent {
+                Some(p) if p == target => return true,
+                Some(p) => parent = parent_of(p),
+                None => return false,
+            }
+        }
+        false
+    };
+    let family = || stack.iter().filter(|s| &s.window == target || below_target(s));
+    family()
+        .filter(|s| s.modal && &s.window != target)
+        .last()
+        .or_else(|| family().last())
+        .map_or_else(|| target.clone(), |s| s.window.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn w(window: u32, parent: Option<u32>, modal: bool) -> Stacked<u32> {
+        Stacked {
+            window,
+            parent,
+            modal,
+        }
+    }
+
+    #[test]
+    fn a_window_without_dialogs_is_itself() {
+        assert_eq!(activation_target(&1, &[w(1, None, false), w(2, None, false)]), 1);
+    }
+
+    #[test]
+    fn its_dialog_focused_last_is_focused_again() {
+        let stack = [w(1, None, false), w(2, Some(1), false), w(3, None, false)];
+        assert_eq!(activation_target(&1, &stack), 2);
+    }
+
+    #[test]
+    fn the_parent_focused_after_its_dialog_stays_focused() {
+        let stack = [w(2, Some(1), false), w(1, None, false)];
+        assert_eq!(activation_target(&1, &stack), 1);
+    }
+
+    #[test]
+    fn a_modal_dialog_wins_over_anything_focused_later() {
+        let stack = [
+            w(3, Some(1), true),
+            w(2, Some(1), false),
+            w(1, None, false),
+        ];
+        assert_eq!(activation_target(&1, &stack), 3);
+    }
+
+    #[test]
+    fn the_topmost_of_several_modals_wins() {
+        let stack = [w(1, None, false), w(2, Some(1), true), w(3, Some(1), true)];
+        assert_eq!(activation_target(&1, &stack), 3);
+    }
+
+    #[test]
+    fn a_dialog_of_a_dialog_counts() {
+        let stack = [w(1, None, false), w(2, Some(1), false), w(3, Some(2), true)];
+        assert_eq!(activation_target(&1, &stack), 3);
+    }
+
+    #[test]
+    fn other_apps_dialogs_are_ignored() {
+        let stack = [w(1, None, false), w(5, None, false), w(6, Some(5), true)];
+        assert_eq!(activation_target(&1, &stack), 1);
     }
 }

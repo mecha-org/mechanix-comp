@@ -283,7 +283,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         self.space.map_element(window.clone(), loc, false);
         self.toplevels.get_mut(surface).unwrap().mapped = true;
-        if self.active_fullscreen_window().is_none() {
+        // A parent mapped after its focused dialog leaves the focus on the dialog.
+        if self.active_fullscreen_window().is_none() && !self.active_group().contains(surface) {
             self.focus_window(window, SERIAL_COUNTER.next_serial());
         } else if let Some(output) = &output {
             self.apply_layout(output);

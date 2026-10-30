@@ -865,23 +865,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 .any(|output| self.visible_surfaces(output).contains(&toplevel))
     }
 
-    /// The topmost window currently marked modal, if any. While open, input to
-    /// every other window is blocked. Without the session xdg-dialog global the
-    /// flag stays false.
-    pub fn active_modal_window(&self) -> Option<Window> {
-        self.space
-            .elements()
-            .rev()
-            .find(|w| {
-                w.toplevel().is_some_and(|toplevel| {
-                    self.toplevels
-                        .get(toplevel.wl_surface())
-                        .is_some_and(|ws| ws.modal)
-                })
-            })
-            .cloned()
-    }
-
     /// Recompute keyboard focus from the layer-shell priority list and apply it
     /// if it changed. Called each frame from the backends' idle callbacks.
     pub fn update_keyboard_focus(&mut self) {

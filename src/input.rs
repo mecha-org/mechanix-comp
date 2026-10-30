@@ -14,17 +14,17 @@ use smithay::{
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER},
-    wayland::compositor::with_states,
-    wayland::shell::wlr_layer::{KeyboardInteractivity, Layer as WlrLayer},
+    wayland::shell::wlr_layer::KeyboardInteractivity,
 };
 use tracing::{debug, error, info};
 
 use crate::backend::Backend;
+use crate::layout::{StackEntry, StackingOrder};
 use crate::state::State;
 
 impl<BackendData: Backend + 'static> State<BackendData> {
-    /// The surface under `pos` and its location, topmost first: Overlay/Top
-    /// layers, then toplevels, then Bottom/Background layers.
+    /// The surface under `pos` and its location, topmost first in the order
+    /// the output is drawn.
     pub fn surface_under(
         &self,
         pos: Point<f64, Logical>,
@@ -49,74 +49,22 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return None;
         }
 
-        let map = layer_map_for_output(output);
-
-        let layer_surface_under = |layer: &smithay::desktop::LayerSurface| {
-            let layer_loc = map.layer_geometry(layer).unwrap().loc;
-            layer
-                .surface_under(
-                    pos - output_geo.loc.to_f64() - layer_loc.to_f64(),
-                    WindowSurfaceType::ALL,
-                )
-                .map(|(surface, loc)| (surface, (loc + layer_loc + output_geo.loc).to_f64()))
-        };
-
-        // The main surface only hits if its input region contains the point,
-        // so click-through layers pass it through.
-        let layer_main_hit = |layer: &smithay::desktop::LayerSurface| {
-            let layer_loc = map.layer_geometry(layer).unwrap().loc;
-            let local = pos - output_geo.loc.to_f64() - layer_loc.to_f64();
-            if layer_main_surface_hits(layer, local) {
-                Some((
-                    layer.wl_surface().clone(),
-                    (layer_loc + output_geo.loc).to_f64(),
-                ))
-            } else {
-                None
-            }
-        };
-
-        // Topmost layer in `kinds` that accepts the point.
-        let layer_under = |kinds: [WlrLayer; 2]| {
-            topmost_accepting_layer(&map, pos - output_geo.loc.to_f64(), kinds)
-                .and_then(|layer| layer_surface_under(layer).or_else(|| layer_main_hit(layer)))
-        };
-
-        // A fullscreen window obscures Top/Bottom layers, leaving only Overlay.
-        let fullscreen_active = self.active_fullscreen_window().is_some();
-        let upper_kinds = if fullscreen_active {
-            [WlrLayer::Overlay, WlrLayer::Overlay]
-        } else {
-            [WlrLayer::Overlay, WlrLayer::Top]
-        };
-        if let Some(found) = layer_under(upper_kinds) {
-            return Some(found);
-        }
-
-        let modal = self.active_modal_window();
-        if let Some((window, location)) = self.space.element_under(pos) {
-            // Hidden windows are outside the active group: skip them so clicks
-            // in the clear area don't reach what isn't shown.
-            let in_group = window
-                .toplevel()
-                .is_some_and(|t| self.active_group().contains(t.wl_surface()));
-            // A modal dialog blocks input to every other window.
-            if in_group
-                && modal.as_ref().is_none_or(|m| m == window)
-                && let Some((surface, loc)) = window
-                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(s, p)| (s, (p + location).to_f64()))
+        let visible = self.visible_surfaces(output);
+        let order = StackingOrder::new(&self.space, output, &self.toplevels, &visible);
+        for stacked in order.iter() {
+            let Some(found) = stacked.surface_under(pos) else {
+                continue;
+            };
+            // A modal dialog blocks input to its parents.
+            if let StackEntry::Window(window) = stacked.entry
+                && window
+                    .toplevel()
+                    .is_some_and(|t| self.modal_blocks(&visible, t.wl_surface()))
             {
-                return Some((surface, loc));
+                return None;
             }
-        }
-
-        if !fullscreen_active
-            && let Some(found) = layer_under([WlrLayer::Bottom, WlrLayer::Background])
-        {
             return Some(found);
         }
-
         None
     }
 
@@ -309,57 +257,39 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     fn on_device_removed<B: InputBackend>(&mut self, _device: B::Device) {}
 
-    /// Same focus policy for pointer press and touch down: OnDemand layers, else the window, else lower layers.
+    /// Same focus policy for pointer press and touch down: the surface under
+    /// the point takes focus, OnDemand layers only through `layer_shell_on_demand_focus`.
     fn assign_pointer_click_focus(
         &mut self,
         pos: Point<f64, Logical>,
         serial: smithay::utils::Serial,
     ) {
+        let Some((surface, _)) = self.surface_under(pos) else {
+            return;
+        };
         if self.is_locked() {
-            if let Some((surface, _)) = self.surface_under(pos) {
-                self.seat
-                    .get_keyboard()
-                    .unwrap()
-                    .set_focus(self, Some(surface), serial);
-            }
+            self.seat
+                .get_keyboard()
+                .unwrap()
+                .set_focus(self, Some(surface), serial);
             return;
         }
 
-        let layer_under = |kinds: [WlrLayer; 2]| {
-            self.space.outputs().next().cloned().and_then(|output| {
-                let output_geo = self.space.output_geometry(&output)?;
-                let map = layer_map_for_output(&output);
-                let pos = pos - output_geo.loc.to_f64();
-                topmost_accepting_layer(&map, pos, kinds).map(|layer| {
-                    let on_demand = layer.cached_state().keyboard_interactivity
-                        == KeyboardInteractivity::OnDemand;
-                    (layer.wl_surface().clone(), on_demand)
-                })
-            })
-        };
-
-        // Overlay/Top layers win the click; a fullscreen window covers everything but Overlay.
-        let upper_kinds = if self.active_fullscreen_window().is_some() {
-            [WlrLayer::Overlay, WlrLayer::Overlay]
-        } else {
-            [WlrLayer::Overlay, WlrLayer::Top]
-        };
-        if let Some((surface, on_demand)) = layer_under(upper_kinds) {
-            if on_demand {
-                self.layer_shell_on_demand_focus = Some(surface);
+        let layer = self.space.outputs().find_map(|output| {
+            let map = layer_map_for_output(output);
+            let layer = map.layer_for_surface(&surface, WindowSurfaceType::ALL)?;
+            let interactivity = layer.cached_state().keyboard_interactivity;
+            Some((layer.wl_surface().clone(), interactivity))
+        });
+        if let Some((layer, interactivity)) = layer {
+            if interactivity == KeyboardInteractivity::OnDemand {
+                self.layer_shell_on_demand_focus = Some(layer);
             }
-        } else if let Some(window) = self.space.element_under(pos).map(|(w, _)| w.clone()) {
-            // Modal dialogs keep the parent focused.
-            let modal = self.active_modal_window();
-            if modal.as_ref().is_none_or(|m| m == &window) {
-                self.focus_window(&window, serial);
-            }
-        } else if self.active_fullscreen_window().is_none()
-            && let Some((surface, on_demand)) =
-                layer_under([WlrLayer::Bottom, WlrLayer::Background])
-            && on_demand
+        } else if let Some(ws) = self
+            .toplevel_of(&surface)
+            .and_then(|s| self.toplevels.get(&s))
         {
-            self.layer_shell_on_demand_focus = Some(surface);
+            self.focus_window(&ws.window.clone(), serial);
         }
     }
 
@@ -543,51 +473,4 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
     } else {
         None
     }
-}
-
-/// The topmost layer surface in `kinds` accepting `pos` (output-relative): a
-/// popup/subsurface under the point, or its main surface's input region.
-/// Click-through layers pass the point through.
-fn topmost_accepting_layer(
-    map: &smithay::desktop::LayerMap,
-    pos: Point<f64, Logical>,
-    kinds: [WlrLayer; 2],
-) -> Option<&smithay::desktop::LayerSurface> {
-    kinds.into_iter().find_map(|kind| {
-        map.layers_on(kind).rev().find(|layer| {
-            let layer_loc = map.layer_geometry(layer).unwrap().loc;
-            let local = pos - layer_loc.to_f64();
-            // Ignore the main surface here: `surface_under` is pure geometry,
-            // so gate it on the input region below.
-            layer
-                .surface_under(local, WindowSurfaceType::ALL)
-                .is_some_and(|(surface, _)| surface != *layer.wl_surface())
-                || layer_main_surface_hits(layer, local)
-        })
-    })
-}
-
-/// Whether `local` (relative to the layer surface) lies on its main surface:
-/// inside its (viewport-scaled) rectangle and, if set, inside its input region.
-fn layer_main_surface_hits(
-    layer: &smithay::desktop::LayerSurface,
-    local: Point<f64, Logical>,
-) -> bool {
-    // A layer without an input region must still only capture its own on-screen
-    // rectangle; `geometry()` is the wp_viewport-scaled destination.
-    if !layer.geometry().to_f64().contains(local) {
-        return false;
-    }
-    with_states(layer.wl_surface(), |states| {
-        match states
-            .cached_state
-            .get::<smithay::wayland::compositor::SurfaceAttributes>()
-            .current()
-            .input_region
-            .as_ref()
-        {
-            None => true,
-            Some(region) => region.contains(local.to_i32_round::<i32>()),
-        }
-    })
 }

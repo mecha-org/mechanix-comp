@@ -1,20 +1,26 @@
-//! Comet layout: one stateful model per output, owning the window stack and the work zone.
+//! Comet layout: where windows go, which are shown, and the stacking order
+//! rendering and hit-testing share.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::MutexGuard;
 
-use smithay::desktop::{Window, layer_map_for_output};
+use smithay::desktop::{
+    LayerMap, LayerSurface, Space, Window, WindowSurfaceType, layer_map_for_output,
+};
 use smithay::output::{Mode, Output, Scale};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Point;
 use smithay::utils::{Logical, Rectangle, Size};
+use smithay::wayland::compositor::{SurfaceAttributes, with_states};
 use smithay::wayland::session_lock::LockSurface;
+use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::backend::Backend;
 use crate::state::State;
-use crate::state::WindowMode;
+use crate::state::{WindowMode, WindowState};
 
 pub fn is_dialog(toplevel: &ToplevelSurface) -> bool {
     toplevel.parent().is_some()
@@ -263,6 +269,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .collect()
     }
 
+    /// Whether a shown modal dialog has `window` as a parent, blocking its input.
+    pub fn modal_blocks(&self, visible: &HashSet<WlSurface>, window: &WlSurface) -> bool {
+        visible
+            .iter()
+            .filter(|s| *s != window && self.toplevels.get(*s).is_some_and(|ws| ws.modal))
+            .any(|modal| ancestor_chain(modal, |s| self.parent_of(s)).contains(window))
+    }
+
     /// The active group's surfaces that are stacked on `output`.
     pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
         let Some(layout) = self.layouts.get(output) else {
@@ -272,4 +286,122 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         visible.retain(|s| layout.contains(s));
         visible
     }
+}
+
+/// One entry of the stacking order, at its location in global coordinates.
+pub struct Stacked<'a> {
+    pub entry: StackEntry<'a>,
+    pub loc: Point<i32, Logical>,
+}
+
+/// What a stacking order entry draws and takes input for.
+pub enum StackEntry<'a> {
+    /// A layer surface's popups and/or its own surface tree, as `kind` selects.
+    Layer(&'a LayerSurface, WindowSurfaceType),
+    /// A shown window with its popups.
+    Window(&'a Window),
+}
+
+/// An output's shown surfaces, holding its layer map while in use.
+pub struct StackingOrder<'a> {
+    space: &'a Space<Window>,
+    map: MutexGuard<'a, LayerMap>,
+    origin: Point<i32, Logical>,
+    toplevels: &'a HashMap<WlSurface, WindowState>,
+    visible: &'a HashSet<WlSurface>,
+}
+
+impl<'a> StackingOrder<'a> {
+    pub fn new(
+        space: &'a Space<Window>,
+        output: &'a Output,
+        toplevels: &'a HashMap<WlSurface, WindowState>,
+        visible: &'a HashSet<WlSurface>,
+    ) -> Self {
+        Self {
+            space,
+            map: layer_map_for_output(output),
+            origin: space.output_geometry(output).unwrap_or_default().loc,
+            toplevels,
+            visible,
+        }
+    }
+
+    /// Front to back: Overlay layers, fullscreen windows, Top layers,
+    /// Bottom/Background popups, the other windows, then the Bottom/Background surfaces.
+    pub fn iter(&self) -> impl Iterator<Item = Stacked<'_>> {
+        let popups = WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE;
+        let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
+        self.layer(Layer::Overlay, WindowSurfaceType::ALL)
+            .chain(self.windows(true))
+            .chain(self.layer(Layer::Top, WindowSurfaceType::ALL))
+            .chain(self.layer(Layer::Bottom, popups))
+            .chain(self.layer(Layer::Background, popups))
+            .chain(self.windows(false))
+            .chain(self.layer(Layer::Bottom, own))
+            .chain(self.layer(Layer::Background, own))
+    }
+
+    /// `layer`'s surfaces, newest first as the order within a layer is ours to pick.
+    fn layer(&self, layer: Layer, kind: WindowSurfaceType) -> impl Iterator<Item = Stacked<'_>> {
+        self.map.layers_on(layer).rev().filter_map(move |surface| {
+            let loc = self.map.layer_geometry(surface)?.loc + self.origin;
+            Some(Stacked {
+                entry: StackEntry::Layer(surface, kind),
+                loc,
+            })
+        })
+    }
+
+    /// The shown windows that are fullscreen, or the ones that aren't, topmost first.
+    fn windows(&self, fullscreen: bool) -> impl Iterator<Item = Stacked<'_>> {
+        self.space.elements().rev().filter_map(move |window| {
+            let surface = window.toplevel()?.wl_surface();
+            let mode = self.toplevels.get(surface)?.mode;
+            if !self.visible.contains(surface) || (mode == WindowMode::Fullscreen) != fullscreen {
+                return None;
+            }
+            let loc = self.space.element_location(window)? - window.geometry().loc;
+            Some(Stacked {
+                entry: StackEntry::Window(window),
+                loc,
+            })
+        })
+    }
+}
+
+impl Stacked<'_> {
+    /// The surface of this entry under `pos`, and that surface's location.
+    pub fn surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let local = pos - self.loc.to_f64();
+        let hit = match self.entry {
+            StackEntry::Layer(layer, kind) => layer_under(layer, local, kind),
+            StackEntry::Window(window) => window.surface_under(local, WindowSurfaceType::ALL),
+        };
+        hit.map(|(surface, loc)| (surface, (loc + self.loc).to_f64()))
+    }
+}
+
+/// The surface of `layer` under `local`, its main surface only within its
+/// viewport-scaled rectangle and input region so click-through layers pass the point on.
+fn layer_under(
+    layer: &LayerSurface,
+    local: Point<f64, Logical>,
+    kind: WindowSurfaceType,
+) -> Option<(WlSurface, Point<i32, Logical>)> {
+    let main = layer.wl_surface();
+    if let Some(hit) = layer.surface_under(local, kind).filter(|(s, _)| s != main) {
+        return Some(hit);
+    }
+    let hits = kind.contains(WindowSurfaceType::TOPLEVEL)
+        && layer.geometry().to_f64().contains(local)
+        && with_states(main, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let region = attributes.current().input_region.as_ref();
+            region.is_none_or(|region| region.contains(local.to_i32_round()))
+        });
+    hits.then(|| (main.clone(), Point::default()))
 }

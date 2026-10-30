@@ -38,7 +38,7 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
-        self.thumbnail_view.forget_surface(surface.wl_surface());
+        self.forget_thumbnail_surface(surface.wl_surface());
         let Some(output) = self
             .space
             .outputs()

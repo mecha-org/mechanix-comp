@@ -42,7 +42,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         // The foreign-toplevel `closed` event is sent by
         // `foreign_toplevel_refresh` on the next idle callback.
         self.forget_toplevel(surface.wl_surface());
-        self.thumbnail_view.forget_surface(surface.wl_surface());
+        self.forget_thumbnail_surface(surface.wl_surface());
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {

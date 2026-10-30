@@ -438,6 +438,38 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
+    /// Queue a redraw of the outputs showing `layers`; every output if one of
+    /// them is no longer in any layer map.
+    pub fn schedule_render_for_layers(&mut self, layers: &[WlSurface]) {
+        if layers.is_empty() {
+            return;
+        }
+        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
+        let mut found = 0;
+        for output in &outputs {
+            let shows = {
+                let map = layer_map_for_output(output);
+                layers
+                    .iter()
+                    .filter(|layer| map.layers().any(|l| l.wl_surface() == *layer))
+                    .count()
+            };
+            if shows > 0 {
+                found += shows;
+                self.backend_data.schedule_render(output);
+            }
+        }
+        if found < layers.len() {
+            self.schedule_render();
+        }
+    }
+
+    /// Forget `surface` in the thumbnail state and redraw what that changes.
+    pub fn forget_thumbnail_surface(&mut self, surface: &WlSurface) {
+        let layers = self.thumbnail_view.forget_surface(surface);
+        self.schedule_render_for_layers(&layers);
+    }
+
     /// Send frame callbacks for a presented frame; `now` is its presentation time.
     pub fn send_frame_callbacks(&mut self, output: &Output, now: Duration) {
         if self.is_locked() {
@@ -864,20 +896,20 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         });
     }
 
-    /// The topmost window currently in `Fullscreen` mode, if any. While one is
-    /// active it is rendered above the top layer and keeps keyboard focus.
+    /// The active window if it is in `Fullscreen` mode. It keeps keyboard
+    /// focus against ordinary focus changes; a fullscreen window that stopped
+    /// being active (a shell switch) blocks nothing.
     pub fn active_fullscreen_window(&self) -> Option<Window> {
+        let active = active_if_fullscreen(self.active_window.clone(), |surface| {
+            self.toplevels
+                .get(surface)
+                .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
+        })?;
+        let ws = self.toplevels.get(&active)?;
         self.space
             .elements()
-            .rev()
-            .find(|window| {
-                window.toplevel().is_some_and(|toplevel| {
-                    self.toplevels
-                        .get(toplevel.wl_surface())
-                        .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
-                })
-            })
-            .cloned()
+            .any(|window| window == &ws.window)
+            .then(|| ws.window.clone())
     }
 
     /// The toplevel a surface belongs to, through subsurfaces and popups.
@@ -1010,6 +1042,11 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+/// The active window, if it is fullscreen.
+fn active_if_fullscreen<S>(active: Option<S>, is_fullscreen: impl Fn(&S) -> bool) -> Option<S> {
+    active.filter(|surface| is_fullscreen(surface))
+}
+
 /// Whether a mapped toplevel gets xdg `Suspended`: nothing shows or records it.
 fn should_suspend(visible: bool, recorded: bool, thumbnailed: bool) -> bool {
     !visible && !recorded && !thumbnailed
@@ -1029,6 +1066,16 @@ fn frame_output<O: Clone>(scanout: Option<O>, thumbnailed: bool, output: &O) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_active_fullscreen_window_blocks_focus() {
+        let fullscreen = |w: &u32| *w == 1;
+        // The fullscreen window stopped being active (shell switch): no block.
+        assert_eq!(active_if_fullscreen(Some(2), fullscreen), None);
+        assert_eq!(active_if_fullscreen(None, fullscreen), None);
+        // The fullscreen window is the active one: it blocks.
+        assert_eq!(active_if_fullscreen(Some(1), fullscreen), Some(1));
+    }
 
     #[test]
     fn thumbnailed_window_is_not_suspended() {

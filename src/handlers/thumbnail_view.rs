@@ -79,8 +79,11 @@ impl<T: PartialEq, S: Eq + Hash + Clone> Thumbnails<T, S> {
         ));
     }
 
-    fn remove(&mut self, id: &T) {
-        self.entries.retain(|(entry, _)| entry != id);
+    /// Drop thumbnail `id`; the layer it was drawn on, if it was drawn.
+    fn remove(&mut self, id: &T) -> Option<S> {
+        let index = self.entries.iter().position(|(entry, _)| entry == id)?;
+        let (_, thumbnail) = self.entries.remove(index);
+        thumbnail.drawable().then_some(thumbnail.layer)
     }
 
     /// Record a `set_properties`; unknown ids (inert from creation, or dropped
@@ -128,15 +131,31 @@ impl<T: PartialEq, S: Eq + Hash + Clone> Thumbnails<T, S> {
             .collect()
     }
 
-    /// Drop thumbnails on layer `surface`; make those of toplevel `surface` inert.
-    fn forget_surface(&mut self, surface: &S) {
-        self.entries
-            .retain(|(_, thumbnail)| &thumbnail.layer != surface);
+    /// Drop thumbnails on layer `surface`; make those of toplevel `surface`
+    /// inert. Returns the layers that lost a drawn thumbnail.
+    fn forget_surface(&mut self, surface: &S) -> Vec<S> {
+        let mut redraw = Vec::new();
+        let mut note = |layer: &S| {
+            if !redraw.contains(layer) {
+                redraw.push(layer.clone());
+            }
+        };
+        self.entries.retain(|(_, thumbnail)| {
+            let dropped = &thumbnail.layer == surface;
+            if dropped && thumbnail.drawable() {
+                note(&thumbnail.layer);
+            }
+            !dropped
+        });
         for (_, thumbnail) in &mut self.entries {
             if &thumbnail.toplevel == surface {
+                if thumbnail.drawable() {
+                    note(&thumbnail.layer);
+                }
                 thumbnail.toplevel_alive = false;
             }
         }
+        redraw
     }
 }
 
@@ -183,9 +202,11 @@ impl ThumbnailViewState {
     }
 
     /// `s` is gone: drop thumbnails on it as a layer; those of it as a
-    /// toplevel stay inert until the client destroys them.
-    pub fn forget_surface(&mut self, s: &WlSurface) {
-        self.thumbnails.forget_surface(s);
+    /// toplevel stay inert until the client destroys them. Returns the layer
+    /// surfaces that lost a drawn thumbnail and need a redraw.
+    #[must_use = "redraw the returned layers' outputs"]
+    pub fn forget_surface(&mut self, s: &WlSurface) -> Vec<WlSurface> {
+        self.thumbnails.forget_surface(s)
     }
 }
 
@@ -313,7 +334,9 @@ impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivateThumbnail, State<Back
         _client: ClientId,
         resource: &PhoshPrivateThumbnail,
     ) {
-        state.thumbnail_view.thumbnails.remove(resource);
+        if let Some(layer) = state.thumbnail_view.thumbnails.remove(resource) {
+            state.schedule_render_for_layers(&[layer]);
+        }
     }
 }
 
@@ -406,6 +429,30 @@ mod tests {
         assert_eq!(drawn(&thumbnails, LAYER), vec![(30, 40, 0.25, 1.0)]);
         thumbnails.remove(&100);
         assert_eq!(drawn(&thumbnails, LAYER), vec![(30, 40, 0.25, 1.0)]);
+    }
+
+    #[test]
+    fn removing_drawn_thumbnails_reports_layers_to_redraw() {
+        let mut thumbnails = one_thumbnail();
+        thumbnails.add(101, 11, OTHER_LAYER);
+        // Not yet applied: nothing was drawn, nothing to redraw.
+        assert_eq!(thumbnails.remove(&101), None);
+        thumbnails.add(102, 11, OTHER_LAYER);
+        thumbnails.set_properties(&100, 10, 20, 0.5, 0.8);
+        thumbnails.set_properties(&102, 10, 20, 0.5, 0.8);
+        thumbnails.on_layer_commit(&LAYER);
+        thumbnails.on_layer_commit(&OTHER_LAYER);
+
+        assert_eq!(thumbnails.forget_surface(&TOPLEVEL), vec![LAYER]);
+        // Already inert: no second redraw.
+        assert_eq!(thumbnails.forget_surface(&TOPLEVEL), Vec::<u32>::new());
+        assert_eq!(thumbnails.remove(&100), None);
+        assert_eq!(thumbnails.remove(&102), Some(OTHER_LAYER));
+
+        let mut thumbnails = one_thumbnail();
+        thumbnails.set_properties(&100, 10, 20, 0.5, 0.8);
+        thumbnails.on_layer_commit(&LAYER);
+        assert_eq!(thumbnails.forget_surface(&LAYER), vec![LAYER]);
     }
 
     #[test]

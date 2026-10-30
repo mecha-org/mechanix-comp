@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::process::Command;
 use std::time::Duration;
 
 use smithay::backend::allocator::Fourcc;
@@ -29,7 +29,7 @@ use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session};
 use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
 use smithay::backend::udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu};
-use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::desktop::layer_map_for_output;
 use smithay::desktop::utils::{
     OutputPresentationFeedback, send_dmabuf_feedback_surface_tree, surface_primary_scanout_output,
@@ -46,14 +46,15 @@ use smithay::reexports::wayland_server::Display;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::backend::GlobalId;
-use smithay::utils::{DeviceFd, IsAlive, Monotonic, Time};
-use smithay::wayland::compositor::{SurfaceData, with_states};
+use smithay::utils::{DeviceFd, IsAlive, Monotonic, Physical, Point, Time};
+use smithay::wayland::compositor::SurfaceData;
 use smithay::wayland::dmabuf::{DmabufFeedback, DmabufFeedbackBuilder};
 use smithay_drm_extras::drm_scanner::{DrmScanEvent, DrmScanner};
 use tracing::{error, info, warn};
 
 use crate::backend::{Backend, Wakeups, output_refresh};
 use crate::drawing::{PointerElement, cached_pointer_buffer};
+use crate::handlers::image_copy_capture::{OutputFrame, capture_output};
 use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
 
@@ -104,16 +105,18 @@ enum RepaintState {
     Idle,
     RenderQueued,
     AwaitingVblank {
-        /// New damage arrived while the frame was scanning out.
-        damage_pending: bool,
+        /// New damage arrived, or frame callbacks were skipped.
+        render_again: bool,
     },
 }
 
 #[derive(Default)]
 struct Repaint {
     state: RepaintState,
-    /// When frame callbacks were last sent (pacing).
-    last_ack: Option<Time<Monotonic>>,
+    /// The vblank frame callbacks were last sent for.
+    acked_vblank: Option<Duration>,
+    /// The last real vblank, to predict the next one.
+    last_vblank: Option<Time<Monotonic>>,
     /// Pending paced redraw, if any.
     render_wake: Option<RegistrationToken>,
 }
@@ -127,11 +130,8 @@ pub struct UdevData {
     renderer_node: Option<DrmNode>,
     devices: HashMap<DrmNode, DeviceData>,
     keyboards: Vec<smithay::reexports::input::Device>,
-    /// Connected pointer devices; the software cursor renders only while non-empty.
-    pointers: Vec<smithay::reexports::input::Device>,
-    /// True once a pointer device has actually moved; a phantom pointer (e.g.
-    /// the HDMI controller) must not summon a cursor stuck at (0,0).
-    pointer_moved: bool,
+    /// Cursor shown: pointer activity shows it, touch hides it.
+    cursor_visible: bool,
     /// Loaded xcursor theme used to pick the current cursor frame.
     pointer_image: crate::cursor::Cursor,
     /// Cache of imported cursor frames, keyed by the raw xcursor image.
@@ -166,6 +166,10 @@ impl Backend for UdevData {
         self.login.seat()
     }
 
+    fn default_scale(&self, output: &Output) -> f64 {
+        crate::backend::guess_default_scale(output)
+    }
+
     fn reset_buffers(&mut self, output: &Output) {
         if let Some(id) = output.user_data().get::<OutputKey>()
             && let Some(device) = self.devices.get_mut(&id.node)
@@ -184,6 +188,25 @@ impl Backend for UdevData {
 
     fn output_power_supported(&self, output: &Output) -> bool {
         output.user_data().get::<OutputKey>().is_some()
+    }
+
+    fn pointer_visible(&self) -> bool {
+        self.cursor_visible
+    }
+
+    fn cursor_elements(
+        &mut self,
+        location: Point<i32, Physical>,
+        scale: smithay::utils::Scale<f64>,
+    ) -> Vec<Element> {
+        if !self.pointer_visible() {
+            return Vec::new();
+        }
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Vec::new();
+        };
+        self.pointer_element
+            .render_elements(renderer, location, scale, 1.0)
     }
 
     fn scanout_dmabuf_feedback(&self, output: &Output) -> Option<DmabufFeedback> {
@@ -255,8 +278,8 @@ impl Backend for UdevData {
                     state.render_surface(node, crtc);
                 });
             }
-            RepaintState::AwaitingVblank { damage_pending } => {
-                *damage_pending = true;
+            RepaintState::AwaitingVblank { render_again } => {
+                *render_again = true;
             }
             RepaintState::RenderQueued => {}
         }
@@ -304,6 +327,29 @@ impl UdevData {
     }
 }
 
+/// Put `WAYLAND_DISPLAY` in the systemd and D-Bus activation environments.
+fn export_wayland_display() {
+    let status = Command::new("dbus-update-activation-environment")
+        .args(["--systemd", "WAYLAND_DISPLAY"])
+        .status()
+        .or_else(|_| {
+            Command::new("systemctl")
+                .args(["--user", "import-environment", "WAYLAND_DISPLAY"])
+                .status()
+        });
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => warn!("exporting WAYLAND_DISPLAY failed: {status}"),
+        Err(err) => warn!("exporting WAYLAND_DISPLAY failed: {err}"),
+    }
+}
+
+/// The first vblank after `now`, in whole refreshes from the last one.
+fn next_vblank(last: Duration, refresh: Duration, now: Duration) -> Duration {
+    let periods = now.saturating_sub(last).as_nanos() / refresh.as_nanos().max(1) + 1;
+    last + refresh * periods as u32
+}
+
 /// KMS-capable = has modeset resources; render-only cards (etnaviv) don't.
 fn is_kms_card(fd: &DrmDeviceFd) -> bool {
     fd.resource_handles().is_ok_and(|res| {
@@ -326,8 +372,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         renderer_node: None,
         devices: HashMap::new(),
         keyboards: Vec::new(),
-        pointers: Vec::new(),
-        pointer_moved: false,
+        cursor_visible: false,
         pointer_image: crate::cursor::Cursor::load(),
         pointer_images: Vec::new(),
         pointer_element: PointerElement::default(),
@@ -339,6 +384,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut state = State::new(&mut event_loop, display, udev_data);
+
+    // Children need the real socket name.
+    // SAFETY: nothing else runs yet: no renderer, clients or other threads.
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
 
     // Initialize libinput backend
     let mut libinput_context = Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(
@@ -372,28 +421,30 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = device.config_accel_set_profile(AccelProfile::Adaptive);
                         let _ = device.config_accel_set_speed(0.0);
                     }
-                    data.backend_data.pointers.push(device.clone());
-                    data.backend_data.pointer_moved = false;
                 }
-            } else if let InputEvent::DeviceRemoved { ref device } = event {
-                if device.has_capability(DeviceCapability::Keyboard) {
-                    data.backend_data.keyboards.retain(|item| item != device);
-                }
-                if device.has_capability(DeviceCapability::Pointer) {
-                    data.backend_data.pointers.retain(|item| item != device);
-                    if data.backend_data.pointers.is_empty() {
-                        data.backend_data.pointer_moved = false;
-                    }
-                }
+            } else if let InputEvent::DeviceRemoved { ref device } = event
+                && device.has_capability(DeviceCapability::Keyboard)
+            {
+                data.backend_data.keyboards.retain(|item| item != device);
             }
 
-            // A real pointer moving is what summons the cursor; touch and the
-            // phantom HDMI "pointer" never move it.
-            if matches!(
-                event,
-                InputEvent::PointerMotion { .. } | InputEvent::PointerMotionAbsolute { .. }
-            ) {
-                data.backend_data.pointer_moved = true;
+            let cursor_visible = match event {
+                InputEvent::PointerMotion { .. }
+                | InputEvent::PointerMotionAbsolute { .. }
+                | InputEvent::PointerButton { .. }
+                | InputEvent::PointerAxis { .. } => Some(true),
+                InputEvent::TouchDown { .. } => Some(false),
+                _ => None,
+            };
+            if let Some(visible) = cursor_visible
+                && visible != data.backend_data.cursor_visible
+            {
+                data.backend_data.cursor_visible = visible;
+                // Re-target before delivering the event that unhid the cursor.
+                if visible {
+                    data.refresh_pointer_focus();
+                }
+                data.schedule_render();
             }
 
             data.process_input_event(event)
@@ -472,10 +523,19 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.socket_name
     );
 
+    // As a systemd service, hand user services the socket before READY.
+    if std::env::var_os("NOTIFY_SOCKET").is_some() {
+        export_wayland_display();
+    }
+    // Readiness for systemd's Type=notify.
+    if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
+        warn!("failed to signal readiness to systemd: {err}");
+    }
+
     event_loop.run(None, &mut state, move |state| {
         state.refresh_space();
         state.foreign_toplevel_refresh();
-        state.update_idle_inhibit();
+        state.update_suspended();
         let _ = state.display_handle.flush_clients();
     })?;
 
@@ -669,13 +729,6 @@ impl State<UdevData> {
         connector: connector::Info,
         crtc: crtc::Handle,
     ) {
-        let Some(device) = self.backend_data.devices.get_mut(&node) else {
-            return;
-        };
-        let Some(renderer) = self.backend_data.renderer.as_mut() else {
-            return;
-        };
-
         let mode_id = connector
             .modes()
             .iter()
@@ -704,13 +757,7 @@ impl State<UdevData> {
             },
         );
         output.set_preferred(wl_mode);
-        // Auto-detect the scale from the panel's physical size unless overridden.
-        let scale = crate::backend::env_scale().unwrap_or_else(|| {
-            crate::backend::snap_scale(crate::backend::guess_default_scale(
-                connector.size(),
-                wl_mode.size,
-            ))
-        });
+        let scale = self.output_scale(&output);
         // Extend: place each output to the right of the existing ones.
         let x = self
             .space
@@ -728,6 +775,12 @@ impl State<UdevData> {
             .user_data()
             .insert_if_missing(|| OutputKey { node, crtc });
 
+        let Some(device) = self.backend_data.devices.get_mut(&node) else {
+            return;
+        };
+        let Some(renderer) = self.backend_data.renderer.as_mut() else {
+            return;
+        };
         let global = output.create_global::<State<UdevData>>(&self.display_handle);
         self.space.map_output(&output, position);
 
@@ -806,6 +859,7 @@ impl State<UdevData> {
         self.display_handle
             .remove_global::<State<UdevData>>(surface.global);
         if let Some(output) = self.output_for_crtc(node, crtc) {
+            self.stop_captures_for_output(&output);
             self.release_fifo_barriers(&output);
             self.output_power.output_removed(&output);
             self.space.unmap_output(&output);
@@ -862,6 +916,15 @@ impl State<UdevData> {
 
         let visible = self.visible_surfaces(&output);
         let locked = self.is_locked();
+        let now: Duration = self.clock.now().into();
+        let presented = self
+            .backend_data
+            .repaints
+            .get(&(node, crtc))
+            .and_then(|frame| frame.last_vblank)
+            .map_or(now, |last| next_vblank(last.into(), refresh, now));
+        let cursor_hotspot = self.cursor_hotspot();
+        let pointer_visible = self.backend_data.pointer_visible();
 
         let mut queued = false;
         let mut render_failed = false;
@@ -886,25 +949,7 @@ impl State<UdevData> {
                 let pointer_location = self.pointer.current_location();
 
                 let mut custom_elements: Vec<Element> = Vec::new();
-                // Render the cursor only after a real pointer has moved; the
-                // touch-only panel (and phantom devices) never summon it.
-                let pointer_present =
-                    self.backend_data.pointer_moved && !self.backend_data.pointers.is_empty();
-                if pointer_present && output_geometry.to_f64().contains(pointer_location) {
-                    let cursor_hotspot =
-                        if let CursorImageStatus::Surface(surface) = &self.cursor_status {
-                            with_states(surface, |states| {
-                                states
-                                    .data_map
-                                    .get::<Mutex<CursorImageAttributes>>()
-                                    .unwrap()
-                                    .lock()
-                                    .unwrap()
-                                    .hotspot
-                            })
-                        } else {
-                            (0, 0).into()
-                        };
+                if pointer_visible && output_geometry.to_f64().contains(pointer_location) {
                     let cursor_pos = pointer_location - output_geometry.loc.to_f64();
 
                     let cursor_scale =
@@ -983,8 +1028,21 @@ impl State<UdevData> {
                 clear_color,
                 FrameFlags::DEFAULT,
             ) {
-                Ok(result) if !result.is_empty => Some(result.states),
-                Ok(_) => None,
+                Ok(result) => {
+                    capture_output(
+                        &mut self.capture_sessions,
+                        renderer,
+                        &self.loop_handle,
+                        OutputFrame {
+                            output: &output,
+                            elements: &elements,
+                            clear_color,
+                            composited: Some(&result),
+                            presented,
+                        },
+                    );
+                    (!result.is_empty).then_some(result.states)
+                }
                 Err(err) => {
                     warn!("Rendering failed: {err}");
                     render_failed = true;
@@ -996,6 +1054,7 @@ impl State<UdevData> {
                 scanout_states = Some(states);
             }
         }
+        self.refresh_cursor_captures();
 
         if let Some(states) = scanout_states.take() {
             self.update_surface_scanout(&output, &states);
@@ -1017,46 +1076,51 @@ impl State<UdevData> {
             }
         }
 
+        // Send frame callbacks once per vblank so a client cannot redraw faster than the output.
+        let already_acked = self
+            .backend_data
+            .repaints
+            .get(&(node, crtc))
+            .and_then(|frame| frame.acked_vblank)
+            .filter(|&acked| acked >= presented);
+
         if queued {
             self.lock_frame_queued(&output);
+            if already_acked.is_none() {
+                // Ack now, stamped with the vblank this frame should hit.
+                self.ack_frame(node, crtc, &output, presented);
+            }
             // The frame is on the CRTC; damage arriving before its vblank re-renders.
             if let Some(frame) = self.backend_data.repaints.get_mut(&(node, crtc)) {
                 frame.state = RepaintState::AwaitingVblank {
-                    damage_pending: false,
+                    render_again: already_acked.is_some(),
                 };
             }
         } else if render_failed {
             // Retry a failed render at the next refresh.
             self.backend_data.schedule_render_after(&output, refresh);
+        } else if let Some(acked) = already_acked {
+            // Nothing to present, and this vblank was acked: retry once it passes.
+            let now: Duration = self.clock.now().into();
+            self.backend_data
+                .schedule_render_after(&output, acked.saturating_sub(now));
         } else {
-            // Nothing to present. Deliver frame callbacks at most once per
-            // refresh so a client cannot redraw faster than the output.
-            let now = self.clock.now();
-            let deadline = self
-                .backend_data
-                .repaints
-                .get(&(node, crtc))
-                .and_then(|frame| frame.last_ack)
-                .map(|last| last + refresh);
-            match deadline {
-                Some(deadline) if now < deadline => {
-                    self.backend_data.schedule_render_after(
-                        &output,
-                        Duration::from(deadline) - Duration::from(now),
-                    );
-                }
-                _ => {
-                    if let Some(frame) = self.backend_data.repaints.get_mut(&(node, crtc)) {
-                        frame.last_ack = Some(now);
-                    }
-                    self.send_frame_callbacks(&output, Duration::from(now));
-                }
-            }
+            // Nothing to present.
+            self.ack_frame(node, crtc, &output, presented);
+            self.release_fifo_barriers(&output);
         }
 
         if cursor_animated && !self.is_locked() {
             self.backend_data.schedule_render_after(&output, refresh);
         }
+    }
+
+    /// Send frame callbacks timestamped with `vblank`, and remember it for pacing.
+    fn ack_frame(&mut self, node: DrmNode, crtc: crtc::Handle, output: &Output, vblank: Duration) {
+        if let Some(frame) = self.backend_data.repaints.get_mut(&(node, crtc)) {
+            frame.acked_vblank = Some(vblank);
+        }
+        self.send_frame_callbacks(output, vblank);
     }
 
     /// Vblank: retire the frame, notify clients, re-render if damage landed meanwhile.
@@ -1102,21 +1166,17 @@ impl State<UdevData> {
             .repaints
             .get_mut(&(node, crtc))
             .is_some_and(|frame| {
-                frame.last_ack = Some(vblank.unwrap_or(now));
-                let damage = matches!(
+                frame.last_vblank = Some(vblank.unwrap_or(now));
+                let again = matches!(
                     frame.state,
-                    RepaintState::AwaitingVblank {
-                        damage_pending: true
-                    }
+                    RepaintState::AwaitingVblank { render_again: true }
                 );
                 frame.state = RepaintState::Idle;
-                damage
+                again
             });
 
         if let Some(output) = self.output_for_crtc(node, crtc) {
             self.lock_frame_presented(&output);
-            // Ack with the vblank time so client frame-callback clocks match it.
-            self.send_frame_callbacks(&output, Duration::from(vblank.unwrap_or(now)));
             self.send_presentation_feedback(&output, submitted, vblank, now, seq);
             // Render before releasing FIFO waiters so a resumed commit only marks damage.
             if render_again {

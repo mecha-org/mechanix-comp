@@ -1,4 +1,3 @@
-use std::sync::Mutex;
 use std::time::Duration;
 
 use smithay::backend::renderer::ImportDma;
@@ -11,18 +10,17 @@ use smithay::backend::renderer::element::surface::{
 };
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{WinitEvent, WinitGraphicsBackend};
-use smithay::desktop::layer_map_for_output;
-use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::{IsAlive, Rectangle, Transform};
-use smithay::wayland::compositor::with_states;
+use smithay::utils::{IsAlive, Physical, Point, Rectangle, Transform};
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use tracing::warn;
 
 use crate::backend::{Backend, Wakeups};
 use crate::drawing::{PointerElement, cached_pointer_buffer};
+use crate::handlers::image_copy_capture::{OutputFrame, capture_output};
 use crate::render::{Element, OutputElements, output_elements};
 use crate::state::State;
 
@@ -48,6 +46,10 @@ impl Backend for WinitData {
         "winit".to_string()
     }
 
+    fn default_scale(&self, _output: &Output) -> f64 {
+        crate::backend::snap_scale(self.backend.scale_factor())
+    }
+
     fn reset_buffers(&mut self, _output: &Output) {
         // The winit backend re-renders a full frame every time; there are no
         // scanout buffers to reset.
@@ -59,6 +61,16 @@ impl Backend for WinitData {
 
     fn arm_commit_timer(&mut self, delay: Duration) {
         self.wakeups.arm_commit(delay);
+    }
+
+    fn cursor_elements(
+        &mut self,
+        location: Point<i32, Physical>,
+        scale: smithay::utils::Scale<f64>,
+    ) -> Vec<Element> {
+        let renderer = self.backend.renderer();
+        self.pointer_element
+            .render_elements(renderer, location, scale, 1.0)
     }
 
     fn touch_transform(&self, _output: &Output) -> Transform {
@@ -137,9 +149,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let _global = output.create_global::<State<WinitData>>(&state.display_handle);
-    // Follow the host's scale factor unless `MECHA_SCALE` overrides it.
-    let scale = crate::backend::env_scale()
-        .unwrap_or_else(|| crate::backend::snap_scale(state.backend_data.backend.scale_factor()));
+    let scale = state.output_scale(&output);
     output.change_current_state(
         Some(mode),
         Some(Transform::Flipped180),
@@ -156,36 +166,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     event_loop
         .handle()
         .insert_source(winit, move |event, _, state| match event {
-            WinitEvent::Resized { size, scale_factor } => {
-                // Follow the host's scale factor (unless overridden) when it changes.
-                let scale = (crate::backend::env_scale().is_none()
-                    && scale_factor != output.current_scale().fractional_scale())
-                .then(|| Scale::Fractional(crate::backend::snap_scale(scale_factor)));
-                output.change_current_state(
-                    Some(Mode {
-                        size,
-                        refresh: 60_000,
-                    }),
-                    None,
-                    scale,
-                    None,
-                );
-
-                // Re-arrange layers for the new size, keeping toplevels filling
-                // the (possibly changed) non-exclusive zone.
-                layer_map_for_output(&output).arrange();
-                state.apply_layout(&output);
-
-                if state.is_locked() {
-                    let logical_size = state.space.output_geometry(&output).map(|geo| geo.size);
-                    for surface in &state.lock_surfaces {
-                        surface.with_pending_state(|pending| {
-                            pending.size =
-                                logical_size.map(|size| (size.w as u32, size.h as u32).into());
-                        });
-                        surface.send_configure();
-                    }
-                }
+            WinitEvent::Resized { size, .. } => {
+                let mode = Mode {
+                    size,
+                    refresh: 60_000,
+                };
+                state.reconfigure_output(&output, Some(mode));
             }
             WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => {
@@ -211,26 +197,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 let visible = state.visible_surfaces(&output);
                 let locked = state.is_locked();
-                let result = {
+                let cursor_hotspot = state.cursor_hotspot();
+                let (result, elements, clear_color) = {
                     let (renderer, mut framebuffer) = state.backend_data.backend.bind().unwrap();
                     let scale =
                         smithay::utils::Scale::from(output.current_scale().fractional_scale());
 
                     let cursor_pos = state.pointer.current_location();
-                    let cursor_hotspot =
-                        if let CursorImageStatus::Surface(ref surface) = state.cursor_status {
-                            with_states(surface, |states| {
-                                states
-                                    .data_map
-                                    .get::<Mutex<CursorImageAttributes>>()
-                                    .unwrap()
-                                    .lock()
-                                    .unwrap()
-                                    .hotspot
-                            })
-                        } else {
-                            (0, 0).into()
-                        };
 
                     let cursor_scale =
                         output.current_scale().fractional_scale().round().max(1.0) as u32;
@@ -295,13 +268,30 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &visible,
                         custom_elements,
                     );
-                    damage_tracker
+                    let result = damage_tracker
                         .render_output(renderer, &mut framebuffer, 0, &elements, clear_color)
-                        .unwrap()
+                        .unwrap();
+                    (result, elements, clear_color)
                 };
                 state.update_surface_scanout(&output, &result.states);
                 let feedback = state.take_presentation_feedback(&output, &result.states);
                 state.backend_data.backend.submit(Some(&[damage])).unwrap();
+
+                // After the swap: capturing unbinds the window's surface.
+                let presented: Duration = state.clock.now().into();
+                capture_output(
+                    &mut state.capture_sessions,
+                    state.backend_data.backend.renderer(),
+                    &state.loop_handle,
+                    OutputFrame {
+                        output: &output,
+                        elements: &elements,
+                        clear_color,
+                        composited: None,
+                        presented,
+                    },
+                );
+                state.refresh_cursor_captures();
 
                 state.send_frame_callbacks(&output, Duration::from(state.clock.now()));
                 state.lock_frame_queued(&output);
@@ -320,10 +310,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.socket_name
     );
 
+    // Readiness for systemd's Type=notify.
+    if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
+        warn!("failed to signal readiness to systemd: {err}");
+    }
+
     event_loop.run(None, &mut state, move |state| {
         state.refresh_space();
         state.foreign_toplevel_refresh();
-        state.update_idle_inhibit();
+        state.update_suspended();
         let _ = state.display_handle.flush_clients();
     })?;
 

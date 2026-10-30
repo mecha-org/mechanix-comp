@@ -1,0 +1,14 @@
+namespace = "org.mechanix.comp"
+version = 1
+dir = "mechanix-comp"
+
+[groups.output]
+label = "Display"
+
+[keys.output.scale]
+type = "float"
+min = 0.1
+max = 10.0
+env = "MECHA_SCALE"
+label = "Scale"
+description = "Every output's scale. Unset follows the panel's DPI, or the host window when nested."

@@ -1,0 +1,12 @@
+[Unit]
+Description=Mechanix on-screen keyboard
+BindsTo=mechanix-compositor.service
+After=mechanix-compositor.service
+PartOf=graphical-session.target
+ConditionPathExists=/usr/bin/mechanix-keyboard
+
+[Service]
+ExecStart=/usr/bin/mechanix-keyboard
+Restart=on-failure
+RestartSec=1
+Slice=session.slice

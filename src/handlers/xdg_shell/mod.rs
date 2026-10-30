@@ -13,7 +13,7 @@ use smithay::desktop::{
 use smithay::input::{Seat, pointer::Focus};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::{wl_output, wl_seat, wl_surface::WlSurface};
-use smithay::utils::{SERIAL_COUNTER, Serial};
+use smithay::utils::{SERIAL_COUNTER, Serial, Size};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -31,8 +31,9 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
             WindowState {
                 window: window.clone(),
                 mode: WindowMode::Floating,
-                mapped: false,
+                output: None,
                 modal: false,
+                layout_size: Size::default(),
             },
         );
     }
@@ -40,28 +41,11 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         // The foreign-toplevel `closed` event is sent by
         // `foreign_toplevel_refresh` on the next idle callback.
-        let wl = surface.wl_surface();
-        for layout in self.layouts.values_mut() {
-            layout.remove(wl);
-        }
-        self.toplevels.remove(wl);
-        let window = self
-            .space
-            .elements()
-            .find(|w| w.toplevel() == Some(&surface))
-            .cloned();
-        if let Some(window) = window {
-            self.space.unmap_elem(&window);
-            self.focus_topmost();
-            self.schedule_render();
-        }
+        self.forget_toplevel(surface.wl_surface());
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {
-        if self
-            .toplevels
-            .get(surface.wl_surface())
-            .is_some_and(|ws| ws.mapped)
+        if self.is_mapped(surface.wl_surface())
             && let Some(output) = self.primary_output()
         {
             self.apply_layout(&output);
@@ -78,7 +62,20 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
     }
 
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        self.popups.cleanup();
+        // A closed popup damages the window it belonged to.
+        self.schedule_render();
+        if let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(surface)) {
+            self.capture_commit(&root);
+        }
+    }
+
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        if self.is_locked() {
+            surface.send_popup_done();
+            return;
+        }
         let seat = Seat::from_resource(&seat).unwrap();
         let kind = PopupKind::Xdg(surface);
         let Ok(root) = find_popup_root_surface(&kind) else {
@@ -219,10 +216,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             self.set_activated_group(&group);
         }
 
-        self.seat
-            .get_keyboard()
-            .unwrap()
-            .set_focus(self, Some(focused_surface), serial);
+        if !self.is_locked() {
+            self.seat
+                .get_keyboard()
+                .unwrap()
+                .set_focus(self, Some(focused_surface), serial);
+        }
     }
 
     /// Set the xdg `activated` state on every toplevel in `group` and clear it
@@ -245,21 +244,17 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     pub fn focus_topmost(&mut self) {
-        let topmost = self
-            .space
-            .outputs()
-            .next()
-            .and_then(|o| self.layouts.get(o))
-            .and_then(|layout| layout.top().cloned())
-            .and_then(|s| self.toplevels.get(&s).map(|ws| ws.window.clone()));
+        let topmost = self.space.elements().last().cloned();
         if let Some(window) = topmost {
             self.focus_window(&window, SERIAL_COUNTER.next_serial());
         } else {
             self.active_window = None;
             self.layer_shell_on_demand_focus = None;
-            let keyboard = self.seat.get_keyboard().unwrap();
-            let serial = SERIAL_COUNTER.next_serial();
-            keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+            if !self.is_locked() {
+                let keyboard = self.seat.get_keyboard().unwrap();
+                let serial = SERIAL_COUNTER.next_serial();
+                keyboard.set_focus(self, Option::<WlSurface>::None, serial);
+            }
         }
     }
 
@@ -270,16 +265,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .map(|o| layer_map_for_output(o).non_exclusive_zone().loc)
             .unwrap_or_default();
 
-        if let Some(output) = &output {
-            self.layouts
-                .entry(output.clone())
-                .or_default()
-                .insert(surface.clone());
-        }
-
+        self.toplevels.get_mut(surface).unwrap().output = output.clone();
         self.space.map_element(window.clone(), loc, false);
-        self.toplevels.get_mut(surface).unwrap().mapped = true;
-        if self.active_fullscreen_window().is_none() {
+        // A parent mapped after its focused dialog leaves the focus on the dialog.
+        if self.active_fullscreen_window().is_none() && !self.active_group().contains(surface) {
             self.focus_window(window, SERIAL_COUNTER.next_serial());
         } else if let Some(output) = &output {
             self.apply_layout(output);
@@ -287,16 +276,25 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     fn unmap_toplevel(&mut self, surface: &WlSurface, window: &Window) {
-        let ws = self.toplevels.get_mut(surface).unwrap();
-        ws.mapped = false;
         // A remap is a fresh mapping: reset the mode so it is re-evaluated.
-        ws.mode = WindowMode::Floating;
-        for layout in self.layouts.values_mut() {
-            layout.remove(surface);
-        }
+        self.toplevels.get_mut(surface).unwrap().mode = WindowMode::Floating;
         self.space.unmap_elem(window);
+        self.stop_captures_for_toplevel(surface);
         self.focus_topmost();
         self.schedule_render();
+    }
+
+    /// Drop a toplevel once its xdg_toplevel or wl_surface is gone.
+    pub fn forget_toplevel(&mut self, surface: &WlSurface) {
+        let Some(ws) = self.toplevels.remove(surface) else {
+            return;
+        };
+        self.stop_captures_for_toplevel(surface);
+        if self.space.elements().any(|window| window == &ws.window) {
+            self.space.unmap_elem(&ws.window);
+            self.focus_topmost();
+            self.schedule_render();
+        }
     }
 
     /// Apply a mode change: reposition a mapped window, or reply to an unmapped one.
@@ -309,7 +307,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Reposition a mapped window, or reply to one that can't be laid out yet.
     fn reply_placement(&mut self, surface: &WlSurface, window: &Window) {
-        if self.toplevels[surface].mapped
+        if self.is_mapped(surface)
             && let Some(output) = self.primary_output()
         {
             self.apply_layout(&output);
@@ -345,11 +343,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        let Some(window) = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == &root)
-        else {
+        let Some(window) = self.toplevels.get(&root).map(|ws| &ws.window) else {
             return;
         };
 
@@ -414,7 +408,7 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     }
     {
         let window = state.toplevels[surface].window.clone();
-        let mapped = state.toplevels[surface].mapped;
+        let mapped = state.is_mapped(surface);
         let buffered = with_renderer_surface_state(surface, |states| states.buffer().is_some())
             .unwrap_or(false);
 
@@ -422,7 +416,16 @@ pub fn handle_commit<BackendData: Backend + 'static>(
             (true, false) => state.map_toplevel(surface, &window),
             (false, true) => state.unmap_toplevel(surface, &window),
             (false, false) => state.configure_toplevel(surface, &window),
-            (true, true) => {}
+            (true, true) => {
+                // Keep floating windows centred.
+                let ws = &state.toplevels[surface];
+                if ws.mode == WindowMode::Floating
+                    && ws.layout_size != window.geometry().size
+                    && let Some(output) = state.primary_output()
+                {
+                    state.apply_layout(&output);
+                }
+            }
         }
     }
     true

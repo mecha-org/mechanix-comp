@@ -1,0 +1,13 @@
+[Unit]
+Description=Mechanix session
+BindsTo=graphical-session.target
+Before=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+Wants=xdg-desktop-autostart.target
+Before=xdg-desktop-autostart.target
+Wants=mechanix-compositor.service
+#Wants=mechanix-shell.service
+Wants=mechanix-keyboard.service
+Wants=mechanix-waybar.service
+Wants=mechanix-drawer.service

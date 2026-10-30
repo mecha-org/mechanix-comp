@@ -1,18 +1,26 @@
-//! Comet layout: one stateful model per output, owning the window stack and the work zone.
+//! Comet layout: where windows go, which are shown, and the stacking order
+//! rendering and hit-testing share.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::MutexGuard;
 
-use smithay::desktop::{Window, layer_map_for_output};
-use smithay::output::Output;
+use smithay::desktop::{
+    LayerMap, LayerSurface, Space, Window, WindowSurfaceType, layer_map_for_output,
+};
+use smithay::output::{Mode, Output, Scale};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Point;
-use smithay::utils::{Logical, Rectangle};
+use smithay::utils::{Logical, Rectangle, Size};
+use smithay::wayland::compositor::{SurfaceAttributes, with_states};
+use smithay::wayland::session_lock::LockSurface;
+use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::backend::Backend;
 use crate::state::State;
-use crate::state::WindowMode;
+use crate::state::{WindowMode, WindowState};
 
 pub fn is_dialog(toplevel: &ToplevelSurface) -> bool {
     toplevel.parent().is_some()
@@ -40,65 +48,6 @@ fn ancestor_chain(
     }
     chain.reverse();
     chain
-}
-
-/// Per-output model: the window stack (back → front) and the work zone.
-#[derive(Debug, Default)]
-pub struct Layout {
-    stack: Vec<WlSurface>,
-    zone: Rectangle<i32, Logical>,
-}
-
-impl Layout {
-    /// Whether `surface` is stacked on this output.
-    pub fn contains(&self, surface: &WlSurface) -> bool {
-        self.stack.contains(surface)
-    }
-
-    pub fn insert(&mut self, surface: WlSurface) {
-        if !self.stack.iter().any(|s| s == &surface) {
-            self.stack.push(surface);
-        }
-    }
-
-    pub fn remove(&mut self, surface: &WlSurface) {
-        self.stack.retain(|s| s != surface);
-    }
-
-    pub fn retain(&mut self, f: impl Fn(&WlSurface) -> bool) {
-        self.stack.retain(f);
-    }
-
-    pub fn set_zone(&mut self, zone: Rectangle<i32, Logical>) {
-        self.zone = zone;
-    }
-
-    /// Move this ancestor chain (root → leaf) to the front of the stack.
-    pub fn activate_group(&mut self, group: Vec<WlSurface>) {
-        let group_set: HashSet<_> = group.iter().cloned().collect();
-        self.stack.retain(|s| !group_set.contains(s));
-        self.stack.extend(group);
-    }
-
-    pub fn stack(&self) -> &[WlSurface] {
-        &self.stack
-    }
-
-    pub fn top(&self) -> Option<&WlSurface> {
-        self.stack.last()
-    }
-
-    /// What is on screen when `focused` leads the group: the ancestor chain.
-    pub fn visible(
-        &self,
-        focused: Option<&WlSurface>,
-        parent_of: impl Fn(&WlSurface) -> Option<WlSurface>,
-    ) -> HashSet<WlSurface> {
-        match focused {
-            Some(focused) => ancestor_chain(focused, parent_of).into_iter().collect(),
-            None => HashSet::new(),
-        }
-    }
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
@@ -163,33 +112,64 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.toplevels.get(surface).map(|ws| ws.window.clone())
     }
 
-    fn layout_mut(&mut self, output: &Output) -> &mut Layout {
-        self.layouts.entry(output.clone()).or_default()
-    }
-
     /// The single output of the space, if any.
     pub fn primary_output(&self) -> Option<Output> {
         self.space.outputs().next().cloned()
     }
 
-    /// Size, position, xdg state, and Space z-order from the Comet model.
+    /// Give `output` `mode`, if any, and its scale, then refit everything on it.
+    pub fn reconfigure_output(&mut self, output: &Output, mode: Option<Mode>) {
+        let scale = self.output_scale(output);
+        let scale = (scale != output.current_scale().fractional_scale())
+            .then_some(Scale::Fractional(scale));
+        if mode.is_none() && scale.is_none() {
+            return;
+        }
+        output.change_current_state(mode, None, scale, None);
+        layer_map_for_output(output).arrange();
+        self.apply_layout(output);
+        self.update_capture_constraints(output);
+        if !self.is_locked() {
+            return;
+        }
+        let geometry = self.space.output_geometry(output);
+        let size = geometry.map(|geo| Size::from((geo.size.w as u32, geo.size.h as u32)));
+        let on_output = |surface: &&LockSurface| {
+            self.lock_surface_outputs.get(&surface.wl_surface().id()) == Some(output)
+        };
+        for surface in self.lock_surfaces.iter().filter(on_output) {
+            surface.with_pending_state(|pending| pending.size = size);
+            surface.send_configure();
+        }
+    }
+
+    /// Raise the active group, then size, position and configure `output`'s windows.
     pub fn apply_layout(&mut self, output: &Output) {
         let zone = layer_map_for_output(output).non_exclusive_zone();
         if let Some(focused) = self.active_window.clone() {
-            let group = ancestor_chain(&focused, |s| self.parent_of(s));
-            self.layout_mut(output).activate_group(group);
+            for surface in ancestor_chain(&focused, |s| self.parent_of(s)) {
+                if let Some(window) = self.window_for(&surface) {
+                    self.space.raise_element(&window, false);
+                }
+            }
         }
-        self.layout_mut(output).set_zone(zone);
 
-        let stack: Vec<WlSurface> = self.layout_mut(output).stack().to_vec();
+        let windows: Vec<Window> = self
+            .space
+            .elements()
+            .filter(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|t| self.is_on(t.wl_surface(), output))
+            })
+            .cloned()
+            .collect();
         let output_geo = self.space.output_geometry(output);
-        for surface in &stack {
-            let Some(window) = self.window_for(surface) else {
-                continue;
-            };
+        for window in &windows {
             let Some(toplevel) = window.toplevel() else {
                 continue;
             };
+            let surface = toplevel.wl_surface();
 
             // Fullscreen covers the output; dialogs center over their parent; else the work zone.
             let mode = self.placement_mode(surface, toplevel);
@@ -221,19 +201,13 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
             if let Some(ws) = self.toplevels.get_mut(surface) {
                 ws.mode = mode;
+                ws.layout_size = window.geometry().size;
             }
             self.set_toplevel_placement(toplevel, area, mode);
             if toplevel.is_initial_configure_sent() {
                 toplevel.send_pending_configure();
             }
-            self.space.relocate_element(&window, loc);
-        }
-
-        // Space z-order is the stack, back → front.
-        for surface in &stack {
-            if let Some(window) = self.window_for(surface) {
-                self.space.raise_element(&window, false);
-            }
+            self.space.relocate_element(window, loc);
         }
         self.schedule_render();
     }
@@ -250,15 +224,151 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .collect()
     }
 
-    /// The active group's surfaces that are stacked on `output`.
-    pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
-        let Some(layout) = self.layouts.get(output) else {
-            return HashSet::new();
-        };
-        layout
-            .visible(self.active_window.as_ref(), |s| self.parent_of(s))
-            .into_iter()
-            .filter(|s| layout.contains(s))
-            .collect()
+    /// Whether a shown modal dialog has `window` as a parent, blocking its input.
+    pub fn modal_blocks(&self, visible: &HashSet<WlSurface>, window: &WlSurface) -> bool {
+        visible
+            .iter()
+            .filter(|s| *s != window && self.toplevels.get(*s).is_some_and(|ws| ws.modal))
+            .any(|modal| ancestor_chain(modal, |s| self.parent_of(s)).contains(window))
     }
+
+    /// The active group's windows mapped on `output`, the ones it shows.
+    pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
+        let mut visible = self.active_group();
+        visible.retain(|s| self.is_on(s, output));
+        visible
+    }
+
+    /// Whether `surface` is a toplevel mapped on `output`.
+    fn is_on(&self, surface: &WlSurface, output: &Output) -> bool {
+        self.toplevels.get(surface).is_some_and(|ws| {
+            ws.output.as_ref() == Some(output) && self.space.elements().any(|w| w == &ws.window)
+        })
+    }
+
+    /// Whether `surface` is a toplevel mapped into the space.
+    pub fn is_mapped(&self, surface: &WlSurface) -> bool {
+        let Some(ws) = self.toplevels.get(surface) else {
+            return false;
+        };
+        self.space.elements().any(|window| window == &ws.window)
+    }
+}
+
+/// One entry of the stacking order, at its location in global coordinates.
+pub struct Stacked<'a> {
+    pub entry: StackEntry<'a>,
+    pub loc: Point<i32, Logical>,
+}
+
+/// What a stacking order entry draws and takes input for.
+pub enum StackEntry<'a> {
+    /// A layer surface's popups and/or its own surface tree, as `kind` selects.
+    Layer(&'a LayerSurface, WindowSurfaceType),
+    /// A shown window with its popups.
+    Window(&'a Window),
+}
+
+/// An output's shown surfaces, holding its layer map while in use.
+pub struct StackingOrder<'a> {
+    space: &'a Space<Window>,
+    map: MutexGuard<'a, LayerMap>,
+    origin: Point<i32, Logical>,
+    toplevels: &'a HashMap<WlSurface, WindowState>,
+    visible: &'a HashSet<WlSurface>,
+}
+
+impl<'a> StackingOrder<'a> {
+    pub fn new(
+        space: &'a Space<Window>,
+        output: &'a Output,
+        toplevels: &'a HashMap<WlSurface, WindowState>,
+        visible: &'a HashSet<WlSurface>,
+    ) -> Self {
+        Self {
+            space,
+            map: layer_map_for_output(output),
+            origin: space.output_geometry(output).unwrap_or_default().loc,
+            toplevels,
+            visible,
+        }
+    }
+
+    /// Front to back: Overlay layers, fullscreen windows, Top layers,
+    /// Bottom/Background popups, the other windows, then the Bottom/Background surfaces.
+    pub fn iter(&self) -> impl Iterator<Item = Stacked<'_>> {
+        let popups = WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE;
+        let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
+        self.layer(Layer::Overlay, WindowSurfaceType::ALL)
+            .chain(self.windows(true))
+            .chain(self.layer(Layer::Top, WindowSurfaceType::ALL))
+            .chain(self.layer(Layer::Bottom, popups))
+            .chain(self.layer(Layer::Background, popups))
+            .chain(self.windows(false))
+            .chain(self.layer(Layer::Bottom, own))
+            .chain(self.layer(Layer::Background, own))
+    }
+
+    /// `layer`'s surfaces, newest first as the order within a layer is ours to pick.
+    fn layer(&self, layer: Layer, kind: WindowSurfaceType) -> impl Iterator<Item = Stacked<'_>> {
+        self.map.layers_on(layer).rev().filter_map(move |surface| {
+            let loc = self.map.layer_geometry(surface)?.loc + self.origin;
+            Some(Stacked {
+                entry: StackEntry::Layer(surface, kind),
+                loc,
+            })
+        })
+    }
+
+    /// The shown windows that are fullscreen, or the ones that aren't, topmost first.
+    fn windows(&self, fullscreen: bool) -> impl Iterator<Item = Stacked<'_>> {
+        self.space.elements().rev().filter_map(move |window| {
+            let surface = window.toplevel()?.wl_surface();
+            let mode = self.toplevels.get(surface)?.mode;
+            if !self.visible.contains(surface) || (mode == WindowMode::Fullscreen) != fullscreen {
+                return None;
+            }
+            let loc = self.space.element_location(window)? - window.geometry().loc;
+            Some(Stacked {
+                entry: StackEntry::Window(window),
+                loc,
+            })
+        })
+    }
+}
+
+impl Stacked<'_> {
+    /// The surface of this entry under `pos`, and that surface's location.
+    pub fn surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let local = pos - self.loc.to_f64();
+        let hit = match self.entry {
+            StackEntry::Layer(layer, kind) => layer_under(layer, local, kind),
+            StackEntry::Window(window) => window.surface_under(local, WindowSurfaceType::ALL),
+        };
+        hit.map(|(surface, loc)| (surface, (loc + self.loc).to_f64()))
+    }
+}
+
+/// The surface of `layer` under `local`, its main surface only within its
+/// viewport-scaled rectangle and input region so click-through layers pass the point on.
+fn layer_under(
+    layer: &LayerSurface,
+    local: Point<f64, Logical>,
+    kind: WindowSurfaceType,
+) -> Option<(WlSurface, Point<i32, Logical>)> {
+    let main = layer.wl_surface();
+    if let Some(hit) = layer.surface_under(local, kind).filter(|(s, _)| s != main) {
+        return Some(hit);
+    }
+    let hits = kind.contains(WindowSurfaceType::TOPLEVEL)
+        && layer.geometry().to_f64().contains(local)
+        && with_states(main, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let region = attributes.current().input_region.as_ref();
+            region.is_none_or(|region| region.contains(local.to_i32_round()))
+        });
+    hits.then(|| (main.clone(), Point::default()))
 }

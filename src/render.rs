@@ -1,23 +1,22 @@
+use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::element::surface::{
     WaylandSurfaceRenderElement, render_elements_from_surface_tree,
 };
-use smithay::backend::renderer::element::{AsRenderElements, Wrap};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{ImportAll, ImportMem};
-use smithay::desktop::space::SpaceRenderElements;
-use smithay::desktop::{LayerSurface, PopupManager, Space, Window, layer_map_for_output};
+use smithay::desktop::{PopupManager, Space, Window, WindowSurfaceType};
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::Scale;
+use smithay::utils::{Physical, Point, Scale};
 use smithay::wayland::session_lock::LockSurface;
-use smithay::wayland::shell::wlr_layer::Layer;
 
 use std::collections::HashMap;
 use std::collections::HashSet;
 
 use crate::drawing::PointerRenderElement;
-use crate::state::{WindowMode, WindowState};
+use crate::layout::{StackEntry, Stacked, StackingOrder};
+use crate::state::WindowState;
 
 // Background shown behind normal desktop contents.
 pub const CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
@@ -25,8 +24,7 @@ pub const CLEAR_COLOR: [f32; 4] = [0.1, 0.1, 0.1, 1.0];
 pub const CLEAR_COLOR_LOCKED: [f32; 4] = [0.08, 0.08, 0.08, 1.0];
 
 smithay::backend::renderer::element::render_elements! {
-    pub OutputElements<R, E> where R: ImportAll + ImportMem;
-    Space = SpaceRenderElements<R, E>,
+    pub OutputElements<R> where R: ImportAll + ImportMem;
     Surface = WaylandSurfaceRenderElement<R>,
     Pointer = PointerRenderElement<R>,
 }
@@ -34,7 +32,7 @@ smithay::backend::renderer::element::render_elements! {
 /// Concrete element type used by both backends: the compositor always renders
 /// with a `GlesRenderer`, and every element ultimately resolves to a
 /// `WaylandSurfaceRenderElement`.
-pub type Element = OutputElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>;
+pub type Element = OutputElements<GlesRenderer>;
 
 /// Build the full list of render elements for `output` plus the clear color,
 /// shared by every backend so the "what to draw" policy lives in one place.
@@ -42,10 +40,7 @@ pub type Element = OutputElements<GlesRenderer, WaylandSurfaceRenderElement<Gles
 /// DRM swapchain).
 ///
 /// The renderer draws the list back-to-front, so the front of the list is the
-/// top of the stack. The layer-shell stack is built by hand (mirroring the
-/// positions smithay's `space_render_elements` would use) so that popups of
-/// Background/Bottom layers render *above* the windows, while the bars
-/// themselves stay below them.
+/// top of the stacking order, which comes from [`StackingOrder`] like hit-testing does.
 #[allow(clippy::too_many_arguments)]
 pub fn output_elements(
     renderer: &mut GlesRenderer,
@@ -59,222 +54,63 @@ pub fn output_elements(
 ) -> (Vec<Element>, [f32; 4]) {
     // Queue cursor elements first
     let mut elements = custom_elements;
+    let scale = output.current_scale().fractional_scale();
     if is_locked {
         // Only render live lock surfaces; dead ones fall back to the clear color.
         for lock_surface in lock_surfaces.iter().filter(|s| s.alive()) {
-            elements.extend(
-                render_elements_from_surface_tree::<
-                    GlesRenderer,
-                    WaylandSurfaceRenderElement<GlesRenderer>,
-                >(
-                    renderer,
-                    lock_surface.wl_surface(),
-                    (0, 0),
-                    output.current_scale().fractional_scale(),
-                    1.0,
-                    Kind::Unspecified,
-                )
-                .into_iter()
-                .map(OutputElements::Surface),
-            );
+            elements.extend(surface_tree(
+                renderer,
+                lock_surface.wl_surface(),
+                (0, 0).into(),
+                scale,
+            ));
         }
         (elements, CLEAR_COLOR_LOCKED)
     } else {
-        let scale = output.current_scale().fractional_scale();
-
-        // Split the layer map exactly like smithay's `space_render_elements`:
-        // upper = Top/Overlay, lower = Background/Bottom (insertion order,
-        // reversed). The guard must outlive the borrowed layer surfaces.
-        let map = layer_map_for_output(output);
-        let (lower, upper): (Vec<&LayerSurface>, Vec<&LayerSurface>) = map
-            .layers()
-            .rev()
-            .partition(|s| matches!(s.layer(), Layer::Background | Layer::Bottom));
-
-        // Fullscreen windows render above the top layer but below Overlay, so
-        // Overlay wins the stack and Top stays below.
-        let (overlay, top): (Vec<&LayerSurface>, Vec<&LayerSurface>) =
-            upper.into_iter().partition(|s| s.layer() == Layer::Overlay);
-
-        // Overlay layers (and their popups) above everything.
-        for surface in &overlay {
-            let Some(geo) = map.layer_geometry(surface) else {
-                continue;
-            };
-            elements.extend(
-                surface
-                    .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                        renderer,
-                        geo.loc.to_physical_precise_round(scale),
-                        Scale::from(scale),
-                        1.0,
-                    )
-                    .into_iter()
-                    .map(OutputElements::Surface),
-            );
-        }
-
-        let is_fullscreen = |window: &Window| {
-            window.toplevel().is_some_and(|toplevel| {
-                toplevels
-                    .get(toplevel.wl_surface())
-                    .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
-            })
-        };
-
-        // Fullscreen windows, topmost first (their own popups included).
-        if let Some(output_geo) = space.output_geometry(output) {
-            for window in space.elements().rev().filter(|w| is_fullscreen(w)) {
-                let loc = space.element_location(window).unwrap() - output_geo.loc;
-                elements.extend(
-                    window
-                        .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                            renderer,
-                            loc.to_physical_precise_round(scale),
-                            Scale::from(scale),
-                            1.0,
-                        )
-                        .into_iter()
-                        .map(|e| {
-                            OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
-                        }),
-                );
-            }
-        }
-
-        // Top layers (and their popups) above the non-fullscreen windows.
-        for surface in &top {
-            let Some(geo) = map.layer_geometry(surface) else {
-                continue;
-            };
-            elements.extend(
-                surface
-                    .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                        renderer,
-                        geo.loc.to_physical_precise_round(scale),
-                        Scale::from(scale),
-                        1.0,
-                    )
-                    .into_iter()
-                    .map(OutputElements::Surface),
-            );
-        }
-
-        // Background/Bottom layer popups, hoisted above the windows.
-        for surface in &lower {
-            let Some(geo) = map.layer_geometry(surface) else {
-                continue;
-            };
-            for (popup, popup_offset) in PopupManager::popups_for_surface(surface.wl_surface()) {
-                let offset = (popup_offset - popup.geometry().loc)
-                    .to_f64()
-                    .to_physical(scale)
-                    .to_i32_round();
-                elements.extend(
-                    render_elements_from_surface_tree::<
-                        GlesRenderer,
-                        WaylandSurfaceRenderElement<GlesRenderer>,
-                    >(
-                        renderer,
-                        popup.wl_surface(),
-                        geo.loc.to_physical_precise_round(scale) + offset,
-                        Scale::from(scale),
-                        1.0,
-                        Kind::Unspecified,
-                    )
-                    .into_iter()
-                    .map(OutputElements::Surface),
-                );
-            }
-        }
-
-        // The windows. Hidden (non-visible) windows are skipped.
-        if let Some(output_geo) = space.output_geometry(output) {
-            let in_visible = |window: &Window| {
-                window
-                    .toplevel()
-                    .is_some_and(|t| visible.contains(t.wl_surface()))
-            };
-            if space.elements().any(is_fullscreen) {
-                // Fullscreen windows were rendered above; render the rest
-                // individually so they stay below the Top layer.
-                for window in space.elements().rev().filter(|w| !is_fullscreen(w)) {
-                    if !in_visible(window) {
-                        continue;
-                    }
-                    let loc = space.element_location(window).unwrap() - output_geo.loc;
-                    elements.extend(
-                        window
-                            .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+        let output_loc = space.output_geometry(output).unwrap_or_default().loc;
+        let order = StackingOrder::new(space, output, toplevels, visible);
+        for Stacked { entry, loc } in order.iter() {
+            let loc = (loc - output_loc).to_physical_precise_round(scale);
+            match entry {
+                StackEntry::Layer(layer, kind) => {
+                    if kind.contains(WindowSurfaceType::POPUP) {
+                        for (popup, popup_offset) in
+                            PopupManager::popups_for_surface(layer.wl_surface())
+                        {
+                            let offset = (popup_offset - popup.geometry().loc)
+                                .to_f64()
+                                .to_physical(scale)
+                                .to_i32_round();
+                            elements.extend(surface_tree(
                                 renderer,
-                                loc.to_physical_precise_round(scale),
-                                Scale::from(scale),
-                                1.0,
-                            )
-                            .into_iter()
-                            .map(|e| {
-                                OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
-                            }),
-                    );
-                }
-            } else if visible.len() == space.elements().count() {
-                // Fast path: every window is visible, render the whole space at
-                // once.
-                elements.extend(
-                    space
-                        .render_elements_for_region(renderer, &output_geo, scale, 1.0)
-                        .into_iter()
-                        .map(|e| {
-                            OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
-                        }),
-                );
-            } else {
-                // Only a subset is visible (e.g. the active group): render
-                // those individually so the rest stay hidden.
-                for window in space.elements().rev() {
-                    if !in_visible(window) {
-                        continue;
+                                popup.wl_surface(),
+                                loc + offset,
+                                scale,
+                            ));
+                        }
                     }
-                    let loc = space.element_location(window).unwrap() - output_geo.loc;
-                    elements.extend(
-                        window
-                            .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
-                                renderer,
-                                loc.to_physical_precise_round(scale),
-                                Scale::from(scale),
-                                1.0,
-                            )
-                            .into_iter()
-                            .map(|e| {
-                                OutputElements::Space(SpaceRenderElements::Element(Wrap::from(e)))
-                            }),
-                    );
+                    if kind.contains(WindowSurfaceType::TOPLEVEL) {
+                        elements.extend(surface_tree(renderer, layer.wl_surface(), loc, scale));
+                    }
                 }
-            }
-        }
-
-        // Background/Bottom layer surfaces (the bars), below the windows.
-        // Their popups were hoisted above the windows already.
-        for surface in &lower {
-            let Some(geo) = map.layer_geometry(surface) else {
-                continue;
-            };
-            elements.extend(
-                render_elements_from_surface_tree::<
-                    GlesRenderer,
-                    WaylandSurfaceRenderElement<GlesRenderer>,
-                >(
+                StackEntry::Window(window) => elements.extend(window.render_elements::<Element>(
                     renderer,
-                    surface.wl_surface(),
-                    geo.loc.to_physical_precise_round(scale),
+                    loc,
                     Scale::from(scale),
                     1.0,
-                    Kind::Unspecified,
-                )
-                .into_iter()
-                .map(OutputElements::Surface),
-            );
+                )),
+            }
         }
         (elements, CLEAR_COLOR)
     }
+}
+
+/// The render elements of `surface` and its subsurfaces at `loc`.
+fn surface_tree(
+    renderer: &mut GlesRenderer,
+    surface: &WlSurface,
+    loc: Point<i32, Physical>,
+    scale: f64,
+) -> Vec<Element> {
+    render_elements_from_surface_tree(renderer, surface, loc, scale, 1.0, Kind::Unspecified)
 }

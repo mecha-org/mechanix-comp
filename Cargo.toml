@@ -8,7 +8,7 @@ members = ["."]
 
 [dependencies.smithay]
 git = "https://github.com/mecha-org/smithay"
-rev = "bb3be182f5d80e00f797e9efdeb63e7aa8b8925e"
+rev = "60aafc2b1a64395bd32ec93f41e6712a07544c34"
 default-features = false
 features = [
   "backend_winit",
@@ -25,10 +25,12 @@ features = [
 
 [dependencies.smithay-drm-extras]
 git = "https://github.com/mecha-org/smithay"
-rev = "bb3be182f5d80e00f797e9efdeb63e7aa8b8925e"
+rev = "60aafc2b1a64395bd32ec93f41e6712a07544c34"
 default-features = false
 
 [dependencies]
+mxconfig = { git = "https://github.com/mecha-org/mxconfig", rev = "510a018ef9e0a174fecac7cedb5369231a494e30" }
+sd-notify = "0.5.0"
 thiserror = "2.0.20"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

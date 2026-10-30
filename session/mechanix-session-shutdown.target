@@ -1,0 +1,6 @@
+[Unit]
+Description=Shut down the Mechanix session
+DefaultDependencies=no
+Conflicts=graphical-session.target mechanix-session.target
+After=graphical-session.target mechanix-session.target
+StopWhenUnneeded=true

@@ -6,21 +6,23 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::output::Output;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
-use smithay::utils::{Physical, Size, Transform};
+use smithay::utils::{Physical, Point, Scale, Transform};
 use smithay::wayland::dmabuf::DmabufFeedback;
 
+use crate::render::Element;
 use crate::state::State;
 
 pub mod udev;
 pub mod winit;
 
 /// 2x only for clearly HiDPI panels: tall enough, real physical size, >192 DPI on both axes.
-pub fn guess_default_scale(size_mm: Option<(u32, u32)>, mode: Size<i32, Physical>) -> f64 {
-    let Some((w_mm, h_mm)) = size_mm else {
+pub fn guess_default_scale(output: &Output) -> f64 {
+    let (w_mm, h_mm) = output.physical_properties().size.into();
+    let Some(mode) = output.preferred_mode().map(|mode| mode.size) else {
         return 1.0;
     };
     // Ignore bogus EDID sizes reported as a bare aspect ratio.
-    if w_mm == 0 || h_mm == 0 || mode.h < 1200 {
+    if w_mm <= 0 || h_mm <= 0 || mode.h < 1200 {
         return 1.0;
     }
     if matches!(
@@ -58,15 +60,6 @@ pub fn output_refresh(output: &Output) -> Option<Duration> {
         .map(|mode| Duration::from_secs_f64(1000.0 / mode.refresh as f64))
 }
 
-/// The `MECHA_SCALE` override, if set.
-pub fn env_scale() -> Option<f64> {
-    std::env::var("MECHA_SCALE")
-        .ok()?
-        .parse::<f64>()
-        .ok()
-        .map(|scale| snap_scale(scale.clamp(0.1, 10.0)))
-}
-
 /// Abstraction over the concrete rendering/presentation backend the compositor
 /// runs on. Both backends render with the same `GlesRenderer`, so the render
 /// element type stays uniform (`WaylandSurfaceRenderElement<GlesRenderer>`);
@@ -77,6 +70,9 @@ pub trait Backend {
 
     /// The seat name advertised for this backend.
     fn seat_name(&self) -> String;
+
+    /// `output`'s scale when none is configured.
+    fn default_scale(&self, output: &Output) -> f64;
 
     /// Discard any cached swapchain/damage buffers for `output`, e.g. after a
     /// session resume (VT switch back) where the previous framebuffers are stale.
@@ -110,6 +106,20 @@ pub trait Backend {
 
     /// Queue a redraw of `output` after `delay`.
     fn schedule_render_after(&mut self, _output: &Output, _delay: Duration) {}
+
+    /// Whether a pointer is in use.
+    fn pointer_visible(&self) -> bool {
+        true
+    }
+
+    /// The cursor as outputs draw it; empty while hidden.
+    fn cursor_elements(
+        &mut self,
+        _location: Point<i32, Physical>,
+        _scale: Scale<f64>,
+    ) -> Vec<Element> {
+        Vec::new()
+    }
 
     /// Transform to apply to absolute (touch) input positions for `output`.
     /// Nested winit windows already report positions in window space, so they

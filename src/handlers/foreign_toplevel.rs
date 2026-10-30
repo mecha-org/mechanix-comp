@@ -336,6 +336,18 @@ impl ForeignToplevelManagerState {
             .map(|(surface, _)| surface.clone())
     }
 
+    /// The `wl_surface` behind an ext-foreign-toplevel handle, if tracked.
+    pub fn surface_for_ext_handle(&self, handle: &ForeignToplevelHandle) -> Option<WlSurface> {
+        self.toplevels
+            .iter()
+            .find(|(_, data)| {
+                data.ext_handle
+                    .as_ref()
+                    .is_some_and(|ext| ext.matches(handle))
+            })
+            .map(|(surface, _)| surface.clone())
+    }
+
     fn remove_wlr_instance(&mut self, resource: &ZwlrForeignToplevelHandleV1) {
         for data in self.toplevels.values_mut() {
             data.wlr_management_instances.remove(resource);
@@ -495,6 +507,10 @@ impl<BackendData: Backend + 'static> ForeignToplevelListHandler for State<Backen
 impl<BackendData: Backend + 'static>
     GlobalDispatch2<ZwlrForeignToplevelManagerV1, State<BackendData>> for ForeignToplevelUdata
 {
+    fn can_view(&self, client: &Client) -> bool {
+        crate::state::client_is_unrestricted(client)
+    }
+
     fn bind(
         &self,
         state: &mut State<BackendData>,

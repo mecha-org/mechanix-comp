@@ -1,5 +1,5 @@
 use crate::backend::Backend;
-use crate::state::State;
+use crate::state::{State, root_surface};
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::reexports::calloop::Interest;
 use smithay::reexports::wayland_server::Resource;
@@ -7,7 +7,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::commit_timing::CommitTimerStateUserData;
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorHandler, CompositorState, SurfaceAttributes, add_blocker,
-    add_pre_commit_hook, get_parent, is_sync_subsurface, with_states,
+    add_pre_commit_hook, is_sync_subsurface, with_states,
 };
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
@@ -107,19 +107,33 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
 
-        if !is_sync_subsurface(surface) {
-            let mut root = surface.clone();
-            while let Some(parent) = get_parent(&root) {
-                root = parent;
-            }
-            if let Some(window) = self.toplevels.get(&root).map(|ws| ws.window.clone()) {
-                window.on_commit();
-            }
+        let root = (!is_sync_subsurface(surface)).then(|| root_surface(surface));
+        if let Some(window) = root
+            .as_ref()
+            .and_then(|root| self.toplevels.get(root))
+            .map(|ws| ws.window.clone())
+        {
+            window.on_commit();
         }
 
         self.popups.commit(surface);
+        if let Some(root) = &root {
+            self.capture_commit(root);
+        }
+
         self.ensure_initial_configure(surface);
         // A commit is new damage; render on demand instead of polling.
+        if !self.in_hidden_window(surface) {
+            self.schedule_render();
+        }
+    }
+
+    fn destroyed(&mut self, surface: &WlSurface) {
         self.schedule_render();
+        self.popups.cleanup();
+        self.forget_toplevel(surface);
+        if self.idle_inhibitors.remove(surface).is_some() {
+            self.update_idle_inhibit();
+        }
     }
 }

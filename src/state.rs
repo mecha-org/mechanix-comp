@@ -1,20 +1,26 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use smithay::backend::input::InputTime;
 use smithay::backend::renderer::element::{
     RenderElementStates, default_primary_scanout_output_compare,
 };
+use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::desktop::utils::{
     OutputPresentationFeedback, surface_presentation_feedback_flags_from_states,
     surface_primary_scanout_output, take_presentation_feedback_surface_tree,
     update_surface_primary_scanout_output, with_surfaces_surface_tree,
 };
-use smithay::desktop::{PopupManager, Space, Window, layer_map_for_output};
+use smithay::desktop::{
+    PopupManager, Space, Window, find_popup_root_surface, layer_map_for_output,
+};
 use smithay::input::keyboard::Keysym;
-use smithay::input::pointer::{CursorImageStatus, PointerHandle};
+use smithay::input::pointer::{
+    CursorImageAttributes, CursorImageStatus, MotionEvent, PointerHandle,
+};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::{
@@ -27,18 +33,22 @@ use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, ObjectId,
 };
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Time};
+use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Size, Time};
 use smithay::wayland::commit_timing::{
     CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
 };
 use smithay::wayland::compositor::{
-    CompositorClientState, CompositorHandler, CompositorState, SurfaceData, with_states,
+    CompositorClientState, CompositorHandler, CompositorState, SurfaceData, get_parent, with_states,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::drm_syncobj::DrmSyncobjState;
 use smithay::wayland::fifo::{FifoBarrierCachedState, FifoManagerState};
 use smithay::wayland::fractional_scale::{FractionalScaleManagerState, with_fractional_scale};
+use smithay::wayland::image_capture_source::{
+    OutputCaptureSourceState, ToplevelCaptureSourceState,
+};
+use smithay::wayland::image_copy_capture::ImageCopyCaptureState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::presentation::{PresentationState, Refresh};
 use smithay::wayland::session_lock::{LockSurface, SessionLocker};
@@ -54,6 +64,7 @@ use smithay::wayland::foreign_toplevel_list::ForeignToplevelListState;
 use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::idle_notify::IdleNotifierState;
 use smithay::wayland::input_method::InputMethodManagerState;
+use smithay::wayland::security_context::SecurityContextState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::selection::wlr_data_control::DataControlState;
@@ -68,9 +79,10 @@ use smithay::wayland::xdg_toplevel_icon::XdgToplevelIconManager;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::backend::Backend;
+use crate::config::Config;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
+use crate::handlers::image_copy_capture::CaptureSession;
 use crate::handlers::output_power::OutputPowerManagerState;
-use crate::layout::Layout;
 
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -87,11 +99,13 @@ pub enum WindowMode {
 pub struct WindowState {
     pub window: Window,
     pub mode: WindowMode,
-    /// True once the window joined the `Space`.
-    pub mapped: bool,
+    /// The output the window is laid out on, set when it maps.
+    pub output: Option<Output>,
     /// The xdg-dialog modal hint, cached so input handling needn't lock
     /// surface data on every click.
     pub modal: bool,
+    /// Size at the last layout.
+    pub layout_size: Size<i32, Logical>,
 }
 
 /// The icon surface a client sets for an active drag-and-drop, drawn next to
@@ -173,8 +187,16 @@ pub struct State<BackendData: Backend + 'static> {
     pub foreign_toplevel: ForeignToplevelManagerState,
     pub foreign_toplevel_list: ForeignToplevelListState,
     pub idle_notifier_state: IdleNotifierState<State<BackendData>>,
-    pub idle_inhibiting_surfaces: HashSet<WlSurface>,
+    /// Inhibitor count per surface.
+    pub idle_inhibitors: HashMap<WlSurface, usize>,
     pub output_power: OutputPowerManagerState,
+
+    /// Screen capture (ext-image-capture-source, ext-image-copy-capture).
+    pub output_capture_source_state: OutputCaptureSourceState,
+    pub toplevel_capture_source_state: ToplevelCaptureSourceState,
+    pub image_copy_capture_state: ImageCopyCaptureState,
+    /// Live capture sessions and their in-flight frames.
+    pub capture_sessions: Vec<CaptureSession>,
 
     pub seat: Seat<Self>,
     pub suppressed_keys: Vec<Keysym>,
@@ -189,15 +211,13 @@ pub struct State<BackendData: Backend + 'static> {
     // Rendering backend + dmabuf import. The dmabuf global is created lazily by
     // each backend once its renderer (and thus its format list) exists.
     pub backend_data: BackendData,
+    pub config: Config,
     pub dmabuf_state: DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
     pub drm_syncobj_state: Option<DrmSyncobjState>,
     pub lock_phase: LockPhase,
     pub lock_surfaces: Vec<LockSurface>,
     pub lock_surface_outputs: HashMap<ObjectId, Output>,
-    /// One layout model per output; the source of truth for window stacking.
-    #[allow(clippy::mutable_key_type)] // `Output` is interior-mutable, but stable as a key.
-    pub layouts: HashMap<Output, Layout>,
     /// The `OnDemand` layer surface last opened or clicked. `update_keyboard_focus`
     /// focuses it while it stays a mapped OnDemand layer, so launchers and
     /// panels take keyboard focus on open.
@@ -238,7 +258,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             ],
         );
         XdgDecorationState::new::<Self>(&dh);
-        let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
+        let layer_shell_state =
+            WlrLayerShellState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
         OutputManagerState::new_with_xdg_output::<Self>(&dh);
         let space = Space::default();
@@ -250,36 +271,48 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         ViewporterState::new::<Self>(&dh);
         FractionalScaleManagerState::new::<Self>(&dh);
-        #[allow(clippy::mutable_key_type)] // `Output` is interior-mutable, but stable as a key.
-        let layouts: HashMap<Output, Layout> = HashMap::new();
         CursorShapeManagerState::new::<Self>(&dh);
         let mut xdg_toplevel_icon = XdgToplevelIconManager::new::<Self>(&dh);
         // Advertise two sizes; a scaled output picks the larger.
         xdg_toplevel_icon.add_icon_size(64);
         xdg_toplevel_icon.add_icon_size(128);
         TextInputManagerState::new::<Self>(&dh);
-        InputMethodManagerState::new::<Self, _>(&dh, |_client| true);
-        VirtualKeyboardManagerState::new::<Self, _>(&dh, |_client| true);
+        InputMethodManagerState::new::<Self, _>(&dh, client_is_unrestricted);
+        VirtualKeyboardManagerState::new::<Self, _>(&dh, client_is_unrestricted);
         let xdg_activation_state = XdgActivationState::new::<Self>(&dh);
         let data_device_state = DataDeviceState::new::<Self>(&dh);
         let primary_selection_state = PrimarySelectionState::new::<Self>(&dh);
-        let data_control_state =
-            DataControlState::new::<Self, _>(&dh, Some(&primary_selection_state), |_| true);
+        let data_control_state = DataControlState::new::<Self, _>(
+            &dh,
+            Some(&primary_selection_state),
+            client_is_unrestricted,
+        );
         let xdg_foreign_state = XdgForeignState::new::<Self>(&dh);
         SinglePixelBufferState::new::<Self>(&dh);
-        let session_lock_state = SessionLockManagerState::new::<Self, _>(&dh, |_| true);
+        let session_lock_state =
+            SessionLockManagerState::new::<Self, _>(&dh, client_is_unrestricted);
         let foreign_toplevel = ForeignToplevelManagerState::new::<Self>(&dh);
-        let foreign_toplevel_list = ForeignToplevelListState::new::<Self>(&dh);
+        let foreign_toplevel_list =
+            ForeignToplevelListState::new_with_filter::<Self>(&dh, client_is_unrestricted);
         XdgDialogState::new::<Self>(&dh);
         let idle_notifier_state = IdleNotifierState::new(&dh, event_loop.handle());
         IdleInhibitManagerState::new::<Self>(&dh);
         let output_power = OutputPowerManagerState::new::<Self>(&dh);
+        SecurityContextState::new::<Self, _>(&dh, client_is_unrestricted);
+        let output_capture_source_state =
+            OutputCaptureSourceState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
+        let toplevel_capture_source_state =
+            ToplevelCaptureSourceState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
+        let image_copy_capture_state =
+            ImageCopyCaptureState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
+        let config = Config::load(&event_loop.handle());
 
         Self {
             socket_name,
+            config,
             xdg_activation_state,
             data_device_state,
             primary_selection_state,
@@ -290,7 +323,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             idle_notifier_state,
             data_control_state,
             output_power,
-            idle_inhibiting_surfaces: HashSet::new(),
+            output_capture_source_state,
+            toplevel_capture_source_state,
+            image_copy_capture_state,
+            capture_sessions: Vec::new(),
+            idle_inhibitors: HashMap::new(),
             display_handle: dh,
             space,
             toplevels: HashMap::new(),
@@ -316,7 +353,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             lock_phase: LockPhase::Unlocked,
             lock_surfaces: Vec::new(),
             lock_surface_outputs: HashMap::new(),
-            layouts,
             layer_shell_on_demand_focus: None,
             active_window: None,
         }
@@ -353,13 +389,37 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         socket_name
     }
 
-    /// Refresh the space, popups, dead toplevels, and keyboard focus.
+    /// Refresh the space and input focus.
     /// Callers flush after any work that still queues client events.
     pub fn refresh_space(&mut self) {
         self.space.refresh();
-        self.popups.cleanup();
-        self.cleanup_toplevels();
         self.update_keyboard_focus();
+        self.refresh_pointer_focus();
+    }
+
+    /// Re-target the pointer when what's under it changed while it stood still.
+    pub fn refresh_pointer_focus(&mut self) {
+        let pointer = self.pointer.clone();
+        if pointer.is_grabbed() {
+            return;
+        }
+        let location = pointer.current_location();
+        // A hidden cursor points at nothing.
+        let under = self
+            .backend_data
+            .pointer_visible()
+            .then(|| self.surface_under(location))
+            .flatten();
+        if under.as_ref().map(|(surface, _)| surface) == pointer.current_focus().as_ref() {
+            return;
+        }
+        let event = MotionEvent {
+            location,
+            serial: SERIAL_COUNTER.next_serial(),
+            time: InputTime::now(),
+        };
+        pointer.motion(self, under, &event);
+        pointer.frame(self);
     }
 
     pub fn is_locked(&self) -> bool {
@@ -389,20 +449,70 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         }
         let scale = output.current_scale().fractional_scale();
-        // Visible surfaces are acked every presented frame; hidden ones get
-        // one ack per second so their frame clocks keep running (1Hz).
-        let throttle = Some(Duration::from_secs(1));
+        // Only presented surfaces are acked; hidden ones are suspended instead.
         for window in self.space.elements() {
-            window.send_frame(output, now, throttle, |surface, data| {
+            window.send_frame(output, now, None, |surface, data| {
                 surface_primary_scanout_output(surface, data)
             });
             self.push_fractional_scale(window.toplevel().unwrap().wl_surface(), scale);
         }
         for layer_surface in layer_map_for_output(output).layers() {
-            layer_surface.send_frame(output, now, throttle, |surface, data| {
+            layer_surface.send_frame(output, now, None, |surface, data| {
                 surface_primary_scanout_output(surface, data)
             });
             self.push_fractional_scale(layer_surface.wl_surface(), scale);
+        }
+    }
+
+    /// The cursor's hotspot: the client surface's, or the origin for shapes.
+    pub fn cursor_hotspot(&self) -> Point<i32, Logical> {
+        let CursorImageStatus::Surface(surface) = &self.cursor_status else {
+            return (0, 0).into();
+        };
+        with_states(surface, |states| {
+            states
+                .data_map
+                .get::<Mutex<CursorImageAttributes>>()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .hotspot
+        })
+    }
+
+    /// Suspend mapped toplevels nothing shows, unless they are being recorded.
+    pub fn update_suspended(&mut self) {
+        let visible: HashSet<WlSurface> = if self.is_locked() {
+            HashSet::new()
+        } else {
+            self.space
+                .outputs()
+                .filter(|output| !self.output_power.is_off(output))
+                .flat_map(|output| self.visible_surfaces(output))
+                .collect()
+        };
+        for (surface, window_state) in &self.toplevels {
+            let Some(toplevel) = window_state.window.toplevel() else {
+                continue;
+            };
+            // Unmapped windows still have to draw their first buffer.
+            let suspend = self.is_mapped(surface)
+                && !visible.contains(surface)
+                && !self.is_toplevel_recorded(surface);
+            let changed = toplevel.with_pending_state(|pending| {
+                if pending.states.contains(xdg_toplevel::State::Suspended) == suspend {
+                    return false;
+                }
+                if suspend {
+                    pending.states.set(xdg_toplevel::State::Suspended);
+                } else {
+                    pending.states.unset(xdg_toplevel::State::Suspended);
+                }
+                true
+            });
+            if changed && toplevel.is_initial_configure_sent() {
+                toplevel.send_pending_configure();
+            }
         }
     }
 
@@ -673,6 +783,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 );
             });
         }
+        for lock_surface in self.lock_surfaces.iter().filter(|s| s.alive()) {
+            with_surfaces_surface_tree(lock_surface.wl_surface(), |surface, data| {
+                update_surface_primary_scanout_output(
+                    surface,
+                    output,
+                    data,
+                    None,
+                    states,
+                    default_primary_scanout_output_compare,
+                );
+            });
+        }
         if let Some(icon) = &self.dnd_icon {
             with_surfaces_surface_tree(&icon.surface, |surface, data| {
                 update_surface_primary_scanout_output(
@@ -685,6 +807,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 );
             });
         }
+        self.update_idle_inhibit();
     }
 
     /// Push the preferred fractional scale to `surface` (no-op for surfaces
@@ -716,36 +839,25 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .cloned()
     }
 
-    /// Prune bookkeeping for toplevels whose client went away without the
-    /// `toplevel_destroyed` path (e.g. a crash); dropping the entry also drops
-    /// its foreign-toplevel handle.
-    pub fn cleanup_toplevels(&mut self) {
-        let before = self.toplevels.len();
-        self.toplevels
-            .retain(|_, ws| ws.window.toplevel().unwrap().wl_surface().is_alive());
-        for layout in self.layouts.values_mut() {
-            layout.retain(|s| s.is_alive());
+    /// The toplevel a surface belongs to, through subsurfaces and popups.
+    pub fn toplevel_of(&self, surface: &WlSurface) -> Option<WlSurface> {
+        let root = root_surface(surface);
+        if self.toplevels.contains_key(&root) {
+            return Some(root);
         }
-        if self.toplevels.len() != before {
-            self.schedule_render();
-        }
+        find_popup_root_surface(&self.popups.find_popup(&root)?).ok()
     }
 
-    /// The topmost window currently marked modal, if any. While open, input to
-    /// every other window is blocked. Without the session xdg-dialog global the
-    /// flag stays false.
-    pub fn active_modal_window(&self) -> Option<Window> {
-        self.space
-            .elements()
-            .rev()
-            .find(|w| {
-                w.toplevel().is_some_and(|toplevel| {
-                    self.toplevels
-                        .get(toplevel.wl_surface())
-                        .is_some_and(|ws| ws.modal)
-                })
-            })
-            .cloned()
+    /// Whether `surface` belongs to a mapped window that no output draws.
+    pub fn in_hidden_window(&self, surface: &WlSurface) -> bool {
+        let Some(toplevel) = self.toplevel_of(surface) else {
+            return false;
+        };
+        self.is_mapped(&toplevel)
+            && !self
+                .space
+                .outputs()
+                .any(|output| self.visible_surfaces(output).contains(&toplevel))
     }
 
     /// Recompute keyboard focus from the layer-shell priority list and apply it
@@ -811,10 +923,17 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         })
     }
 
+    /// Inhibit idle while a surface holding an inhibitor is on screen.
     pub fn update_idle_inhibit(&mut self) {
-        self.idle_inhibiting_surfaces
-            .retain(|surface| surface.is_alive());
-        let inhibited = !self.idle_inhibiting_surfaces.is_empty();
+        let inhibited = self.idle_inhibitors.keys().any(|surface| {
+            // Unmapped surfaces keep a stale scanout output.
+            let mapped = with_renderer_surface_state(surface, |state| state.buffer().is_some())
+                .unwrap_or(false);
+            mapped
+                && with_states(surface, |states| {
+                    surface_primary_scanout_output(surface, states).is_some()
+                })
+        });
         self.idle_notifier_state.set_is_inhibited(inhibited);
     }
 }
@@ -822,6 +941,24 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
+    /// Connected through a security context (e.g. a Flatpak app).
+    pub restricted: bool,
+}
+
+/// The root of `surface`'s subsurface tree.
+pub fn root_surface(surface: &WlSurface) -> WlSurface {
+    let mut root = surface.clone();
+    while let Some(parent) = get_parent(&root) {
+        root = parent;
+    }
+    root
+}
+
+/// Whether `client` may see privileged globals (not sandboxed).
+pub fn client_is_unrestricted(client: &Client) -> bool {
+    client
+        .get_data::<ClientState>()
+        .is_some_and(|data| !data.restricted)
 }
 
 impl ClientData for ClientState {

@@ -35,6 +35,8 @@ sd-notify = "0.5.0"
 thiserror = "2.0.20"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Not named in src: the phosh_private code wayland-scanner generates refers
+# to `wayland_backend::` paths.
 wayland-backend = "0.3.16"
 wayland-scanner = "0.31.11"
 wayland-server = "0.31.14"

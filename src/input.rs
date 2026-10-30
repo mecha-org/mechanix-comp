@@ -289,7 +289,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .toplevel_of(&surface)
             .and_then(|s| self.toplevels.get(&s))
         {
-            self.focus_window(&ws.window.clone(), serial);
+            self.focus_window(&ws.window.clone(), serial, false);
         }
     }
 

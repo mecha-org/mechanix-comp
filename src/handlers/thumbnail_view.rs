@@ -165,7 +165,6 @@ impl ThumbnailViewState {
     }
 
     /// Thumbnails to draw on `layer`, in creation order.
-    #[allow(dead_code, reason = "consumed by the layer-surface renderer")]
     pub fn for_layer<'a>(
         &'a self,
         layer: &'a WlSurface,
@@ -177,7 +176,6 @@ impl ThumbnailViewState {
     }
 
     /// Toplevels shown through at least one drawable thumbnail.
-    #[allow(dead_code, reason = "consumed by toplevel liveness checks")]
     pub fn shown_toplevels(&self) -> HashSet<WlSurface> {
         let mut shown = self.thumbnails.shown_toplevels();
         shown.retain(WlSurface::is_alive);

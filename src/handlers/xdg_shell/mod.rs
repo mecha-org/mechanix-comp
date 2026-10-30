@@ -178,7 +178,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         }
         if let Some(window) = self.apply_mode_request(surface.wl_surface(), WindowMode::Fullscreen)
         {
-            self.focus_window(&window, SERIAL_COUNTER.next_serial());
+            self.focus_window(&window, SERIAL_COUNTER.next_serial(), false);
         }
     }
 
@@ -196,11 +196,14 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
-    pub fn focus_window(&mut self, window: &Window, serial: Serial) {
-        // A fullscreen window keeps keyboard focus; other windows can't steal it.
-        if let Some(active) = self.active_fullscreen_window()
-            && &active != window
-        {
+    /// Make `window` the active one. A fullscreen window keeps focus against
+    /// everything but `force` (an explicit shell switch), which leaves it
+    /// fullscreen but no longer active.
+    pub fn focus_window(&mut self, window: &Window, serial: Serial, force: bool) {
+        let blocked = self
+            .active_fullscreen_window()
+            .is_some_and(|active| &active != window);
+        if !may_focus(blocked, force) {
             return;
         }
 
@@ -247,7 +250,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     pub fn focus_topmost(&mut self) {
         let topmost = self.space.elements().last().cloned();
         if let Some(window) = topmost {
-            self.focus_window(&window, SERIAL_COUNTER.next_serial());
+            self.focus_window(&window, SERIAL_COUNTER.next_serial(), false);
         } else {
             self.active_window = None;
             self.layer_shell_on_demand_focus = None;
@@ -270,7 +273,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.space.map_element(window.clone(), loc, false);
         // A parent mapped after its focused dialog leaves the focus on the dialog.
         if self.active_fullscreen_window().is_none() && !self.active_group().contains(surface) {
-            self.focus_window(window, SERIAL_COUNTER.next_serial());
+            self.focus_window(window, SERIAL_COUNTER.next_serial(), false);
         } else if let Some(output) = &output {
             self.apply_layout(output);
         }
@@ -430,4 +433,22 @@ pub fn handle_commit<BackendData: Backend + 'static>(
         }
     }
     true
+}
+
+/// Whether focus may move to a window: a fullscreen window blocks it unless forced.
+fn may_focus(fullscreen_blocks: bool, forced: bool) -> bool {
+    !fullscreen_blocks || forced
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreign_activate_overrides_fullscreen() {
+        assert!(!may_focus(true, false));
+        assert!(may_focus(true, true));
+        assert!(may_focus(false, false));
+        assert!(may_focus(false, true));
+    }
 }

@@ -454,10 +454,13 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         }
         let scale = output.current_scale().fractional_scale();
-        // Only presented surfaces are acked; hidden ones are suspended instead.
+        let thumbnailed = self.thumbnailed_on(output);
+        // Only presented surfaces are acked; hidden ones are suspended instead,
+        // unless a thumbnail on this output shows them.
         for window in self.space.elements() {
+            let shown = thumbnailed.contains(window.toplevel().unwrap().wl_surface());
             window.send_frame(output, now, None, |surface, data| {
-                surface_primary_scanout_output(surface, data)
+                frame_output(surface_primary_scanout_output(surface, data), shown, output)
             });
             self.push_fractional_scale(window.toplevel().unwrap().wl_surface(), scale);
         }
@@ -485,16 +488,46 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         })
     }
 
+    /// Toplevels drawn through a thumbnail on one of `output`'s layer surfaces.
+    pub fn thumbnailed_on(&self, output: &Output) -> HashSet<WlSurface> {
+        layer_map_for_output(output)
+            .layers()
+            .flat_map(|layer| {
+                self.thumbnail_view
+                    .for_layer(layer.wl_surface())
+                    .map(|thumbnail| thumbnail.toplevel.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Whether a drawable thumbnail shows the toplevel `toplevel`.
+    pub fn is_thumbnailed(&self, toplevel: &WlSurface) -> bool {
+        self.thumbnail_view.shown_toplevels().contains(toplevel)
+    }
+
     /// Suspend mapped toplevels nothing shows, unless they are being recorded.
+    /// Runs every event-loop iteration, so thumbnail changes are picked up too.
     pub fn update_suspended(&mut self) {
-        let visible: HashSet<WlSurface> = if self.is_locked() {
-            HashSet::new()
+        let (visible, thumbnailed): (HashSet<WlSurface>, HashSet<WlSurface>) = if self.is_locked() {
+            Default::default()
         } else {
-            self.space
+            let outputs: Vec<Output> = self
+                .space
                 .outputs()
                 .filter(|output| !self.output_power.is_off(output))
-                .flat_map(|output| self.visible_surfaces(output))
-                .collect()
+                .cloned()
+                .collect();
+            (
+                outputs
+                    .iter()
+                    .flat_map(|output| self.visible_surfaces(output))
+                    .collect(),
+                outputs
+                    .iter()
+                    .flat_map(|output| self.thumbnailed_on(output))
+                    .collect(),
+            )
         };
         for (surface, window_state) in &self.toplevels {
             let Some(toplevel) = window_state.window.toplevel() else {
@@ -502,8 +535,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             };
             // Unmapped windows still have to draw their first buffer.
             let suspend = self.is_mapped(surface)
-                && !visible.contains(surface)
-                && !self.is_toplevel_recorded(surface);
+                && should_suspend(
+                    visible.contains(surface),
+                    self.is_toplevel_recorded(surface),
+                    thumbnailed.contains(surface),
+                );
             let changed = toplevel.with_pending_state(|pending| {
                 if pending.states.contains(xdg_toplevel::State::Suspended) == suspend {
                     return false;
@@ -853,16 +889,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         find_popup_root_surface(&self.popups.find_popup(&root)?).ok()
     }
 
-    /// Whether `surface` belongs to a mapped window that no output draws.
+    /// Whether `surface` belongs to a mapped window that no output draws,
+    /// neither as a window nor through a thumbnail.
     pub fn in_hidden_window(&self, surface: &WlSurface) -> bool {
         let Some(toplevel) = self.toplevel_of(surface) else {
             return false;
         };
         self.is_mapped(&toplevel)
-            && !self
-                .space
-                .outputs()
-                .any(|output| self.visible_surfaces(output).contains(&toplevel))
+            && is_hidden(
+                self.space
+                    .outputs()
+                    .any(|output| self.visible_surfaces(output).contains(&toplevel)),
+                self.is_thumbnailed(&toplevel),
+            )
     }
 
     /// Recompute keyboard focus from the layer-shell priority list and apply it
@@ -969,4 +1008,49 @@ pub fn client_is_unrestricted(client: &Client) -> bool {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+/// Whether a mapped toplevel gets xdg `Suspended`: nothing shows or records it.
+fn should_suspend(visible: bool, recorded: bool, thumbnailed: bool) -> bool {
+    !visible && !recorded && !thumbnailed
+}
+
+/// Whether a mapped toplevel's commits can skip the output render.
+fn is_hidden(visible: bool, thumbnailed: bool) -> bool {
+    !visible && !thumbnailed
+}
+
+/// The output whose frames a surface follows: where it was presented, else
+/// `output` when a thumbnail there shows it.
+fn frame_output<O: Clone>(scanout: Option<O>, thumbnailed: bool, output: &O) -> Option<O> {
+    scanout.or_else(|| thumbnailed.then(|| output.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thumbnailed_window_is_not_suspended() {
+        assert!(should_suspend(false, false, false));
+        assert!(!should_suspend(false, false, true));
+        assert!(!should_suspend(true, false, false));
+        assert!(!should_suspend(false, true, false));
+    }
+
+    #[test]
+    fn thumbnailed_commit_triggers_redraw() {
+        assert!(is_hidden(false, false));
+        assert!(!is_hidden(false, true));
+        assert!(!is_hidden(true, false));
+    }
+
+    #[test]
+    fn thumbnailed_window_gets_frame_callbacks() {
+        assert_eq!(frame_output(None, true, &1), Some(1));
+        assert_eq!(frame_output(None, false, &1), None);
+        assert_eq!(frame_output(Some(1), false, &1), Some(1));
+        // A window presented elsewhere keeps that output's pacing.
+        assert_eq!(frame_output(Some(2), true, &1), Some(2));
+    }
 }

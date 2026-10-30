@@ -24,7 +24,7 @@ impl<BackendData: Backend + 'static> XdgActivationHandler for State<BackendData>
                 .find(|w| w.toplevel().is_some_and(|tl| tl.wl_surface() == &surface))
                 .cloned();
             if let Some(window) = window {
-                self.focus_window(&window, SERIAL_COUNTER.next_serial());
+                self.focus_window(&window, SERIAL_COUNTER.next_serial(), false);
             }
         }
     }

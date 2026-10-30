@@ -482,13 +482,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// wlr `activate` request: raise the toplevel and give it keyboard focus.
+    /// wlr `activate` request: raise the toplevel and give it keyboard focus,
+    /// even over a fullscreen window (a shell switch is an explicit choice).
     fn foreign_activate(&mut self, surface: &WlSurface) {
         let Some(ws) = self.toplevels.get(surface) else {
             return;
         };
         let window = ws.window.clone();
-        self.focus_window(&window, SERIAL_COUNTER.next_serial());
+        self.focus_window(&window, SERIAL_COUNTER.next_serial(), true);
     }
 
     /// wlr `close` request: ask the toplevel to close.

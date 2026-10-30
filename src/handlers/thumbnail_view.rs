@@ -1,6 +1,7 @@
 //! Phosh's `phosh_private` v8: thumbnail views of toplevels drawn onto a
 //! layer surface. Only `add_thumbnail_view` is served; every other request is
-//! a protocol error.
+//! a protocol error. A thumbnail whose toplevel handle or layer surface is
+//! already gone is inert: never stored, never drawn, its requests no-ops.
 
 use std::collections::HashSet;
 use std::hash::Hash;
@@ -82,7 +83,8 @@ impl<T: PartialEq, S: Eq + Hash + Clone> Thumbnails<T, S> {
         self.entries.retain(|(entry, _)| entry != id);
     }
 
-    /// Record a `set_properties`; unknown ids (dropped with their layer) are ignored.
+    /// Record a `set_properties`; unknown ids (inert from creation, or dropped
+    /// with their layer) are ignored.
     fn set_properties(&mut self, id: &T, x: i32, y: i32, scale: f64, alpha: f32) {
         if let Some((_, thumbnail)) = self.entries.iter_mut().find(|(entry, _)| entry == id) {
             thumbnail.pending = Some((x, y, scale, alpha));
@@ -231,21 +233,14 @@ impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivate, State<BackendData>>
                     .layer_surfaces()
                     .find(|layer| layer.shell_surface() == &layer_surface)
                     .map(|layer| layer.wl_surface().clone());
-                match (toplevel, layer) {
-                    (Some(toplevel), Some(layer)) => {
-                        state
-                            .thumbnail_view
-                            .thumbnails
-                            .add(thumbnail, toplevel, layer);
-                    }
-                    (None, _) => resource.post_error(
-                        phosh_private::Error::InvalidArgument,
-                        "add_thumbnail_view: unknown or closed toplevel",
-                    ),
-                    (_, None) => resource.post_error(
-                        phosh_private::Error::InvalidArgument,
-                        "add_thumbnail_view: unknown layer surface",
-                    ),
+                // A closed handle or dead layer surface can race with this
+                // request, so it is not an error: the thumbnail stays out of
+                // the store, inert, and its requests are no-ops.
+                if let (Some(toplevel), Some(layer)) = (toplevel, layer) {
+                    state
+                        .thumbnail_view
+                        .thumbnails
+                        .add(thumbnail, toplevel, layer);
                 }
                 return;
             }
@@ -397,6 +392,21 @@ mod tests {
         assert_eq!(drawn(&thumbnails, LAYER), vec![(30, 40, 0.25, 1.0)]);
         thumbnails.remove(&100);
         assert_eq!(drawn(&thumbnails, LAYER), vec![(30, 40, 0.25, 1.0)]);
+    }
+
+    #[test]
+    fn inert_handle_makes_inert_thumbnail() {
+        // `add_thumbnail_view` with a closed handle or dead layer surface
+        // stores nothing; the thumbnail's later requests must be harmless.
+        let mut thumbnails = one_thumbnail();
+        thumbnails.set_properties(&100, 10, 20, 0.5, 0.8);
+        thumbnails.set_properties(&200, 1, 2, 1.0, 1.0);
+        thumbnails.on_layer_commit(&LAYER);
+        assert_eq!(drawn(&thumbnails, LAYER), vec![(10, 20, 0.5, 0.8)]);
+        assert_eq!(thumbnails.shown_toplevels(), HashSet::from([TOPLEVEL]));
+
+        thumbnails.remove(&200);
+        assert_eq!(drawn(&thumbnails, LAYER), vec![(10, 20, 0.5, 0.8)]);
     }
 
     #[test]

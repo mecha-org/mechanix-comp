@@ -31,7 +31,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
             WindowState {
                 window: window.clone(),
                 mode: WindowMode::Floating,
-                mapped: false,
+                output: None,
                 modal: false,
                 layout_size: Size::default(),
             },
@@ -45,10 +45,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {
-        if self
-            .toplevels
-            .get(surface.wl_surface())
-            .is_some_and(|ws| ws.mapped)
+        if self.is_mapped(surface.wl_surface())
             && let Some(output) = self.primary_output()
         {
             self.apply_layout(&output);
@@ -247,13 +244,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     pub fn focus_topmost(&mut self) {
-        let topmost = self
-            .space
-            .outputs()
-            .next()
-            .and_then(|o| self.layouts.get(o))
-            .and_then(|layout| layout.top().cloned())
-            .and_then(|s| self.toplevels.get(&s).map(|ws| ws.window.clone()));
+        let topmost = self.space.elements().last().cloned();
         if let Some(window) = topmost {
             self.focus_window(&window, SERIAL_COUNTER.next_serial());
         } else {
@@ -274,15 +265,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .map(|o| layer_map_for_output(o).non_exclusive_zone().loc)
             .unwrap_or_default();
 
-        if let Some(output) = &output {
-            self.layouts
-                .entry(output.clone())
-                .or_default()
-                .insert(surface.clone());
-        }
-
+        self.toplevels.get_mut(surface).unwrap().output = output.clone();
         self.space.map_element(window.clone(), loc, false);
-        self.toplevels.get_mut(surface).unwrap().mapped = true;
         // A parent mapped after its focused dialog leaves the focus on the dialog.
         if self.active_fullscreen_window().is_none() && !self.active_group().contains(surface) {
             self.focus_window(window, SERIAL_COUNTER.next_serial());
@@ -292,13 +276,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     fn unmap_toplevel(&mut self, surface: &WlSurface, window: &Window) {
-        let ws = self.toplevels.get_mut(surface).unwrap();
-        ws.mapped = false;
         // A remap is a fresh mapping: reset the mode so it is re-evaluated.
-        ws.mode = WindowMode::Floating;
-        for layout in self.layouts.values_mut() {
-            layout.remove(surface);
-        }
+        self.toplevels.get_mut(surface).unwrap().mode = WindowMode::Floating;
         self.space.unmap_elem(window);
         self.stop_captures_for_toplevel(surface);
         self.focus_topmost();
@@ -310,9 +289,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let Some(ws) = self.toplevels.remove(surface) else {
             return;
         };
-        for layout in self.layouts.values_mut() {
-            layout.remove(surface);
-        }
         self.stop_captures_for_toplevel(surface);
         if self.space.elements().any(|window| window == &ws.window) {
             self.space.unmap_elem(&ws.window);
@@ -331,7 +307,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Reposition a mapped window, or reply to one that can't be laid out yet.
     fn reply_placement(&mut self, surface: &WlSurface, window: &Window) {
-        if self.toplevels[surface].mapped
+        if self.is_mapped(surface)
             && let Some(output) = self.primary_output()
         {
             self.apply_layout(&output);
@@ -432,7 +408,7 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     }
     {
         let window = state.toplevels[surface].window.clone();
-        let mapped = state.toplevels[surface].mapped;
+        let mapped = state.is_mapped(surface);
         let buffered = with_renderer_surface_state(surface, |states| states.buffer().is_some())
             .unwrap_or(false);
 

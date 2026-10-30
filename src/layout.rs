@@ -50,49 +50,6 @@ fn ancestor_chain(
     chain
 }
 
-/// Per-output model: the window stack (back → front) and the work zone.
-#[derive(Debug, Default)]
-pub struct Layout {
-    stack: Vec<WlSurface>,
-    zone: Rectangle<i32, Logical>,
-}
-
-impl Layout {
-    /// Whether `surface` is stacked on this output.
-    pub fn contains(&self, surface: &WlSurface) -> bool {
-        self.stack.contains(surface)
-    }
-
-    pub fn insert(&mut self, surface: WlSurface) {
-        if !self.stack.iter().any(|s| s == &surface) {
-            self.stack.push(surface);
-        }
-    }
-
-    pub fn remove(&mut self, surface: &WlSurface) {
-        self.stack.retain(|s| s != surface);
-    }
-
-    pub fn set_zone(&mut self, zone: Rectangle<i32, Logical>) {
-        self.zone = zone;
-    }
-
-    /// Move this ancestor chain (root → leaf) to the front of the stack.
-    pub fn activate_group(&mut self, group: Vec<WlSurface>) {
-        let group_set: HashSet<_> = group.iter().cloned().collect();
-        self.stack.retain(|s| !group_set.contains(s));
-        self.stack.extend(group);
-    }
-
-    pub fn stack(&self) -> &[WlSurface] {
-        &self.stack
-    }
-
-    pub fn top(&self) -> Option<&WlSurface> {
-        self.stack.last()
-    }
-}
-
 impl<BackendData: Backend + 'static> State<BackendData> {
     /// Set a toplevel's pending size/bounds/states for `mode` over `area`.
     pub(crate) fn set_toplevel_placement(
@@ -155,10 +112,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.toplevels.get(surface).map(|ws| ws.window.clone())
     }
 
-    fn layout_mut(&mut self, output: &Output) -> &mut Layout {
-        self.layouts.entry(output.clone()).or_default()
-    }
-
     /// The single output of the space, if any.
     pub fn primary_output(&self) -> Option<Output> {
         self.space.outputs().next().cloned()
@@ -190,24 +143,33 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Size, position, xdg state, and Space z-order from the Comet model.
+    /// Raise the active group, then size, position and configure `output`'s windows.
     pub fn apply_layout(&mut self, output: &Output) {
         let zone = layer_map_for_output(output).non_exclusive_zone();
         if let Some(focused) = self.active_window.clone() {
-            let group = ancestor_chain(&focused, |s| self.parent_of(s));
-            self.layout_mut(output).activate_group(group);
+            for surface in ancestor_chain(&focused, |s| self.parent_of(s)) {
+                if let Some(window) = self.window_for(&surface) {
+                    self.space.raise_element(&window, false);
+                }
+            }
         }
-        self.layout_mut(output).set_zone(zone);
 
-        let stack: Vec<WlSurface> = self.layout_mut(output).stack().to_vec();
+        let windows: Vec<Window> = self
+            .space
+            .elements()
+            .filter(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|t| self.is_on(t.wl_surface(), output))
+            })
+            .cloned()
+            .collect();
         let output_geo = self.space.output_geometry(output);
-        for surface in &stack {
-            let Some(window) = self.window_for(surface) else {
-                continue;
-            };
+        for window in &windows {
             let Some(toplevel) = window.toplevel() else {
                 continue;
             };
+            let surface = toplevel.wl_surface();
 
             // Fullscreen covers the output; dialogs center over their parent; else the work zone.
             let mode = self.placement_mode(surface, toplevel);
@@ -245,14 +207,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             if toplevel.is_initial_configure_sent() {
                 toplevel.send_pending_configure();
             }
-            self.space.relocate_element(&window, loc);
-        }
-
-        // Space z-order is the stack, back → front.
-        for surface in &stack {
-            if let Some(window) = self.window_for(surface) {
-                self.space.raise_element(&window, false);
-            }
+            self.space.relocate_element(window, loc);
         }
         self.schedule_render();
     }
@@ -277,14 +232,26 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .any(|modal| ancestor_chain(modal, |s| self.parent_of(s)).contains(window))
     }
 
-    /// The active group's surfaces that are stacked on `output`.
+    /// The active group's windows mapped on `output`, the ones it shows.
     pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
-        let Some(layout) = self.layouts.get(output) else {
-            return HashSet::new();
-        };
         let mut visible = self.active_group();
-        visible.retain(|s| layout.contains(s));
+        visible.retain(|s| self.is_on(s, output));
         visible
+    }
+
+    /// Whether `surface` is a toplevel mapped on `output`.
+    fn is_on(&self, surface: &WlSurface, output: &Output) -> bool {
+        self.toplevels.get(surface).is_some_and(|ws| {
+            ws.output.as_ref() == Some(output) && self.space.elements().any(|w| w == &ws.window)
+        })
+    }
+
+    /// Whether `surface` is a toplevel mapped into the space.
+    pub fn is_mapped(&self, surface: &WlSurface) -> bool {
+        let Some(ws) = self.toplevels.get(surface) else {
+            return false;
+        };
+        self.space.elements().any(|window| window == &ws.window)
     }
 }
 

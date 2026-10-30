@@ -83,7 +83,6 @@ use crate::config::Config;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::image_copy_capture::CaptureSession;
 use crate::handlers::output_power::OutputPowerManagerState;
-use crate::layout::Layout;
 
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -100,8 +99,8 @@ pub enum WindowMode {
 pub struct WindowState {
     pub window: Window,
     pub mode: WindowMode,
-    /// True once the window joined the `Space`.
-    pub mapped: bool,
+    /// The output the window is laid out on, set when it maps.
+    pub output: Option<Output>,
     /// The xdg-dialog modal hint, cached so input handling needn't lock
     /// surface data on every click.
     pub modal: bool,
@@ -219,9 +218,6 @@ pub struct State<BackendData: Backend + 'static> {
     pub lock_phase: LockPhase,
     pub lock_surfaces: Vec<LockSurface>,
     pub lock_surface_outputs: HashMap<ObjectId, Output>,
-    /// One layout model per output; the source of truth for window stacking.
-    #[allow(clippy::mutable_key_type)] // `Output` is interior-mutable, but stable as a key.
-    pub layouts: HashMap<Output, Layout>,
     /// The `OnDemand` layer surface last opened or clicked. `update_keyboard_focus`
     /// focuses it while it stays a mapped OnDemand layer, so launchers and
     /// panels take keyboard focus on open.
@@ -275,8 +271,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         ViewporterState::new::<Self>(&dh);
         FractionalScaleManagerState::new::<Self>(&dh);
-        #[allow(clippy::mutable_key_type)] // `Output` is interior-mutable, but stable as a key.
-        let layouts: HashMap<Output, Layout> = HashMap::new();
         CursorShapeManagerState::new::<Self>(&dh);
         let mut xdg_toplevel_icon = XdgToplevelIconManager::new::<Self>(&dh);
         // Advertise two sizes; a scaled output picks the larger.
@@ -359,7 +353,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             lock_phase: LockPhase::Unlocked,
             lock_surfaces: Vec::new(),
             lock_surface_outputs: HashMap::new(),
-            layouts,
             layer_shell_on_demand_focus: None,
             active_window: None,
         }
@@ -503,7 +496,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 continue;
             };
             // Unmapped windows still have to draw their first buffer.
-            let suspend = window_state.mapped
+            let suspend = self.is_mapped(surface)
                 && !visible.contains(surface)
                 && !self.is_toplevel_recorded(surface);
             let changed = toplevel.with_pending_state(|pending| {
@@ -860,8 +853,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let Some(toplevel) = self.toplevel_of(surface) else {
             return false;
         };
-        self.toplevels.get(&toplevel).is_some_and(|ws| ws.mapped)
-            && !(self.space.outputs())
+        self.is_mapped(&toplevel)
+            && !self
+                .space
+                .outputs()
                 .any(|output| self.visible_surfaces(output).contains(&toplevel))
     }
 

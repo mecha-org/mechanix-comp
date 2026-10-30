@@ -84,8 +84,14 @@ impl<T: PartialEq, S: Eq + Hash + Clone> Thumbnails<T, S> {
     }
 
     /// Record a `set_properties`; unknown ids (inert from creation, or dropped
-    /// with their layer) are ignored.
+    /// with their layer) are ignored. A non-finite or non-positive scale, or a
+    /// NaN alpha, is ignored (the previous pending stays); alpha is clamped to
+    /// [0, 1].
     fn set_properties(&mut self, id: &T, x: i32, y: i32, scale: f64, alpha: f32) {
+        if !(scale.is_finite() && scale > 0.0) || alpha.is_nan() {
+            return;
+        }
+        let alpha = alpha.clamp(0.0, 1.0);
         if let Some((_, thumbnail)) = self.entries.iter_mut().find(|(entry, _)| entry == id) {
             thumbnail.pending = Some((x, y, scale, alpha));
         }
@@ -164,13 +170,18 @@ impl ThumbnailViewState {
         &'a self,
         layer: &'a WlSurface,
     ) -> impl Iterator<Item = &'a Thumbnail> + 'a {
-        self.thumbnails.for_layer(layer)
+        // Belt and braces: `forget_surface` already makes dead toplevels inert.
+        self.thumbnails
+            .for_layer(layer)
+            .filter(|thumbnail| thumbnail.toplevel.is_alive())
     }
 
     /// Toplevels shown through at least one drawable thumbnail.
     #[allow(dead_code, reason = "consumed by toplevel liveness checks")]
     pub fn shown_toplevels(&self) -> HashSet<WlSurface> {
-        self.thumbnails.shown_toplevels()
+        let mut shown = self.thumbnails.shown_toplevels();
+        shown.retain(WlSurface::is_alive);
+        shown
     }
 
     /// `s` is gone: drop thumbnails on it as a layer; those of it as a
@@ -227,7 +238,12 @@ impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivate, State<BackendData>>
                 layer_surface,
             } => {
                 let thumbnail = data_init.init(id, ThumbnailUdata);
-                let toplevel = state.foreign_toplevel.surface_for_wlr_handle(&toplevel);
+                // The foreign-toplevel map is pruned only on the next refresh,
+                // so a handle can still resolve to a window already forgotten.
+                let toplevel = state
+                    .foreign_toplevel
+                    .surface_for_wlr_handle(&toplevel)
+                    .filter(|surface| surface.is_alive() && state.toplevels.contains_key(surface));
                 let layer = state
                     .layer_shell_state
                     .layer_surfaces()
@@ -392,6 +408,25 @@ mod tests {
         assert_eq!(drawn(&thumbnails, LAYER), vec![(30, 40, 0.25, 1.0)]);
         thumbnails.remove(&100);
         assert_eq!(drawn(&thumbnails, LAYER), vec![(30, 40, 0.25, 1.0)]);
+    }
+
+    #[test]
+    fn invalid_properties_are_sanitised() {
+        let mut thumbnails = one_thumbnail();
+        thumbnails.set_properties(&100, 10, 20, 0.5, 0.8);
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            thumbnails.set_properties(&100, 1, 2, scale, 1.0);
+        }
+        thumbnails.set_properties(&100, 3, 4, 1.0, f32::NAN);
+        thumbnails.on_layer_commit(&LAYER);
+        assert_eq!(drawn(&thumbnails, LAYER), vec![(10, 20, 0.5, 0.8)]);
+
+        thumbnails.set_properties(&100, 0, 0, 1.0, 1.5);
+        thumbnails.on_layer_commit(&LAYER);
+        assert_eq!(drawn(&thumbnails, LAYER), vec![(0, 0, 1.0, 1.0)]);
+        thumbnails.set_properties(&100, 0, 0, 1.0, -0.5);
+        thumbnails.on_layer_commit(&LAYER);
+        assert_eq!(drawn(&thumbnails, LAYER), vec![(0, 0, 1.0, 0.0)]);
     }
 
     #[test]

@@ -1018,6 +1018,7 @@ impl State<UdevData> {
                     &self.lock_surfaces,
                     &self.toplevels,
                     &visible,
+                    &self.thumbnail_view,
                     custom_elements,
                 )
             };

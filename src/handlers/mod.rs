@@ -14,6 +14,7 @@ pub mod seat;
 pub mod security_context;
 pub mod session_lock;
 pub mod shm;
+pub mod thumbnail_view;
 pub mod xdg_activation;
 pub mod xdg_dialog;
 pub mod xdg_foreign;

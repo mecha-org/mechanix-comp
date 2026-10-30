@@ -329,7 +329,11 @@ impl ForeignToplevelManagerState {
         instance.parent(parent);
     }
 
-    fn surface_for_wlr_handle(&self, resource: &ZwlrForeignToplevelHandleV1) -> Option<WlSurface> {
+    /// The `wl_surface` behind a wlr handle, if its toplevel is still announced.
+    pub fn surface_for_wlr_handle(
+        &self,
+        resource: &ZwlrForeignToplevelHandleV1,
+    ) -> Option<WlSurface> {
         self.toplevels
             .iter()
             .find(|(_, data)| data.wlr_management_instances.contains_key(resource))

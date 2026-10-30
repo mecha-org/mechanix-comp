@@ -121,6 +121,8 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
             self.capture_commit(root);
         }
 
+        // Double-buffered thumbnail properties land with the layer surface commit.
+        self.thumbnail_view.on_layer_commit(surface);
         self.ensure_initial_configure(surface);
         // A commit is new damage; render on demand instead of polling.
         if !self.in_hidden_window(surface) {
@@ -132,6 +134,7 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
         self.schedule_render();
         self.popups.cleanup();
         self.forget_toplevel(surface);
+        self.thumbnail_view.forget_surface(surface);
         if self.idle_inhibitors.remove(surface).is_some() {
             self.update_idle_inhibit();
         }

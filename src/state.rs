@@ -83,6 +83,7 @@ use crate::config::Config;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::image_copy_capture::CaptureSession;
 use crate::handlers::output_power::OutputPowerManagerState;
+use crate::handlers::thumbnail_view::ThumbnailViewState;
 
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -197,6 +198,8 @@ pub struct State<BackendData: Backend + 'static> {
     pub image_copy_capture_state: ImageCopyCaptureState,
     /// Live capture sessions and their in-flight frames.
     pub capture_sessions: Vec<CaptureSession>,
+    /// `phosh_private` thumbnail views drawn onto layer surfaces.
+    pub thumbnail_view: ThumbnailViewState,
 
     pub seat: Seat<Self>,
     pub suppressed_keys: Vec<Keysym>,
@@ -305,6 +308,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             ToplevelCaptureSourceState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
         let image_copy_capture_state =
             ImageCopyCaptureState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
+        let thumbnail_view = ThumbnailViewState::new::<Self>(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
@@ -327,6 +331,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             toplevel_capture_source_state,
             image_copy_capture_state,
             capture_sessions: Vec::new(),
+            thumbnail_view,
             idle_inhibitors: HashMap::new(),
             display_handle: dh,
             space,

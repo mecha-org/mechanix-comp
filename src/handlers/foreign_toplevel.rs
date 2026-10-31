@@ -684,7 +684,11 @@ fn activation_target<T: Clone + PartialEq>(target: &T, stack: &[Stacked<T>]) -> 
         }
         false
     };
-    let family = || stack.iter().filter(|s| &s.window == target || below_target(s));
+    let family = || {
+        stack
+            .iter()
+            .filter(|s| &s.window == target || below_target(s))
+    };
     family()
         .filter(|s| s.modal && &s.window != target)
         .last()
@@ -706,7 +710,10 @@ mod tests {
 
     #[test]
     fn a_window_without_dialogs_is_itself() {
-        assert_eq!(activation_target(&1, &[w(1, None, false), w(2, None, false)]), 1);
+        assert_eq!(
+            activation_target(&1, &[w(1, None, false), w(2, None, false)]),
+            1
+        );
     }
 
     #[test]
@@ -723,11 +730,7 @@ mod tests {
 
     #[test]
     fn a_modal_dialog_wins_over_anything_focused_later() {
-        let stack = [
-            w(3, Some(1), true),
-            w(2, Some(1), false),
-            w(1, None, false),
-        ];
+        let stack = [w(3, Some(1), true), w(2, Some(1), false), w(1, None, false)];
         assert_eq!(activation_target(&1, &stack), 3);
     }
 

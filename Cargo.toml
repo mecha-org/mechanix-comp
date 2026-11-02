@@ -29,9 +29,15 @@ rev = "60aafc2b1a64395bd32ec93f41e6712a07544c34"
 default-features = false
 
 [dependencies]
+bitflags = "2.13.0"
 mxconfig = { git = "https://github.com/mecha-org/mxconfig", rev = "510a018ef9e0a174fecac7cedb5369231a494e30" }
 sd-notify = "0.5.0"
 thiserror = "2.0.20"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Not named in src: the phosh_private code wayland-scanner generates refers
+# to `wayland_backend::` paths.
+wayland-backend = "0.3.16"
+wayland-scanner = "0.31.11"
+wayland-server = "0.31.14"
 xcursor = "0.3.11"

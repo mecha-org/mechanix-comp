@@ -266,6 +266,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &state.lock_surfaces,
                         &state.toplevels,
                         &visible,
+                        &state.thumbnail_view,
                         custom_elements,
                     );
                     let result = damage_tracker

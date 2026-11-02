@@ -33,12 +33,13 @@ use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, ObjectId,
 };
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Size, Time};
+use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Size, Time, Transform};
 use smithay::wayland::commit_timing::{
     CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
 };
 use smithay::wayland::compositor::{
-    CompositorClientState, CompositorHandler, CompositorState, SurfaceData, get_parent, with_states,
+    CompositorClientState, CompositorHandler, CompositorState, SurfaceData, get_parent,
+    send_surface_state, with_states,
 };
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
@@ -83,6 +84,7 @@ use crate::config::Config;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::image_copy_capture::CaptureSession;
 use crate::handlers::output_power::OutputPowerManagerState;
+use crate::handlers::thumbnail_view::ThumbnailViewState;
 
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -197,6 +199,8 @@ pub struct State<BackendData: Backend + 'static> {
     pub image_copy_capture_state: ImageCopyCaptureState,
     /// Live capture sessions and their in-flight frames.
     pub capture_sessions: Vec<CaptureSession>,
+    /// `phosh_private` thumbnail views drawn onto layer surfaces.
+    pub thumbnail_view: ThumbnailViewState,
 
     pub seat: Seat<Self>,
     pub suppressed_keys: Vec<Keysym>,
@@ -249,7 +253,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         let seat_name = backend_data.seat_name();
 
-        let compositor_state = CompositorState::new::<Self>(&dh);
+        // Version 6 lets clients without fractional scale size their
+        // buffers from `preferred_buffer_scale` (see `push_preferred_scale`).
+        let compositor_state = CompositorState::new_v6::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(
             &dh,
             [
@@ -305,6 +311,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             ToplevelCaptureSourceState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
         let image_copy_capture_state =
             ImageCopyCaptureState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
+        let thumbnail_view = ThumbnailViewState::new::<Self>(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
@@ -327,6 +334,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             toplevel_capture_source_state,
             image_copy_capture_state,
             capture_sessions: Vec::new(),
+            thumbnail_view,
             idle_inhibitors: HashMap::new(),
             display_handle: dh,
             space,
@@ -433,6 +441,38 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
+    /// Queue a redraw of the outputs showing `layers`; every output if one of
+    /// them is no longer in any layer map.
+    pub fn schedule_render_for_layers(&mut self, layers: &[WlSurface]) {
+        if layers.is_empty() {
+            return;
+        }
+        let outputs: Vec<Output> = self.space.outputs().cloned().collect();
+        let mut found = 0;
+        for output in &outputs {
+            let shows = {
+                let map = layer_map_for_output(output);
+                layers
+                    .iter()
+                    .filter(|layer| map.layers().any(|l| l.wl_surface() == *layer))
+                    .count()
+            };
+            if shows > 0 {
+                found += shows;
+                self.backend_data.schedule_render(output);
+            }
+        }
+        if found < layers.len() {
+            self.schedule_render();
+        }
+    }
+
+    /// Forget `surface` in the thumbnail state and redraw what that changes.
+    pub fn forget_thumbnail_surface(&mut self, surface: &WlSurface) {
+        let layers = self.thumbnail_view.forget_surface(surface);
+        self.schedule_render_for_layers(&layers);
+    }
+
     /// Send frame callbacks for a presented frame; `now` is its presentation time.
     pub fn send_frame_callbacks(&mut self, output: &Output, now: Duration) {
         if self.is_locked() {
@@ -449,18 +489,21 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         }
         let scale = output.current_scale().fractional_scale();
-        // Only presented surfaces are acked; hidden ones are suspended instead.
+        let thumbnailed = self.thumbnailed_on(output);
+        // Only presented surfaces are acked; hidden ones are suspended instead,
+        // unless a thumbnail on this output shows them.
         for window in self.space.elements() {
+            let shown = thumbnailed.contains(window.toplevel().unwrap().wl_surface());
             window.send_frame(output, now, None, |surface, data| {
-                surface_primary_scanout_output(surface, data)
+                frame_output(surface_primary_scanout_output(surface, data), shown, output)
             });
-            self.push_fractional_scale(window.toplevel().unwrap().wl_surface(), scale);
+            self.push_preferred_scale(window.toplevel().unwrap().wl_surface(), scale);
         }
         for layer_surface in layer_map_for_output(output).layers() {
             layer_surface.send_frame(output, now, None, |surface, data| {
                 surface_primary_scanout_output(surface, data)
             });
-            self.push_fractional_scale(layer_surface.wl_surface(), scale);
+            self.push_preferred_scale(layer_surface.wl_surface(), scale);
         }
     }
 
@@ -480,16 +523,46 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         })
     }
 
+    /// Toplevels drawn through a thumbnail on one of `output`'s layer surfaces.
+    pub fn thumbnailed_on(&self, output: &Output) -> HashSet<WlSurface> {
+        layer_map_for_output(output)
+            .layers()
+            .flat_map(|layer| {
+                self.thumbnail_view
+                    .for_layer(layer.wl_surface())
+                    .map(|thumbnail| thumbnail.toplevel.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Whether a drawable thumbnail shows the toplevel `toplevel`.
+    pub fn is_thumbnailed(&self, toplevel: &WlSurface) -> bool {
+        self.thumbnail_view.shown_toplevels().contains(toplevel)
+    }
+
     /// Suspend mapped toplevels nothing shows, unless they are being recorded.
+    /// Runs every event-loop iteration, so thumbnail changes are picked up too.
     pub fn update_suspended(&mut self) {
-        let visible: HashSet<WlSurface> = if self.is_locked() {
-            HashSet::new()
+        let (visible, thumbnailed): (HashSet<WlSurface>, HashSet<WlSurface>) = if self.is_locked() {
+            Default::default()
         } else {
-            self.space
+            let outputs: Vec<Output> = self
+                .space
                 .outputs()
                 .filter(|output| !self.output_power.is_off(output))
-                .flat_map(|output| self.visible_surfaces(output))
-                .collect()
+                .cloned()
+                .collect();
+            (
+                outputs
+                    .iter()
+                    .flat_map(|output| self.visible_surfaces(output))
+                    .collect(),
+                outputs
+                    .iter()
+                    .flat_map(|output| self.thumbnailed_on(output))
+                    .collect(),
+            )
         };
         for (surface, window_state) in &self.toplevels {
             let Some(toplevel) = window_state.window.toplevel() else {
@@ -497,8 +570,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             };
             // Unmapped windows still have to draw their first buffer.
             let suspend = self.is_mapped(surface)
-                && !visible.contains(surface)
-                && !self.is_toplevel_recorded(surface);
+                && should_suspend(
+                    visible.contains(surface),
+                    self.is_toplevel_recorded(surface),
+                    thumbnailed.contains(surface),
+                );
             let changed = toplevel.with_pending_state(|pending| {
                 if pending.states.contains(xdg_toplevel::State::Suspended) == suspend {
                     return false;
@@ -810,9 +886,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.update_idle_inhibit();
     }
 
-    /// Push the preferred fractional scale to `surface` (no-op for surfaces
-    /// without the object); the module only sends the event when it changes.
-    fn push_fractional_scale(&self, surface: &WlSurface, scale: f64) {
+    /// Push the output's scale to `surface`: exactly, to a client with the
+    /// fractional-scale object, and as [`buffer_scale`] to one on
+    /// `wl_surface` version 6. Each is only sent when it changes.
+    fn push_preferred_scale(&self, surface: &WlSurface, scale: f64) {
         if !surface.is_alive() {
             return;
         }
@@ -820,23 +897,24 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             with_fractional_scale(states, |fractional_scale| {
                 fractional_scale.set_preferred_scale(scale);
             });
+            send_surface_state(surface, states, buffer_scale(scale), Transform::Normal);
         });
     }
 
-    /// The topmost window currently in `Fullscreen` mode, if any. While one is
-    /// active it is rendered above the top layer and keeps keyboard focus.
+    /// The active window if it is in `Fullscreen` mode. It keeps keyboard
+    /// focus against ordinary focus changes; a fullscreen window that stopped
+    /// being active (a shell switch) blocks nothing.
     pub fn active_fullscreen_window(&self) -> Option<Window> {
+        let active = active_if_fullscreen(self.active_window.clone(), |surface| {
+            self.toplevels
+                .get(surface)
+                .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
+        })?;
+        let ws = self.toplevels.get(&active)?;
         self.space
             .elements()
-            .rev()
-            .find(|window| {
-                window.toplevel().is_some_and(|toplevel| {
-                    self.toplevels
-                        .get(toplevel.wl_surface())
-                        .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
-                })
-            })
-            .cloned()
+            .any(|window| window == &ws.window)
+            .then(|| ws.window.clone())
     }
 
     /// The toplevel a surface belongs to, through subsurfaces and popups.
@@ -848,16 +926,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         find_popup_root_surface(&self.popups.find_popup(&root)?).ok()
     }
 
-    /// Whether `surface` belongs to a mapped window that no output draws.
+    /// Whether `surface` belongs to a mapped window that no output draws,
+    /// neither as a window nor through a thumbnail.
     pub fn in_hidden_window(&self, surface: &WlSurface) -> bool {
         let Some(toplevel) = self.toplevel_of(surface) else {
             return false;
         };
         self.is_mapped(&toplevel)
-            && !self
-                .space
-                .outputs()
-                .any(|output| self.visible_surfaces(output).contains(&toplevel))
+            && is_hidden(
+                self.space
+                    .outputs()
+                    .any(|output| self.visible_surfaces(output).contains(&toplevel)),
+                self.is_thumbnailed(&toplevel),
+            )
     }
 
     /// Recompute keyboard focus from the layer-shell priority list and apply it
@@ -964,4 +1045,80 @@ pub fn client_is_unrestricted(client: &Client) -> bool {
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+}
+
+/// The active window, if it is fullscreen.
+fn active_if_fullscreen<S>(active: Option<S>, is_fullscreen: impl Fn(&S) -> bool) -> Option<S> {
+    active.filter(|surface| is_fullscreen(surface))
+}
+
+/// Whether a mapped toplevel gets xdg `Suspended`: nothing shows or records it.
+fn should_suspend(visible: bool, recorded: bool, thumbnailed: bool) -> bool {
+    !visible && !recorded && !thumbnailed
+}
+
+/// The whole buffer scale for an output `scale`: the next whole number at
+/// or above it, so a client draws at least as sharp as the output and is
+/// scaled down, never up.
+fn buffer_scale(scale: f64) -> i32 {
+    scale.ceil().max(1.0) as i32
+}
+
+/// Whether a mapped toplevel's commits can skip the output render.
+fn is_hidden(visible: bool, thumbnailed: bool) -> bool {
+    !visible && !thumbnailed
+}
+
+/// The output whose frames a surface follows: where it was presented, else
+/// `output` when a thumbnail there shows it.
+fn frame_output<O: Clone>(scanout: Option<O>, thumbnailed: bool, output: &O) -> Option<O> {
+    scanout.or_else(|| thumbnailed.then(|| output.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_buffer_scale_rounds_up_to_a_whole_number() {
+        assert_eq!(buffer_scale(1.0), 1);
+        assert_eq!(buffer_scale(2.0), 2);
+        assert_eq!(buffer_scale(2.25), 3);
+        assert_eq!(buffer_scale(2.61), 3);
+        assert_eq!(buffer_scale(0.5), 1);
+    }
+
+    #[test]
+    fn only_an_active_fullscreen_window_blocks_focus() {
+        let fullscreen = |w: &u32| *w == 1;
+        // The fullscreen window stopped being active (shell switch): no block.
+        assert_eq!(active_if_fullscreen(Some(2), fullscreen), None);
+        assert_eq!(active_if_fullscreen(None, fullscreen), None);
+        // The fullscreen window is the active one: it blocks.
+        assert_eq!(active_if_fullscreen(Some(1), fullscreen), Some(1));
+    }
+
+    #[test]
+    fn thumbnailed_window_is_not_suspended() {
+        assert!(should_suspend(false, false, false));
+        assert!(!should_suspend(false, false, true));
+        assert!(!should_suspend(true, false, false));
+        assert!(!should_suspend(false, true, false));
+    }
+
+    #[test]
+    fn thumbnailed_commit_triggers_redraw() {
+        assert!(is_hidden(false, false));
+        assert!(!is_hidden(false, true));
+        assert!(!is_hidden(true, false));
+    }
+
+    #[test]
+    fn thumbnailed_window_gets_frame_callbacks() {
+        assert_eq!(frame_output(None, true, &1), Some(1));
+        assert_eq!(frame_output(None, false, &1), None);
+        assert_eq!(frame_output(Some(1), false, &1), Some(1));
+        // A window presented elsewhere keeps that output's pacing.
+        assert_eq!(frame_output(Some(2), true, &1), Some(2));
+    }
 }

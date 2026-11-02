@@ -213,6 +213,7 @@ dependencies = [
 name = "compositor"
 version = "1.0.0"
 dependencies = [
+ "bitflags",
  "mxconfig",
  "sd-notify",
  "smithay",
@@ -220,6 +221,9 @@ dependencies = [
  "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
+ "wayland-backend",
+ "wayland-scanner",
+ "wayland-server",
  "xcursor",
 ]
 

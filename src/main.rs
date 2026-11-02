@@ -5,6 +5,7 @@ mod drawing;
 mod handlers;
 mod input;
 mod layout;
+mod protocols;
 mod render;
 mod state;
 

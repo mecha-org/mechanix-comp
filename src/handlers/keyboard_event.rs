@@ -22,6 +22,15 @@ use crate::state::State;
 pub const REPEAT_DELAY: Duration = Duration::from_millis(400);
 /// Interval between subsequent repeats.
 pub const REPEAT_INTERVAL: Duration = Duration::from_millis(120);
+/// Longest continuous repeat; a key held longer (stuck, or pressed in a
+/// pocket) stops repeating until it is pressed again.
+pub const REPEAT_MAX: Duration = Duration::from_secs(10);
+
+/// Whether a repeat that started (first repeat sent) at `first` should
+/// stop at `now` instead of sending another activation.
+fn repeat_expired(first: Duration, now: Duration) -> bool {
+    now.saturating_sub(first) >= REPEAT_MAX
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AccelMods {
@@ -179,11 +188,21 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             old.accelerator_released_event(old_id, time);
         }
         let timer_owner = owner.clone();
+        let mut first = None;
         let token = self.loop_handle.insert_source(
             Timer::from_duration(REPEAT_DELAY),
             move |_, _, state| {
-                let now = Duration::from(state.clock.now()).as_millis() as u32;
-                timer_owner.accelerator_activated_event(action_id, now);
+                let now = Duration::from(state.clock.now());
+                let first = *first.get_or_insert(now);
+                if repeat_expired(first, now) {
+                    // Stop quietly: the key is still down, so no release.
+                    // A replaced or cancelled repeat removed this timer, so
+                    // the active repeat is this one; forget it without
+                    // removing the source twice.
+                    state.keyboard_grabs.repeat = None;
+                    return TimeoutAction::Drop;
+                }
+                timer_owner.accelerator_activated_event(action_id, now.as_millis() as u32);
                 TimeoutAction::ToDuration(REPEAT_INTERVAL)
             },
         );
@@ -300,6 +319,17 @@ impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivateKeyboardEvent, State<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeat_stops_after_max() {
+        let first = Duration::from_secs(100);
+        assert!(!repeat_expired(first, first));
+        assert!(!repeat_expired(first, first + REPEAT_MAX - REPEAT_INTERVAL));
+        assert!(repeat_expired(first, first + REPEAT_MAX));
+        assert!(repeat_expired(first, first + REPEAT_MAX + REPEAT_INTERVAL));
+        // A clock that steps back never ends the repeat early.
+        assert!(!repeat_expired(first, first - REPEAT_INTERVAL));
+    }
 
     fn vol() -> Accelerator {
         parse_accelerator("XF86AudioRaiseVolume").unwrap()

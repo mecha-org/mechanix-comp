@@ -10,6 +10,7 @@ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::{Client, DataInit, DisplayHandle, Resource};
 use smithay::wayland::Dispatch2;
+use tracing::warn;
 
 use crate::backend::Backend;
 use crate::protocols::phosh_private::phosh_private_keyboard_event::{
@@ -171,7 +172,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return false;
         };
         owner.accelerator_activated_event(action_id, time);
-        self.cancel_repeat();
+        // A new grabbed press replaces a running repeat; that key is done.
+        if let Some((old, old_id)) = self.cancel_repeat()
+            && old.version() >= 7
+        {
+            old.accelerator_released_event(old_id, time);
+        }
         let timer_owner = owner.clone();
         let token = self.loop_handle.insert_source(
             Timer::from_duration(REPEAT_DELAY),
@@ -181,13 +187,16 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 TimeoutAction::ToDuration(REPEAT_INTERVAL)
             },
         );
-        if let Ok(token) = token {
-            self.keyboard_grabs.repeat = Some(Repeat {
-                keysym,
-                owner,
-                action_id,
-                token,
-            });
+        match token {
+            Ok(token) => {
+                self.keyboard_grabs.repeat = Some(Repeat {
+                    keysym,
+                    owner,
+                    action_id,
+                    token,
+                });
+            }
+            Err(e) => warn!(err = %e, "Failed to start accelerator repeat timer"),
         }
         true
     }
@@ -204,6 +213,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         {
             owner.accelerator_released_event(action_id, time);
         }
+    }
+
+    /// Outputs blanked: the wake-on-input path eats the next event, possibly
+    /// the key's release, so end any repeat now (reporting the release) and
+    /// forget its suppressed keysym.
+    pub fn end_grab_repeat(&mut self) {
+        let Some(keysym) = self.keyboard_grabs.repeat.as_ref().map(|r| r.keysym) else {
+            return;
+        };
+        let now = Duration::from(self.clock.now()).as_millis() as u32;
+        self.grab_release(keysym, now);
+        self.suppressed_keys.retain(|k| *k != keysym);
     }
 
     fn drop_keyboard_owner(&mut self, owner: &PhoshPrivateKeyboardEvent) {

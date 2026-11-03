@@ -105,6 +105,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             self.backend_data.schedule_render(output);
         } else {
             self.output_power.off.insert(output.clone());
+            // The wake-on-input path eats the next event, maybe a key release.
+            self.end_grab_repeat();
             self.release_fifo_barriers(output);
             self.maybe_send_locked();
         }

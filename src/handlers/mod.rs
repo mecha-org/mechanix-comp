@@ -6,9 +6,8 @@ pub mod drm_syncobj;
 pub mod foreign_toplevel;
 pub mod fractional_scale;
 pub mod idle;
-#[allow(dead_code)] // wired to the protocol resources in Task 3
-pub mod keyboard_event;
 pub mod image_copy_capture;
+pub mod keyboard_event;
 pub mod layer_shell;
 pub mod output;
 pub mod output_power;

@@ -5,6 +5,17 @@
 use std::time::Duration;
 
 use smithay::input::keyboard::{Keysym, ModifiersState, xkb};
+use smithay::reexports::calloop::RegistrationToken;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::reexports::wayland_server::backend::ClientId;
+use smithay::reexports::wayland_server::{Client, DataInit, DisplayHandle, Resource};
+use smithay::wayland::Dispatch2;
+
+use crate::backend::Backend;
+use crate::protocols::phosh_private::phosh_private_keyboard_event::{
+    self, Error as ProtoError, PhoshPrivateKeyboardEvent,
+};
+use crate::state::State;
 
 /// Delay before the first repeat of a held grabbed key.
 pub const REPEAT_DELAY: Duration = Duration::from_millis(400);
@@ -63,6 +74,7 @@ pub fn parse_accelerator(s: &str) -> Option<Accelerator> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrabError {
+    #[allow(dead_code)] // parsing rejects bad keysyms before `grab`
     InvalidKeysym,
     AlreadySubscribed,
 }
@@ -118,6 +130,149 @@ impl<C: PartialEq> Grabs<C> {
             .iter()
             .find(|(_, _, a)| a.keysym == keysym && a.mods == mods)
             .map(|(o, id, _)| (o, *id))
+    }
+}
+
+/// A held grabbed key being repeated from the compositor.
+struct Repeat {
+    keysym: Keysym,
+    owner: PhoshPrivateKeyboardEvent,
+    action_id: u32,
+    token: RegistrationToken,
+}
+
+/// Accelerator grabs of all `phosh_private_keyboard_event` resources plus the
+/// one active repeat.
+#[derive(Default)]
+pub struct KeyboardGrabState {
+    pub grabs: Grabs<PhoshPrivateKeyboardEvent>,
+    repeat: Option<Repeat>,
+}
+
+/// Marker for `phosh_private_keyboard_event` resources.
+pub struct KeyboardEventUdata;
+
+impl<BackendData: Backend + 'static> State<BackendData> {
+    fn cancel_repeat(&mut self) -> Option<(PhoshPrivateKeyboardEvent, u32)> {
+        let r = self.keyboard_grabs.repeat.take()?;
+        self.loop_handle.remove(r.token);
+        Some((r.owner, r.action_id))
+    }
+
+    /// A key was pressed: if it is a grabbed accelerator, notify the owner,
+    /// start the repeat and return true (the key must not reach clients).
+    pub fn grab_press(&mut self, keysym: Keysym, mods: AccelMods, time: u32) -> bool {
+        let Some((owner, action_id)) = self
+            .keyboard_grabs
+            .grabs
+            .lookup(keysym, mods)
+            .map(|(o, id)| (o.clone(), id))
+        else {
+            return false;
+        };
+        owner.accelerator_activated_event(action_id, time);
+        self.cancel_repeat();
+        let timer_owner = owner.clone();
+        let token = self.loop_handle.insert_source(
+            Timer::from_duration(REPEAT_DELAY),
+            move |_, _, state| {
+                let now = Duration::from(state.clock.now()).as_millis() as u32;
+                timer_owner.accelerator_activated_event(action_id, now);
+                TimeoutAction::ToDuration(REPEAT_INTERVAL)
+            },
+        );
+        if let Ok(token) = token {
+            self.keyboard_grabs.repeat = Some(Repeat {
+                keysym,
+                owner,
+                action_id,
+                token,
+            });
+        }
+        true
+    }
+
+    /// A key was released: end its repeat and report the release.
+    pub fn grab_release(&mut self, keysym: Keysym, time: u32) {
+        if self
+            .keyboard_grabs
+            .repeat
+            .as_ref()
+            .is_some_and(|r| r.keysym == keysym)
+            && let Some((owner, action_id)) = self.cancel_repeat()
+            && owner.version() >= 7
+        {
+            owner.accelerator_released_event(action_id, time);
+        }
+    }
+
+    fn drop_keyboard_owner(&mut self, owner: &PhoshPrivateKeyboardEvent) {
+        self.keyboard_grabs.grabs.drop_owner(owner);
+        if self
+            .keyboard_grabs
+            .repeat
+            .as_ref()
+            .is_some_and(|r| r.owner == *owner)
+        {
+            self.cancel_repeat();
+        }
+    }
+}
+
+impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivateKeyboardEvent, State<BackendData>>
+    for KeyboardEventUdata
+{
+    fn request(
+        &self,
+        state: &mut State<BackendData>,
+        _client: &Client,
+        resource: &PhoshPrivateKeyboardEvent,
+        request: phosh_private_keyboard_event::Request,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, State<BackendData>>,
+    ) {
+        use phosh_private_keyboard_event::Request;
+        match request {
+            Request::GrabAcceleratorRequest { accelerator } => {
+                let Some(acc) = parse_accelerator(&accelerator) else {
+                    resource.grab_failed_event(accelerator, ProtoError::InvalidKeysym as u32);
+                    return;
+                };
+                match state.keyboard_grabs.grabs.grab(resource.clone(), acc) {
+                    Ok(id) => resource.grab_success_event(accelerator, id),
+                    Err(GrabError::AlreadySubscribed) => resource
+                        .grab_failed_event(accelerator, ProtoError::AlreadySubscribed as u32),
+                    Err(GrabError::InvalidKeysym) => {
+                        resource.grab_failed_event(accelerator, ProtoError::InvalidKeysym as u32)
+                    }
+                }
+            }
+            Request::UngrabAcceleratorRequest { action_id } => {
+                if state.keyboard_grabs.grabs.ungrab(resource, action_id) {
+                    if state
+                        .keyboard_grabs
+                        .repeat
+                        .as_ref()
+                        .is_some_and(|r| r.owner == *resource && r.action_id == action_id)
+                    {
+                        state.cancel_repeat();
+                    }
+                    resource.ungrab_success_event(action_id);
+                } else {
+                    resource.ungrab_failed_event(action_id, ProtoError::InvalidArgument as u32);
+                }
+            }
+            Request::Destroy => state.drop_keyboard_owner(resource),
+        }
+    }
+
+    fn destroyed(
+        &self,
+        state: &mut State<BackendData>,
+        _client: ClientId,
+        resource: &PhoshPrivateKeyboardEvent,
+    ) {
+        state.drop_keyboard_owner(resource);
     }
 }
 

@@ -1,6 +1,7 @@
 //! Phosh's `phosh_private` v8: thumbnail views of toplevels drawn onto a
-//! layer surface. Only `add_thumbnail_view` is served; every other request is
-//! a protocol error. A thumbnail whose toplevel handle or layer surface is
+//! layer surface. `add_thumbnail_view` and `get_keyboard_event` (accelerator
+//! grabs, see `keyboard_event`) are served; every other request is a protocol
+//! error. A thumbnail whose toplevel handle or layer surface is
 //! already gone is inert: never stored, never drawn, its requests no-ops.
 
 use std::collections::HashSet;
@@ -14,6 +15,7 @@ use smithay::reexports::wayland_server::{
 use smithay::wayland::{Dispatch2, GlobalDispatch2};
 
 use crate::backend::Backend;
+use crate::handlers::keyboard_event::KeyboardEventUdata;
 use crate::protocols::phosh_private::phosh_private::{self, PhoshPrivate};
 use crate::protocols::phosh_private::phosh_private_thumbnail::{self, PhoshPrivateThumbnail};
 use crate::state::State;
@@ -289,8 +291,8 @@ impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivate, State<BackendData>>
                 "get_thumbnail"
             }
             phosh_private::Request::GetKeyboardEvent { id } => {
-                data_init.init(id, UnsupportedUdata);
-                "get_keyboard_event"
+                data_init.init(id, KeyboardEventUdata);
+                return;
             }
             phosh_private::Request::GetStartupTracker { id } => {
                 data_init.init(id, UnsupportedUdata);

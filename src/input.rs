@@ -10,7 +10,7 @@ use smithay::{
     input::{
         keyboard::{FilterResult, Keysym, ModifiersState, keysyms, xkb},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
-        touch::{DownEvent, UpEvent},
+        touch::{DownEvent, TouchDownGrab, UpEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER},
@@ -231,7 +231,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         };
 
-        let under = self.surface_under(touch_location);
+        // The touch-down grab keeps the surface first touched and ignores the
+        // focus, so only other grabs (drag-and-drop) need the hit test.
+        let keeps_focus = handle
+            .with_grab(|_, grab| grab.is::<TouchDownGrab<Self>>())
+            .unwrap_or(false);
+        let under = (!keeps_focus)
+            .then(|| self.surface_under(touch_location))
+            .flatten();
         handle.motion(
             self,
             under,

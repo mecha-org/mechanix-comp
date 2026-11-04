@@ -29,7 +29,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let output = self.space.outputs().next()?;
+        let output = self
+            .space
+            .output_under(pos)
+            .next()
+            .or_else(|| self.space.outputs().next())?;
         let output_geo = self.space.output_geometry(output)?;
 
         if self.is_locked() {

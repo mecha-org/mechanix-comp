@@ -46,10 +46,8 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {
-        if self.is_mapped(surface.wl_surface())
-            && let Some(output) = self.primary_output()
-        {
-            self.apply_layout(&output);
+        if self.is_mapped(surface.wl_surface()) {
+            self.relayout(surface.wl_surface());
         }
     }
 
@@ -136,9 +134,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        if let Some(output) = self.primary_output() {
-            self.apply_layout(&output);
-        }
+        self.relayout(surface.wl_surface());
         surface.send_configure();
     }
 
@@ -155,9 +151,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        if let Some(output) = self.primary_output() {
-            self.apply_layout(&output);
-        }
+        self.relayout(surface.wl_surface());
         surface.send_configure();
     }
 
@@ -213,9 +207,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.layer_shell_on_demand_focus = None;
 
         if !already {
-            if let Some(output) = self.primary_output() {
-                self.apply_layout(&output);
-            }
+            self.relayout(&focused_surface);
             let group = self.active_group();
             self.set_activated_group(&group);
         }
@@ -263,10 +255,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     fn map_toplevel(&mut self, surface: &WlSurface, window: &Window) {
-        let output = self.space.outputs().next().cloned();
+        let output = self.output_of(surface);
         let loc = output
             .as_ref()
-            .map(|o| layer_map_for_output(o).non_exclusive_zone().loc)
+            .and_then(|o| self.output_areas(o))
+            .map(|areas| areas.zone.loc)
             .unwrap_or_default();
 
         self.toplevels.get_mut(surface).unwrap().output = output.clone();
@@ -311,10 +304,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Reposition a mapped window, or reply to one that can't be laid out yet.
     fn reply_placement(&mut self, surface: &WlSurface, window: &Window) {
-        if self.is_mapped(surface)
-            && let Some(output) = self.primary_output()
-        {
-            self.apply_layout(&output);
+        if self.is_mapped(surface) {
+            self.relayout(surface);
         } else if window
             .toplevel()
             .is_some_and(|toplevel| toplevel.is_initial_configure_sent())
@@ -330,14 +321,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         };
         let mode = self.placement_mode(surface, toplevel);
         self.toplevels.get_mut(surface).unwrap().mode = mode;
-        let area = if mode == WindowMode::Fullscreen {
-            self.primary_output()
-                .and_then(|output| self.space.output_geometry(&output))
-        } else {
-            self.primary_output()
-                .map(|output| layer_map_for_output(&output).non_exclusive_zone())
-        };
-        if let Some(area) = area {
+        if let Some(area) = self.placement_area_of(surface, mode) {
             self.set_toplevel_placement(toplevel, area, mode);
         }
         toplevel.send_pending_configure();
@@ -350,18 +334,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let Some(window) = self.toplevels.get(&root).map(|ws| &ws.window) else {
             return;
         };
-
-        let Some(output) = self.space.outputs().next() else {
-            return;
-        };
-        let Some(output_geo) = self.space.output_geometry(output) else {
+        let Some(toplevel) = window.toplevel() else {
             return;
         };
         let Some(window_geo) = self.space.element_geometry(window) else {
             return;
         };
 
-        let mut target = output_geo;
+        // Popups stay within their window's area, clear of the bar and keyboard.
+        let mode = self.placement_mode(&root, toplevel);
+        let Some(mut target) = self.placement_area_of(&root, mode) else {
+            return;
+        };
         target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
         target.loc -= window_geo.loc;
 
@@ -423,11 +407,8 @@ pub fn handle_commit<BackendData: Backend + 'static>(
             (true, true) => {
                 // Keep floating windows centred.
                 let ws = &state.toplevels[surface];
-                if ws.mode == WindowMode::Floating
-                    && ws.layout_size != window.geometry().size
-                    && let Some(output) = state.primary_output()
-                {
-                    state.apply_layout(&output);
+                if ws.mode == WindowMode::Floating && ws.layout_size != window.geometry().size {
+                    state.relayout(surface);
                 }
             }
         }

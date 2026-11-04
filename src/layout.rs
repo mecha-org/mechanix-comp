@@ -36,6 +36,25 @@ fn centered_loc(
     ))
 }
 
+/// An output's work zone (minus exclusive zones) and whole area, global.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutputAreas {
+    pub zone: Rectangle<i32, Logical>,
+    pub full: Rectangle<i32, Logical>,
+}
+
+impl OutputAreas {
+    /// The area `mode` places a window in: the whole output when fullscreen,
+    /// else the work zone. Dialogs use the work zone even over a fullscreen
+    /// window, so the bar and keyboard never cover them.
+    pub(crate) fn for_mode(&self, mode: WindowMode) -> Rectangle<i32, Logical> {
+        match mode {
+            WindowMode::Fullscreen => self.full,
+            WindowMode::Maximized | WindowMode::Floating => self.zone,
+        }
+    }
+}
+
 fn ancestor_chain(
     focused: &WlSurface,
     parent_of: impl Fn(&WlSurface) -> Option<WlSurface>,
@@ -80,6 +99,23 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         });
     }
 
+    /// `output`'s work zone and whole area, both in global coordinates.
+    pub(crate) fn output_areas(&self, output: &Output) -> Option<OutputAreas> {
+        let full = self.space.output_geometry(output)?;
+        let mut zone = layer_map_for_output(output).non_exclusive_zone();
+        zone.loc += full.loc;
+        Some(OutputAreas { zone, full })
+    }
+
+    /// The area `mode` places `surface` in on its window's output.
+    pub(crate) fn placement_area_of(
+        &self,
+        surface: &WlSurface,
+        mode: WindowMode,
+    ) -> Option<Rectangle<i32, Logical>> {
+        Some(self.output_areas(&self.output_of(surface)?)?.for_mode(mode))
+    }
+
     /// The placement a toplevel's mode implies: fullscreen, dialog, or maximized.
     pub(crate) fn placement_mode(
         &self,
@@ -112,9 +148,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.toplevels.get(surface).map(|ws| ws.window.clone())
     }
 
-    /// The single output of the space, if any.
-    pub fn primary_output(&self) -> Option<Output> {
-        self.space.outputs().next().cloned()
+    /// The output `surface`'s window is on; for one not yet placed, its
+    /// nearest placed ancestor's, else the first output.
+    pub(crate) fn output_of(&self, surface: &WlSurface) -> Option<Output> {
+        std::iter::successors(Some(surface.clone()), |s| self.parent_of(s))
+            .find_map(|s| self.toplevels.get(&s)?.output.clone())
+            .or_else(|| self.space.outputs().next().cloned())
+    }
+
+    /// Lay out the output `surface`'s window is on.
+    pub(crate) fn relayout(&mut self, surface: &WlSurface) {
+        if let Some(output) = self.output_of(surface) {
+            self.apply_layout(&output);
+        }
     }
 
     /// Give `output` `mode`, if any, and its scale, then refit everything on it.
@@ -145,7 +191,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Raise the active group, then size, position and configure `output`'s windows.
     pub fn apply_layout(&mut self, output: &Output) {
-        let zone = layer_map_for_output(output).non_exclusive_zone();
         if let Some(focused) = self.active_window.clone() {
             for surface in ancestor_chain(&focused, |s| self.parent_of(s)) {
                 if let Some(window) = self.window_for(&surface) {
@@ -164,39 +209,22 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             })
             .cloned()
             .collect();
-        let output_geo = self.space.output_geometry(output);
+        let Some(areas) = self.output_areas(output) else {
+            self.schedule_render();
+            return;
+        };
         for window in &windows {
             let Some(toplevel) = window.toplevel() else {
                 continue;
             };
             let surface = toplevel.wl_surface();
 
-            // Fullscreen covers the output; dialogs center over their parent; else the work zone.
+            // Dialogs are centered in their area, pinned to its top-left when too big.
             let mode = self.placement_mode(surface, toplevel);
-            let (area, loc) = match mode {
-                WindowMode::Fullscreen => {
-                    let Some(geo) = output_geo else {
-                        continue;
-                    };
-                    (geo, geo.loc)
-                }
-                WindowMode::Floating => {
-                    let loc = toplevel
-                        .parent()
-                        .and_then(|parent| self.window_for(&parent))
-                        .and_then(|parent| self.space.element_geometry(&parent))
-                        .map(|parent_geo| {
-                            Point::from((
-                                parent_geo.loc.x
-                                    + (parent_geo.size.w - window.geometry().size.w) / 2,
-                                parent_geo.loc.y
-                                    + (parent_geo.size.h - window.geometry().size.h) / 2,
-                            ))
-                        })
-                        .unwrap_or_else(|| centered_loc(zone, window.geometry()));
-                    (zone, loc)
-                }
-                WindowMode::Maximized => (zone, zone.loc),
+            let area = areas.for_mode(mode);
+            let loc = match mode {
+                WindowMode::Floating => centered_loc(area, window.geometry()),
+                WindowMode::Fullscreen | WindowMode::Maximized => area.loc,
             };
 
             if let Some(ws) = self.toplevels.get_mut(surface) {

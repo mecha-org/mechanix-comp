@@ -83,6 +83,7 @@ use crate::backend::Backend;
 use crate::config::Config;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::image_copy_capture::CaptureSession;
+use crate::handlers::keyboard_event::KeyboardGrabState;
 use crate::handlers::output_power::OutputPowerManagerState;
 use crate::handlers::thumbnail_view::ThumbnailViewState;
 
@@ -201,6 +202,8 @@ pub struct State<BackendData: Backend + 'static> {
     pub capture_sessions: Vec<CaptureSession>,
     /// `phosh_private` thumbnail views drawn onto layer surfaces.
     pub thumbnail_view: ThumbnailViewState,
+    /// `phosh_private_keyboard_event` accelerator grabs and their repeat.
+    pub keyboard_grabs: KeyboardGrabState,
 
     pub seat: Seat<Self>,
     pub suppressed_keys: Vec<Keysym>,
@@ -335,6 +338,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             image_copy_capture_state,
             capture_sessions: Vec::new(),
             thumbnail_view,
+            keyboard_grabs: KeyboardGrabState::default(),
             idle_inhibitors: HashMap::new(),
             display_handle: dh,
             space,

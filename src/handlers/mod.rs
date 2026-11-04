@@ -7,6 +7,7 @@ pub mod foreign_toplevel;
 pub mod fractional_scale;
 pub mod idle;
 pub mod image_copy_capture;
+pub mod keyboard_event;
 pub mod layer_shell;
 pub mod output;
 pub mod output_power;

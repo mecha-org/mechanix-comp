@@ -118,7 +118,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 state,
                 serial,
                 time,
-                |_, modifiers, handle| {
+                |state_, modifiers, handle| {
+                    // `modified_sym` as-is: shifted-letter grabs like
+                    // `<Shift>a` may not match; only volume keys matter now.
                     let keysym = handle.modified_sym();
 
                     debug!(
@@ -134,6 +136,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     // so that we can decide on a release if the key
                     // should be forwarded to the client or not.
                     if let KeyState::Pressed = state {
+                        // Accelerator grabs win over shortcuts, shortcut
+                        // inhibitors and the lock screen.
+                        if state_.grab_press(keysym, (&*modifiers).into(), time.millis()) {
+                            if !suppressed_keys.contains(&keysym) {
+                                suppressed_keys.push(keysym);
+                            }
+                            return FilterResult::Intercept(KeyAction::None);
+                        }
                         let action = process_keyboard_shortcut(*modifiers, keysym);
 
                         if action.is_some() {
@@ -144,6 +154,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                             .map(FilterResult::Intercept)
                             .unwrap_or(FilterResult::Forward)
                     } else {
+                        state_.grab_release(keysym, time.millis());
                         let suppressed = suppressed_keys.contains(&keysym);
                         if suppressed {
                             suppressed_keys.retain(|k| *k != keysym);

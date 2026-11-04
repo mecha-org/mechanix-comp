@@ -16,7 +16,6 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 };
-use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::foreign_toplevel_list::{
     ForeignToplevelHandle, ForeignToplevelListHandler, ForeignToplevelListState,
@@ -482,8 +481,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// wlr `activate` request: raise the toplevel and give it keyboard focus,
-    /// even over a fullscreen window (a shell switch is an explicit choice).
+    /// wlr `activate` request: raise the toplevel and make it the active one.
     /// A toplevel with dialogs gets the one [`activation_target`] picks, so
     /// switching back to it does not hide them.
     fn foreign_activate(&mut self, surface: &WlSurface) {
@@ -509,7 +507,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         };
         let window = ws.window.clone();
-        self.focus_window(&window, SERIAL_COUNTER.next_serial(), true);
+        self.focus_window(&window);
     }
 
     /// wlr `close` request: ask the toplevel to close.
@@ -659,12 +657,9 @@ struct Stacked<T> {
     modal: bool,
 }
 
-/// The window a shell's activate of `target` should focus, given every
-/// mapped window back to front. Only the focused window and its ancestors
-/// are shown, so activating a parent would hide its dialogs: a modal
-/// dialog of `target` (or of one of its dialogs) wins, the topmost if
-/// several; otherwise the topmost of `target` and its dialogs, which is
-/// the one focused last, since focusing raises.
+/// The window a shell's activate of `target` focuses, given every mapped
+/// window back to front: `target`'s topmost modal dialog, else `target`.
+/// Plain dialogs stay on screen above it and are focused by a tap.
 fn activation_target<T: Clone + PartialEq>(target: &T, stack: &[Stacked<T>]) -> T {
     let parent_of = |w: &T| {
         stack
@@ -684,15 +679,10 @@ fn activation_target<T: Clone + PartialEq>(target: &T, stack: &[Stacked<T>]) -> 
         }
         false
     };
-    let family = || {
-        stack
-            .iter()
-            .filter(|s| &s.window == target || below_target(s))
-    };
-    family()
-        .filter(|s| s.modal && &s.window != target)
+    stack
+        .iter()
+        .filter(|s| s.modal && below_target(s))
         .last()
-        .or_else(|| family().last())
         .map_or_else(|| target.clone(), |s| s.window.clone())
 }
 
@@ -717,9 +707,9 @@ mod tests {
     }
 
     #[test]
-    fn its_dialog_focused_last_is_focused_again() {
+    fn a_plain_dialog_focused_last_does_not_take_it() {
         let stack = [w(1, None, false), w(2, Some(1), false), w(3, None, false)];
-        assert_eq!(activation_target(&1, &stack), 2);
+        assert_eq!(activation_target(&1, &stack), 1);
     }
 
     #[test]

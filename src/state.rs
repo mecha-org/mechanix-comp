@@ -901,22 +901,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         });
     }
 
-    /// The active window if it is in `Fullscreen` mode. It keeps keyboard
-    /// focus against ordinary focus changes; a fullscreen window that stopped
-    /// being active (a shell switch) blocks nothing.
-    pub fn active_fullscreen_window(&self) -> Option<Window> {
-        let active = active_if_fullscreen(self.active_window.clone(), |surface| {
-            self.toplevels
-                .get(surface)
-                .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
-        })?;
-        let ws = self.toplevels.get(&active)?;
-        self.space
-            .elements()
-            .any(|window| window == &ws.window)
-            .then(|| ws.window.clone())
-    }
-
     /// The toplevel a surface belongs to, through subsurfaces and popups.
     pub fn toplevel_of(&self, surface: &WlSurface) -> Option<WlSurface> {
         let root = root_surface(surface);
@@ -1047,11 +1031,6 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
-/// The active window, if it is fullscreen.
-fn active_if_fullscreen<S>(active: Option<S>, is_fullscreen: impl Fn(&S) -> bool) -> Option<S> {
-    active.filter(|surface| is_fullscreen(surface))
-}
-
 /// Whether a mapped toplevel gets xdg `Suspended`: nothing shows or records it.
 fn should_suspend(visible: bool, recorded: bool, thumbnailed: bool) -> bool {
     !visible && !recorded && !thumbnailed
@@ -1086,16 +1065,6 @@ mod tests {
         assert_eq!(buffer_scale(2.25), 3);
         assert_eq!(buffer_scale(2.61), 3);
         assert_eq!(buffer_scale(0.5), 1);
-    }
-
-    #[test]
-    fn only_an_active_fullscreen_window_blocks_focus() {
-        let fullscreen = |w: &u32| *w == 1;
-        // The fullscreen window stopped being active (shell switch): no block.
-        assert_eq!(active_if_fullscreen(Some(2), fullscreen), None);
-        assert_eq!(active_if_fullscreen(None, fullscreen), None);
-        // The fullscreen window is the active one: it blocks.
-        assert_eq!(active_if_fullscreen(Some(1), fullscreen), Some(1));
     }
 
     #[test]

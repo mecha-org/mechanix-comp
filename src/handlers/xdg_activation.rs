@@ -1,7 +1,6 @@
 use crate::backend::Backend;
 use crate::state::State;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
@@ -24,7 +23,7 @@ impl<BackendData: Backend + 'static> XdgActivationHandler for State<BackendData>
                 .find(|w| w.toplevel().is_some_and(|tl| tl.wl_surface() == &surface))
                 .cloned();
             if let Some(window) = window {
-                self.focus_window(&window, SERIAL_COUNTER.next_serial(), false);
+                self.focus_window(&window);
             }
         }
     }

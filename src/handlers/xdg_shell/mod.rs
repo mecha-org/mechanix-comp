@@ -13,7 +13,7 @@ use smithay::desktop::{
 use smithay::input::{Seat, pointer::Focus};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::{wl_output, wl_seat, wl_surface::WlSurface};
-use smithay::utils::{SERIAL_COUNTER, Serial, Size};
+use smithay::utils::{Serial, Size};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -172,7 +172,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         }
         if let Some(window) = self.apply_mode_request(surface.wl_surface(), WindowMode::Fullscreen)
         {
-            self.focus_window(&window, SERIAL_COUNTER.next_serial(), false);
+            self.focus_window(&window);
         }
     }
 
@@ -190,17 +190,9 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
-    /// Make `window` the active one. A fullscreen window keeps focus against
-    /// everything but `force` (an explicit shell switch), which leaves it
-    /// fullscreen but no longer active.
-    pub fn focus_window(&mut self, window: &Window, serial: Serial, force: bool) {
-        let blocked = self
-            .active_fullscreen_window()
-            .is_some_and(|active| &active != window);
-        if !may_focus(blocked, force) {
-            return;
-        }
-
+    /// Make `window` the active one, raised with its family. The keyboard
+    /// follows unless an `Exclusive` layer holds it, until that layer goes.
+    pub fn focus_window(&mut self, window: &Window) {
         let focused_surface = window.toplevel().unwrap().wl_surface().clone();
         let already = self.active_window.as_ref() == Some(&focused_surface);
         self.active_window = Some(focused_surface.clone());
@@ -211,13 +203,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             let group = self.active_group();
             self.set_activated_group(&group);
         }
-
-        if !self.is_locked() {
-            self.seat
-                .get_keyboard()
-                .unwrap()
-                .set_focus(self, Some(focused_surface), serial);
-        }
+        self.update_keyboard_focus();
     }
 
     /// Set the xdg `activated` state on every toplevel in `group` and clear it
@@ -242,15 +228,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     pub fn focus_topmost(&mut self) {
         let topmost = self.space.elements().last().cloned();
         if let Some(window) = topmost {
-            self.focus_window(&window, SERIAL_COUNTER.next_serial(), false);
+            self.focus_window(&window);
         } else {
             self.active_window = None;
             self.layer_shell_on_demand_focus = None;
-            if !self.is_locked() {
-                let keyboard = self.seat.get_keyboard().unwrap();
-                let serial = SERIAL_COUNTER.next_serial();
-                keyboard.set_focus(self, Option::<WlSurface>::None, serial);
-            }
+            self.update_keyboard_focus();
         }
     }
 
@@ -264,9 +246,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         self.toplevels.get_mut(surface).unwrap().output = output.clone();
         self.space.map_element(window.clone(), loc, false);
-        // A parent mapped after its focused dialog leaves the focus on the dialog.
-        if self.active_fullscreen_window().is_none() && !self.active_group().contains(surface) {
-            self.focus_window(window, SERIAL_COUNTER.next_serial(), false);
+        // A new window takes focus; a parent mapped after its focused dialog
+        // leaves the focus on the dialog.
+        if !self.active_group().contains(surface) {
+            self.focus_window(window);
         } else if let Some(output) = &output {
             self.apply_layout(output);
         }
@@ -414,22 +397,4 @@ pub fn handle_commit<BackendData: Backend + 'static>(
         }
     }
     true
-}
-
-/// Whether focus may move to a window: a fullscreen window blocks it unless forced.
-fn may_focus(fullscreen_blocks: bool, forced: bool) -> bool {
-    !fullscreen_blocks || forced
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn foreign_activate_overrides_fullscreen() {
-        assert!(!may_focus(true, false));
-        assert!(may_focus(true, true));
-        assert!(may_focus(false, false));
-        assert!(may_focus(false, true));
-    }
 }

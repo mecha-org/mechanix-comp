@@ -189,13 +189,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Raise the active group, then size, position and configure `output`'s windows.
+    /// Raise the active family, then size, position and configure `output`'s windows.
     pub fn apply_layout(&mut self, output: &Output) {
-        if let Some(focused) = self.active_window.clone() {
-            for surface in ancestor_chain(&focused, |s| self.parent_of(s)) {
-                if let Some(window) = self.window_for(&surface) {
-                    self.space.raise_element(&window, false);
-                }
+        for surface in self.active_family() {
+            if let Some(window) = self.window_for(&surface) {
+                self.space.raise_element(&window, false);
             }
         }
 
@@ -260,17 +258,52 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .any(|modal| ancestor_chain(modal, |s| self.parent_of(s)).contains(window))
     }
 
-    /// The active group's windows mapped on `output`, the ones it shows.
-    pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
-        let mut visible = self.active_group();
-        visible.retain(|s| self.is_on(s, output));
-        visible
+    /// The focused window's root and all its dialogs, in raise order: a
+    /// dialog above its parent, the focused window's line above its siblings.
+    /// Plain dialogs stay shown while their parent is focused, so a tap
+    /// moves focus between them.
+    pub fn active_family(&self) -> Vec<WlSurface> {
+        let Some(focused) = &self.active_window else {
+            return Vec::new();
+        };
+        let line = self.active_group();
+        let root = self.root_of(focused);
+        let mut family: Vec<_> = self
+            .space
+            .elements()
+            .enumerate()
+            .filter_map(|(z, window)| {
+                let surface = window.toplevel()?.wl_surface().clone();
+                let depth =
+                    std::iter::successors(self.parent_of(&surface), |s| self.parent_of(s)).count();
+                (self.root_of(&surface) == root)
+                    .then(|| (depth, line.contains(&surface), z, surface))
+            })
+            .collect();
+        family.sort_by_key(|(depth, on_line, z, _)| (*depth, *on_line, *z));
+        family.into_iter().map(|(.., surface)| surface).collect()
     }
 
     fn root_of(&self, surface: &WlSurface) -> WlSurface {
         std::iter::successors(Some(surface.clone()), |s| self.parent_of(s))
             .last()
             .unwrap()
+    }
+
+    /// The active family's windows mapped on `output`, the ones it shows.
+    pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
+        let Some(focused) = &self.active_window else {
+            return HashSet::new();
+        };
+        let root = self.root_of(focused);
+        self.space
+            .elements()
+            .filter_map(|window| {
+                let surface = window.toplevel()?.wl_surface();
+                let on = self.toplevels.get(surface)?.output.as_ref() == Some(output);
+                (on && self.root_of(surface) == root).then(|| surface.clone())
+            })
+            .collect()
     }
 
     /// How `output` stacks: whether its shown windows are a fullscreen family,

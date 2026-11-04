@@ -113,6 +113,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Wake every blanked output. Returns true if anything was off, so the
     /// caller can consume the input that woke the panel.
+    // TODO: remove.
     pub fn wake_outputs_if_off(&mut self) -> bool {
         if self.output_power.off.is_empty() {
             return false;

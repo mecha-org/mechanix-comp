@@ -13,7 +13,7 @@ use smithay::desktop::{
 use smithay::input::{Seat, pointer::Focus};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::{wl_output, wl_seat, wl_surface::WlSurface};
-use smithay::utils::{SERIAL_COUNTER, Serial, Size};
+use smithay::utils::{Serial, Size};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -46,10 +46,8 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {
-        if self.is_mapped(surface.wl_surface())
-            && let Some(output) = self.primary_output()
-        {
-            self.apply_layout(&output);
+        if self.is_mapped(surface.wl_surface()) {
+            self.relayout(surface.wl_surface());
         }
     }
 
@@ -136,9 +134,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        if let Some(output) = self.primary_output() {
-            self.apply_layout(&output);
-        }
+        self.relayout(surface.wl_surface());
         surface.send_configure();
     }
 
@@ -155,9 +151,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         ) {
             return;
         }
-        if let Some(output) = self.primary_output() {
-            self.apply_layout(&output);
-        }
+        self.relayout(surface.wl_surface());
         surface.send_configure();
     }
 
@@ -178,7 +172,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
         }
         if let Some(window) = self.apply_mode_request(surface.wl_surface(), WindowMode::Fullscreen)
         {
-            self.focus_window(&window, SERIAL_COUNTER.next_serial(), false);
+            self.focus_window(&window);
         }
     }
 
@@ -196,36 +190,20 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
-    /// Make `window` the active one. A fullscreen window keeps focus against
-    /// everything but `force` (an explicit shell switch), which leaves it
-    /// fullscreen but no longer active.
-    pub fn focus_window(&mut self, window: &Window, serial: Serial, force: bool) {
-        let blocked = self
-            .active_fullscreen_window()
-            .is_some_and(|active| &active != window);
-        if !may_focus(blocked, force) {
-            return;
-        }
-
+    /// Make `window` the active one, raised with its family. The keyboard
+    /// follows unless an `Exclusive` layer holds it, until that layer goes.
+    pub fn focus_window(&mut self, window: &Window) {
         let focused_surface = window.toplevel().unwrap().wl_surface().clone();
         let already = self.active_window.as_ref() == Some(&focused_surface);
         self.active_window = Some(focused_surface.clone());
         self.layer_shell_on_demand_focus = None;
 
         if !already {
-            if let Some(output) = self.primary_output() {
-                self.apply_layout(&output);
-            }
+            self.relayout(&focused_surface);
             let group = self.active_group();
             self.set_activated_group(&group);
         }
-
-        if !self.is_locked() {
-            self.seat
-                .get_keyboard()
-                .unwrap()
-                .set_focus(self, Some(focused_surface), serial);
-        }
+        self.update_keyboard_focus();
     }
 
     /// Set the xdg `activated` state on every toplevel in `group` and clear it
@@ -250,30 +228,28 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     pub fn focus_topmost(&mut self) {
         let topmost = self.space.elements().last().cloned();
         if let Some(window) = topmost {
-            self.focus_window(&window, SERIAL_COUNTER.next_serial(), false);
+            self.focus_window(&window);
         } else {
             self.active_window = None;
             self.layer_shell_on_demand_focus = None;
-            if !self.is_locked() {
-                let keyboard = self.seat.get_keyboard().unwrap();
-                let serial = SERIAL_COUNTER.next_serial();
-                keyboard.set_focus(self, Option::<WlSurface>::None, serial);
-            }
+            self.update_keyboard_focus();
         }
     }
 
     fn map_toplevel(&mut self, surface: &WlSurface, window: &Window) {
-        let output = self.space.outputs().next().cloned();
+        let output = self.output_of(surface);
         let loc = output
             .as_ref()
-            .map(|o| layer_map_for_output(o).non_exclusive_zone().loc)
+            .and_then(|o| self.output_areas(o))
+            .map(|areas| areas.zone.loc)
             .unwrap_or_default();
 
         self.toplevels.get_mut(surface).unwrap().output = output.clone();
         self.space.map_element(window.clone(), loc, false);
-        // A parent mapped after its focused dialog leaves the focus on the dialog.
-        if self.active_fullscreen_window().is_none() && !self.active_group().contains(surface) {
-            self.focus_window(window, SERIAL_COUNTER.next_serial(), false);
+        // A new window takes focus; a parent mapped after its focused dialog
+        // leaves the focus on the dialog.
+        if !self.active_group().contains(surface) {
+            self.focus_window(window);
         } else if let Some(output) = &output {
             self.apply_layout(output);
         }
@@ -311,10 +287,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Reposition a mapped window, or reply to one that can't be laid out yet.
     fn reply_placement(&mut self, surface: &WlSurface, window: &Window) {
-        if self.is_mapped(surface)
-            && let Some(output) = self.primary_output()
-        {
-            self.apply_layout(&output);
+        if self.is_mapped(surface) {
+            self.relayout(surface);
         } else if window
             .toplevel()
             .is_some_and(|toplevel| toplevel.is_initial_configure_sent())
@@ -330,14 +304,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         };
         let mode = self.placement_mode(surface, toplevel);
         self.toplevels.get_mut(surface).unwrap().mode = mode;
-        let area = if mode == WindowMode::Fullscreen {
-            self.primary_output()
-                .and_then(|output| self.space.output_geometry(&output))
-        } else {
-            self.primary_output()
-                .map(|output| layer_map_for_output(&output).non_exclusive_zone())
-        };
-        if let Some(area) = area {
+        if let Some(area) = self.placement_area_of(surface, mode) {
             self.set_toplevel_placement(toplevel, area, mode);
         }
         toplevel.send_pending_configure();
@@ -350,18 +317,18 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let Some(window) = self.toplevels.get(&root).map(|ws| &ws.window) else {
             return;
         };
-
-        let Some(output) = self.space.outputs().next() else {
-            return;
-        };
-        let Some(output_geo) = self.space.output_geometry(output) else {
+        let Some(toplevel) = window.toplevel() else {
             return;
         };
         let Some(window_geo) = self.space.element_geometry(window) else {
             return;
         };
 
-        let mut target = output_geo;
+        // Popups stay within their window's area, clear of the bar and keyboard.
+        let mode = self.placement_mode(&root, toplevel);
+        let Some(mut target) = self.placement_area_of(&root, mode) else {
+            return;
+        };
         target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
         target.loc -= window_geo.loc;
 
@@ -423,32 +390,11 @@ pub fn handle_commit<BackendData: Backend + 'static>(
             (true, true) => {
                 // Keep floating windows centred.
                 let ws = &state.toplevels[surface];
-                if ws.mode == WindowMode::Floating
-                    && ws.layout_size != window.geometry().size
-                    && let Some(output) = state.primary_output()
-                {
-                    state.apply_layout(&output);
+                if ws.mode == WindowMode::Floating && ws.layout_size != window.geometry().size {
+                    state.relayout(surface);
                 }
             }
         }
     }
     true
-}
-
-/// Whether focus may move to a window: a fullscreen window blocks it unless forced.
-fn may_focus(fullscreen_blocks: bool, forced: bool) -> bool {
-    !fullscreen_blocks || forced
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn foreign_activate_overrides_fullscreen() {
-        assert!(!may_focus(true, false));
-        assert!(may_focus(true, true));
-        assert!(may_focus(false, false));
-        assert!(may_focus(false, true));
-    }
 }

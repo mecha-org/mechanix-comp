@@ -10,7 +10,7 @@ use smithay::{
     input::{
         keyboard::{FilterResult, Keysym, ModifiersState, keysyms, xkb},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
-        touch::{DownEvent, UpEvent},
+        touch::{DownEvent, TouchDownGrab, UpEvent},
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Logical, Point, SERIAL_COUNTER},
@@ -29,7 +29,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let output = self.space.outputs().next()?;
+        let output = self
+            .space
+            .output_under(pos)
+            .next()
+            .or_else(|| self.space.outputs().next())?;
         let output_geo = self.space.output_geometry(output)?;
 
         if self.is_locked() {
@@ -50,7 +54,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
 
         let visible = self.visible_surfaces(output);
-        let order = StackingOrder::new(&self.space, output, &self.toplevels, &visible);
+        let mode = self.stack_mode(output);
+        let order = StackingOrder::new(&self.space, output, &visible, mode);
         for stacked in order.iter() {
             let Some(found) = stacked.surface_under(pos) else {
                 continue;
@@ -68,7 +73,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         None
     }
 
-    fn process_common_key_action(&mut self, action: KeyAction) {
+    pub(crate) fn process_common_key_action(&mut self, action: KeyAction) {
         match action {
             KeyAction::None => (),
 
@@ -94,7 +99,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    fn keyboard_key_to_action<B: InputBackend>(&mut self, evt: B::KeyboardKeyEvent) -> KeyAction {
+    pub(crate) fn keyboard_key_to_action<B: InputBackend>(
+        &mut self,
+        evt: B::KeyboardKeyEvent,
+    ) -> KeyAction {
         let keycode = evt.key_code();
         let state = evt.state();
         debug!(?keycode, ?state, "key");
@@ -223,7 +231,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         };
 
-        let under = self.surface_under(touch_location);
+        // The touch-down grab keeps the surface first touched and ignores the
+        // focus, so only other grabs (drag-and-drop) need the hit test.
+        let keeps_focus = handle
+            .with_grab(|_, grab| grab.is::<TouchDownGrab<Self>>())
+            .unwrap_or(false);
+        let under = (!keeps_focus)
+            .then(|| self.surface_under(touch_location))
+            .flatten();
         handle.motion(
             self,
             under,
@@ -289,20 +304,27 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .toplevel_of(&surface)
             .and_then(|s| self.toplevels.get(&s))
         {
-            self.focus_window(&ws.window.clone(), serial, false);
+            self.focus_window(&ws.window.clone());
         }
     }
 
-    pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
-        // Wake blanked outputs on any input; consume the event that woke them.
+    /// Note an input event as user activity. True when it woke blanked
+    /// outputs, which consumes it.
+    pub(crate) fn note_input(&mut self) -> bool {
         if self.wake_outputs_if_off() {
+            return true;
+        }
+        // Reset the idle-notify timers so `swayidle`-style clients don't go
+        // idle while the user is using the compositor. The notifier itself
+        // keeps inhibited seats (zwp-idle-inhibit-v1) from idling.
+        self.idle_notifier_state.notify_activity(&self.seat);
+        false
+    }
+
+    pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        if self.note_input() {
             return;
         }
-        // Any input event counts as user activity: reset the idle-notify
-        // timers so `swayidle`-style clients don't go idle while the user is
-        // using the compositor. The notifier itself keeps inhibited seats
-        // (zwp-idle-inhibit-v1) from idling.
-        self.idle_notifier_state.notify_activity(&self.seat);
         match event {
             InputEvent::Keyboard { event, .. } => match self.keyboard_key_to_action::<I>(event) {
                 // TODO Separate for different backends e.g. VtSwitch
@@ -443,7 +465,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
 /// Possible results of a keyboard action
 #[derive(Debug)]
-enum KeyAction {
+pub(crate) enum KeyAction {
     /// Quit the compositor
     Quit,
     /// Trigger a vt-switch

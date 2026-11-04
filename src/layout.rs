@@ -1,7 +1,7 @@
 //! Comet layout: where windows go, which are shown, and the stacking order
 //! rendering and hit-testing share.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::MutexGuard;
 
 use smithay::desktop::{
@@ -20,7 +20,7 @@ use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::backend::Backend;
 use crate::state::State;
-use crate::state::{WindowMode, WindowState};
+use crate::state::WindowMode;
 
 pub fn is_dialog(toplevel: &ToplevelSurface) -> bool {
     toplevel.parent().is_some()
@@ -34,6 +34,25 @@ fn centered_loc(
         zone.loc.x + (zone.size.w - geo.size.w).max(0) / 2,
         zone.loc.y + (zone.size.h - geo.size.h).max(0) / 2,
     ))
+}
+
+/// An output's work zone (minus exclusive zones) and whole area, global.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutputAreas {
+    pub zone: Rectangle<i32, Logical>,
+    pub full: Rectangle<i32, Logical>,
+}
+
+impl OutputAreas {
+    /// The area `mode` places a window in: the whole output when fullscreen,
+    /// else the work zone. Dialogs use the work zone even over a fullscreen
+    /// window, so the bar and keyboard never cover them.
+    pub(crate) fn for_mode(&self, mode: WindowMode) -> Rectangle<i32, Logical> {
+        match mode {
+            WindowMode::Fullscreen => self.full,
+            WindowMode::Maximized | WindowMode::Floating => self.zone,
+        }
+    }
 }
 
 fn ancestor_chain(
@@ -80,6 +99,23 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         });
     }
 
+    /// `output`'s work zone and whole area, both in global coordinates.
+    pub(crate) fn output_areas(&self, output: &Output) -> Option<OutputAreas> {
+        let full = self.space.output_geometry(output)?;
+        let mut zone = layer_map_for_output(output).non_exclusive_zone();
+        zone.loc += full.loc;
+        Some(OutputAreas { zone, full })
+    }
+
+    /// The area `mode` places `surface` in on its window's output.
+    pub(crate) fn placement_area_of(
+        &self,
+        surface: &WlSurface,
+        mode: WindowMode,
+    ) -> Option<Rectangle<i32, Logical>> {
+        Some(self.output_areas(&self.output_of(surface)?)?.for_mode(mode))
+    }
+
     /// The placement a toplevel's mode implies: fullscreen, dialog, or maximized.
     pub(crate) fn placement_mode(
         &self,
@@ -112,9 +148,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.toplevels.get(surface).map(|ws| ws.window.clone())
     }
 
-    /// The single output of the space, if any.
-    pub fn primary_output(&self) -> Option<Output> {
-        self.space.outputs().next().cloned()
+    /// The output `surface`'s window is on; for one not yet placed, its
+    /// nearest placed ancestor's, else the first output.
+    pub(crate) fn output_of(&self, surface: &WlSurface) -> Option<Output> {
+        std::iter::successors(Some(surface.clone()), |s| self.parent_of(s))
+            .find_map(|s| self.toplevels.get(&s)?.output.clone())
+            .or_else(|| self.space.outputs().next().cloned())
+    }
+
+    /// Lay out the output `surface`'s window is on.
+    pub(crate) fn relayout(&mut self, surface: &WlSurface) {
+        if let Some(output) = self.output_of(surface) {
+            self.apply_layout(&output);
+        }
     }
 
     /// Give `output` `mode`, if any, and its scale, then refit everything on it.
@@ -143,14 +189,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Raise the active group, then size, position and configure `output`'s windows.
+    /// Raise the active family, then size, position and configure `output`'s windows.
     pub fn apply_layout(&mut self, output: &Output) {
-        let zone = layer_map_for_output(output).non_exclusive_zone();
-        if let Some(focused) = self.active_window.clone() {
-            for surface in ancestor_chain(&focused, |s| self.parent_of(s)) {
-                if let Some(window) = self.window_for(&surface) {
-                    self.space.raise_element(&window, false);
-                }
+        for surface in self.active_family() {
+            if let Some(window) = self.window_for(&surface) {
+                self.space.raise_element(&window, false);
             }
         }
 
@@ -164,39 +207,22 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             })
             .cloned()
             .collect();
-        let output_geo = self.space.output_geometry(output);
+        let Some(areas) = self.output_areas(output) else {
+            self.schedule_render();
+            return;
+        };
         for window in &windows {
             let Some(toplevel) = window.toplevel() else {
                 continue;
             };
             let surface = toplevel.wl_surface();
 
-            // Fullscreen covers the output; dialogs center over their parent; else the work zone.
+            // Dialogs are centered in their area, pinned to its top-left when too big.
             let mode = self.placement_mode(surface, toplevel);
-            let (area, loc) = match mode {
-                WindowMode::Fullscreen => {
-                    let Some(geo) = output_geo else {
-                        continue;
-                    };
-                    (geo, geo.loc)
-                }
-                WindowMode::Floating => {
-                    let loc = toplevel
-                        .parent()
-                        .and_then(|parent| self.window_for(&parent))
-                        .and_then(|parent| self.space.element_geometry(&parent))
-                        .map(|parent_geo| {
-                            Point::from((
-                                parent_geo.loc.x
-                                    + (parent_geo.size.w - window.geometry().size.w) / 2,
-                                parent_geo.loc.y
-                                    + (parent_geo.size.h - window.geometry().size.h) / 2,
-                            ))
-                        })
-                        .unwrap_or_else(|| centered_loc(zone, window.geometry()));
-                    (zone, loc)
-                }
-                WindowMode::Maximized => (zone, zone.loc),
+            let area = areas.for_mode(mode);
+            let loc = match mode {
+                WindowMode::Floating => centered_loc(area, window.geometry()),
+                WindowMode::Fullscreen | WindowMode::Maximized => area.loc,
             };
 
             if let Some(ws) = self.toplevels.get_mut(surface) {
@@ -232,11 +258,75 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .any(|modal| ancestor_chain(modal, |s| self.parent_of(s)).contains(window))
     }
 
-    /// The active group's windows mapped on `output`, the ones it shows.
+    /// The focused window's root and all its dialogs, in raise order: a
+    /// dialog above its parent, the focused window's line above its siblings.
+    /// Plain dialogs stay shown while their parent is focused, so a tap
+    /// moves focus between them.
+    pub fn active_family(&self) -> Vec<WlSurface> {
+        let Some(focused) = &self.active_window else {
+            return Vec::new();
+        };
+        let line = self.active_group();
+        let root = self.root_of(focused);
+        let mut family: Vec<_> = self
+            .space
+            .elements()
+            .enumerate()
+            .filter_map(|(z, window)| {
+                let surface = window.toplevel()?.wl_surface().clone();
+                let depth =
+                    std::iter::successors(self.parent_of(&surface), |s| self.parent_of(s)).count();
+                (self.root_of(&surface) == root)
+                    .then(|| (depth, line.contains(&surface), z, surface))
+            })
+            .collect();
+        family.sort_by_key(|(depth, on_line, z, _)| (*depth, *on_line, *z));
+        family.into_iter().map(|(.., surface)| surface).collect()
+    }
+
+    fn root_of(&self, surface: &WlSurface) -> WlSurface {
+        std::iter::successors(Some(surface.clone()), |s| self.parent_of(s))
+            .last()
+            .unwrap()
+    }
+
+    /// The active family's windows mapped on `output`, the ones it shows.
     pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
-        let mut visible = self.active_group();
-        visible.retain(|s| self.is_on(s, output));
-        visible
+        let Some(focused) = &self.active_window else {
+            return HashSet::new();
+        };
+        let root = self.root_of(focused);
+        self.space
+            .elements()
+            .filter_map(|window| {
+                let surface = window.toplevel()?.wl_surface();
+                let on = self.toplevels.get(surface)?.output.as_ref() == Some(output);
+                (on && self.root_of(surface) == root).then(|| surface.clone())
+            })
+            .collect()
+    }
+
+    /// How `output` stacks: whether its shown windows are a fullscreen family,
+    /// and whether a prompt has the keyboard focus.
+    pub fn stack_mode(&self, output: &Output) -> StackMode {
+        let fullscreen = self.active_window.as_ref().is_some_and(|focused| {
+            let root = self.root_of(focused);
+            self.is_on(&root, output)
+                && self
+                    .toplevels
+                    .get(&root)
+                    .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
+        });
+        let focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
+        let prompt_focused = focus.is_some_and(|focus| {
+            layer_map_for_output(output)
+                .layer_for_surface(&focus, WindowSurfaceType::TOPLEVEL)
+                .is_some_and(|layer| role_slot(layer) == Some(Slot::Prompt))
+        });
+        StackMode {
+            fullscreen,
+            prompt_focused,
+        }
     }
 
     /// Whether `surface` is a toplevel mapped on `output`.
@@ -269,63 +359,136 @@ pub enum StackEntry<'a> {
     Window(&'a Window),
 }
 
+/// How an output stacks, beyond its layer surfaces' own roles.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StackMode {
+    /// The shown windows are a fullscreen family: they go above Top layers.
+    pub fullscreen: bool,
+    /// A prompt has the keyboard focus: the keyboard goes above prompts.
+    pub prompt_focused: bool,
+}
+
+/// Where surfaces stack, front to back. Shell roles come from layer-shell
+/// namespaces and only count in Top and Overlay; everything else keeps the
+/// protocol's layer order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Slot {
+    KeyboardOverPrompt,
+    Prompt,
+    Chrome,
+    Osd,
+    Keyboard,
+    View,
+    Overlay,
+    FullscreenWindows,
+    Top,
+    BottomPopups,
+    BackgroundPopups,
+    Windows,
+    Bottom,
+    Background,
+}
+
+/// A Top or Overlay layer surface's shell role, from its namespace.
+fn role_slot(layer: &LayerSurface) -> Option<Slot> {
+    if !matches!(layer.layer(), Layer::Top | Layer::Overlay) {
+        return None;
+    }
+    let namespace = layer.namespace();
+    let has = |prefix: &str| namespace.starts_with(prefix);
+    if namespace == "osk" {
+        Some(Slot::Keyboard)
+    } else if has("mx-prompt-") {
+        Some(Slot::Prompt)
+    } else if has("mx-edge-") || has("mx-bar-") {
+        Some(Slot::Chrome)
+    } else if has("mx-osd-") {
+        Some(Slot::Osd)
+    } else if has("mx-view-") {
+        Some(Slot::View)
+    } else {
+        None
+    }
+}
+
 /// An output's shown surfaces, holding its layer map while in use.
 pub struct StackingOrder<'a> {
     space: &'a Space<Window>,
     map: MutexGuard<'a, LayerMap>,
     origin: Point<i32, Logical>,
-    toplevels: &'a HashMap<WlSurface, WindowState>,
     visible: &'a HashSet<WlSurface>,
+    mode: StackMode,
 }
 
 impl<'a> StackingOrder<'a> {
     pub fn new(
         space: &'a Space<Window>,
         output: &'a Output,
-        toplevels: &'a HashMap<WlSurface, WindowState>,
         visible: &'a HashSet<WlSurface>,
+        mode: StackMode,
     ) -> Self {
         Self {
             space,
             map: layer_map_for_output(output),
             origin: space.output_geometry(output).unwrap_or_default().loc,
-            toplevels,
             visible,
+            mode,
         }
     }
 
-    /// Front to back: Overlay layers, fullscreen windows, Top layers,
-    /// Bottom/Background popups, the other windows, then the Bottom/Background surfaces.
+    /// Front to back, by [`Slot`]: the keyboard (above prompts while one has
+    /// focus), prompts, edges and bars, OSDs, the keyboard otherwise, views,
+    /// other Overlay layers, a fullscreen family, other Top layers,
+    /// Bottom/Background popups, other windows, Bottom/Background surfaces.
+    /// Within a slot, newest first.
     pub fn iter(&self) -> impl Iterator<Item = Stacked<'_>> {
         let popups = WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE;
         let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
-        self.layer(Layer::Overlay, WindowSurfaceType::ALL)
-            .chain(self.windows(true))
-            .chain(self.layer(Layer::Top, WindowSurfaceType::ALL))
-            .chain(self.layer(Layer::Bottom, popups))
-            .chain(self.layer(Layer::Background, popups))
-            .chain(self.windows(false))
-            .chain(self.layer(Layer::Bottom, own))
-            .chain(self.layer(Layer::Background, own))
+        let mut layers = Vec::new();
+        for surface in self.map.layers().rev() {
+            let Some(geo) = self.map.layer_geometry(surface) else {
+                continue;
+            };
+            let loc = geo.loc + self.origin;
+            let mut push = |slot, kind| {
+                let entry = StackEntry::Layer(surface, kind);
+                layers.push((slot, Stacked { entry, loc }));
+            };
+            match (surface.layer(), role_slot(surface)) {
+                (_, Some(Slot::Keyboard)) if self.mode.prompt_focused => {
+                    push(Slot::KeyboardOverPrompt, WindowSurfaceType::ALL)
+                }
+                (_, Some(slot)) => push(slot, WindowSurfaceType::ALL),
+                (Layer::Overlay, None) => push(Slot::Overlay, WindowSurfaceType::ALL),
+                (Layer::Top, None) => push(Slot::Top, WindowSurfaceType::ALL),
+                (Layer::Bottom, None) => {
+                    push(Slot::BottomPopups, popups);
+                    push(Slot::Bottom, own);
+                }
+                (Layer::Background, None) => {
+                    push(Slot::BackgroundPopups, popups);
+                    push(Slot::Background, own);
+                }
+            }
+        }
+        layers.sort_by_key(|(slot, _)| *slot);
+        let windows_slot = if self.mode.fullscreen {
+            Slot::FullscreenWindows
+        } else {
+            Slot::Windows
+        };
+        let below = layers.split_off(layers.partition_point(|(slot, _)| *slot < windows_slot));
+        layers
+            .into_iter()
+            .map(|(_, stacked)| stacked)
+            .chain(self.windows())
+            .chain(below.into_iter().map(|(_, stacked)| stacked))
     }
 
-    /// `layer`'s surfaces, newest first as the order within a layer is ours to pick.
-    fn layer(&self, layer: Layer, kind: WindowSurfaceType) -> impl Iterator<Item = Stacked<'_>> {
-        self.map.layers_on(layer).rev().filter_map(move |surface| {
-            let loc = self.map.layer_geometry(surface)?.loc + self.origin;
-            Some(Stacked {
-                entry: StackEntry::Layer(surface, kind),
-                loc,
-            })
-        })
-    }
-
-    /// The shown windows that are fullscreen, or the ones that aren't, topmost first.
-    fn windows(&self, fullscreen: bool) -> impl Iterator<Item = Stacked<'_>> {
+    /// The shown windows, topmost first.
+    fn windows(&self) -> impl Iterator<Item = Stacked<'_>> {
         self.space.elements().rev().filter_map(move |window| {
-            let surface = window.toplevel()?.wl_surface();
-            let mode = self.toplevels.get(surface)?.mode;
-            if !self.visible.contains(surface) || (mode == WindowMode::Fullscreen) != fullscreen {
+            if !self.visible.contains(window.toplevel()?.wl_surface()) {
                 return None;
             }
             let loc = self.space.element_location(window)? - window.geometry().loc;

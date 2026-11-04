@@ -915,6 +915,7 @@ impl State<UdevData> {
         };
 
         let visible = self.visible_surfaces(&output);
+        let stack_mode = self.stack_mode(&output);
         let locked = self.is_locked();
         let now: Duration = self.clock.now().into();
         let presented = self
@@ -1018,6 +1019,7 @@ impl State<UdevData> {
                     &self.lock_surfaces,
                     &self.toplevels,
                     &visible,
+                    stack_mode,
                     &self.thumbnail_view,
                     custom_elements,
                 )

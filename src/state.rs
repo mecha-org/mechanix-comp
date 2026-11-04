@@ -407,6 +407,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
     /// Re-target the pointer when what's under it changed while it stood still.
     pub fn refresh_pointer_focus(&mut self) {
+        // A hidden cursor whose focus is already cleared has nothing to re-target.
+        if !self.backend_data.pointer_visible() && self.pointer.current_focus().is_none() {
+            return;
+        }
         let pointer = self.pointer.clone();
         if pointer.is_grabbed() {
             return;

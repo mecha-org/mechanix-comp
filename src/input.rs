@@ -54,7 +54,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
 
         let visible = self.visible_surfaces(output);
-        let order = StackingOrder::new(&self.space, output, &self.toplevels, &visible);
+        let mode = self.stack_mode(output);
+        let order = StackingOrder::new(&self.space, output, &visible, mode);
         for stacked in order.iter() {
             let Some(found) = stacked.surface_under(pos) else {
                 continue;

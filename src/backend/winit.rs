@@ -196,6 +196,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let visible = state.visible_surfaces(&output);
+                let stack_mode = state.stack_mode(&output);
                 let locked = state.is_locked();
                 let cursor_hotspot = state.cursor_hotspot();
                 let (result, elements, clear_color) = {
@@ -266,6 +267,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &state.lock_surfaces,
                         &state.toplevels,
                         &visible,
+                        stack_mode,
                         &state.thumbnail_view,
                         custom_elements,
                     );

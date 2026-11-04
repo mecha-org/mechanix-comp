@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 use crate::drawing::PointerRenderElement;
 use crate::handlers::thumbnail_view::{Thumbnail, ThumbnailViewState};
-use crate::layout::{StackEntry, Stacked, StackingOrder};
+use crate::layout::{StackEntry, StackMode, Stacked, StackingOrder};
 use crate::state::WindowState;
 
 // Background shown behind normal desktop contents.
@@ -60,6 +60,7 @@ pub fn output_elements(
     lock_surfaces: &[LockSurface],
     toplevels: &HashMap<WlSurface, WindowState>,
     visible: &HashSet<WlSurface>,
+    stack_mode: StackMode,
     thumbnails: &ThumbnailViewState,
     custom_elements: Vec<Element>,
 ) -> (Vec<Element>, [f32; 4]) {
@@ -79,7 +80,7 @@ pub fn output_elements(
         (elements, CLEAR_COLOR_LOCKED)
     } else {
         let output_loc = space.output_geometry(output).unwrap_or_default().loc;
-        let order = StackingOrder::new(space, output, toplevels, visible);
+        let order = StackingOrder::new(space, output, visible, stack_mode);
         for Stacked { entry, loc } in order.iter() {
             let loc_logical = loc;
             let loc = (loc - output_loc).to_physical_precise_round(scale);

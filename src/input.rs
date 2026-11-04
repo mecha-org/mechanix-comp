@@ -68,7 +68,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         None
     }
 
-    fn process_common_key_action(&mut self, action: KeyAction) {
+    pub(crate) fn process_common_key_action(&mut self, action: KeyAction) {
         match action {
             KeyAction::None => (),
 
@@ -94,7 +94,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    fn keyboard_key_to_action<B: InputBackend>(&mut self, evt: B::KeyboardKeyEvent) -> KeyAction {
+    pub(crate) fn keyboard_key_to_action<B: InputBackend>(
+        &mut self,
+        evt: B::KeyboardKeyEvent,
+    ) -> KeyAction {
         let keycode = evt.key_code();
         let state = evt.state();
         debug!(?keycode, ?state, "key");
@@ -293,16 +296,23 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
-        // Wake blanked outputs on any input; consume the event that woke them.
+    /// Note an input event as user activity. True when it woke blanked
+    /// outputs, which consumes it.
+    pub(crate) fn note_input(&mut self) -> bool {
         if self.wake_outputs_if_off() {
+            return true;
+        }
+        // Reset the idle-notify timers so `swayidle`-style clients don't go
+        // idle while the user is using the compositor. The notifier itself
+        // keeps inhibited seats (zwp-idle-inhibit-v1) from idling.
+        self.idle_notifier_state.notify_activity(&self.seat);
+        false
+    }
+
+    pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        if self.note_input() {
             return;
         }
-        // Any input event counts as user activity: reset the idle-notify
-        // timers so `swayidle`-style clients don't go idle while the user is
-        // using the compositor. The notifier itself keeps inhibited seats
-        // (zwp-idle-inhibit-v1) from idling.
-        self.idle_notifier_state.notify_activity(&self.seat);
         match event {
             InputEvent::Keyboard { event, .. } => match self.keyboard_key_to_action::<I>(event) {
                 // TODO Separate for different backends e.g. VtSwitch
@@ -443,7 +453,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
 /// Possible results of a keyboard action
 #[derive(Debug)]
-enum KeyAction {
+pub(crate) enum KeyAction {
     /// Quit the compositor
     Quit,
     /// Trigger a vt-switch

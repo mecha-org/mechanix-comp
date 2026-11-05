@@ -3,6 +3,9 @@
 debug
 target
 
+# mechanix-packager output
+/dist/
+/stage/
 # Linked git worktrees
 .worktrees/
 

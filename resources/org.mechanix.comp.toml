@@ -12,3 +12,10 @@ max = 10.0
 env = "MECHA_SCALE"
 label = "Scale"
 description = "Every output's scale. Unset follows the panel's DPI, or the host window when nested."
+
+[keys.output.transform]
+type = "enum"
+values = ["normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180", "flipped-270"]
+env = "MECHA_TRANSFORM"
+label = "Rotation"
+description = "Every output's rotation, counter-clockwise, and whether it is flipped. Unset keeps the panel's own orientation, or the host window's when nested."

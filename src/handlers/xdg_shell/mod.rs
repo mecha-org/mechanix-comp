@@ -1,6 +1,9 @@
 pub mod decoration;
+mod popup_touch;
 
 use std::collections::HashSet;
+
+use popup_touch::PopupTouchGrab;
 
 use crate::backend::Backend;
 use crate::layout::is_dialog;
@@ -63,6 +66,18 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
         self.popups.cleanup();
+        // Touches are back to normal as soon as the grab's popups are gone:
+        // left in place, the ended grab would keep the next tap from
+        // focusing what it lands on.
+        if let Some(touch) = self.seat.get_touch() {
+            let ended = touch.with_grab(|_, grab| {
+                grab.downcast_ref::<PopupTouchGrab<Self>>()
+                    .is_some_and(PopupTouchGrab::has_ended)
+            });
+            if ended == Some(true) {
+                touch.unset_grab(self);
+            }
+        }
         // A closed popup damages the window it belonged to.
         self.schedule_render();
         if let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(surface)) {
@@ -104,6 +119,9 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
                     return;
                 }
                 pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+            }
+            if let Some(touch) = seat.get_touch() {
+                touch.set_grab(self, PopupTouchGrab::new(&grab), serial);
             }
         }
     }
@@ -380,6 +398,14 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     {
         let window = state.toplevels[surface].window.clone();
         let mapped = state.is_mapped(surface);
+        // The scale and transform before the first configure, so the first
+        // buffer comes at the right size; later changes follow the output.
+        let configured = window
+            .toplevel()
+            .is_some_and(|toplevel| toplevel.is_initial_configure_sent());
+        if !configured && let Some(output) = state.output_of(surface) {
+            state.send_scale_transform_to(surface, &output);
+        }
         let buffered = with_renderer_surface_state(surface, |states| states.buffer().is_some())
             .unwrap_or(false);
 

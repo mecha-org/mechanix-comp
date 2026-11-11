@@ -737,7 +737,7 @@ dependencies = [
 [[package]]
 name = "mxconfig"
 version = "0.1.0"
-source = "git+https://github.com/mecha-org/mxconfig?rev=510a018ef9e0a174fecac7cedb5369231a494e30#510a018ef9e0a174fecac7cedb5369231a494e30"
+source = "git+https://github.com/mecha-org/mxconfig?rev=c8f48426345e5dcc7e46ea29787a7ae706f9a82a#c8f48426345e5dcc7e46ea29787a7ae706f9a82a"
 dependencies = [
  "inotify",
  "mxconfig-macros",
@@ -752,7 +752,7 @@ dependencies = [
 [[package]]
 name = "mxconfig-codegen"
 version = "0.1.0"
-source = "git+https://github.com/mecha-org/mxconfig?rev=510a018ef9e0a174fecac7cedb5369231a494e30#510a018ef9e0a174fecac7cedb5369231a494e30"
+source = "git+https://github.com/mecha-org/mxconfig?rev=c8f48426345e5dcc7e46ea29787a7ae706f9a82a#c8f48426345e5dcc7e46ea29787a7ae706f9a82a"
 dependencies = [
  "anyhow",
  "heck",
@@ -762,7 +762,7 @@ dependencies = [
 [[package]]
 name = "mxconfig-macros"
 version = "0.1.0"
-source = "git+https://github.com/mecha-org/mxconfig?rev=510a018ef9e0a174fecac7cedb5369231a494e30#510a018ef9e0a174fecac7cedb5369231a494e30"
+source = "git+https://github.com/mecha-org/mxconfig?rev=c8f48426345e5dcc7e46ea29787a7ae706f9a82a#c8f48426345e5dcc7e46ea29787a7ae706f9a82a"
 dependencies = [
  "mxconfig-codegen",
  "mxconfig-schema",
@@ -771,7 +771,7 @@ dependencies = [
 [[package]]
 name = "mxconfig-schema"
 version = "0.1.0"
-source = "git+https://github.com/mecha-org/mxconfig?rev=510a018ef9e0a174fecac7cedb5369231a494e30#510a018ef9e0a174fecac7cedb5369231a494e30"
+source = "git+https://github.com/mecha-org/mxconfig?rev=c8f48426345e5dcc7e46ea29787a7ae706f9a82a#c8f48426345e5dcc7e46ea29787a7ae706f9a82a"
 dependencies = [
  "serde",
  "thiserror 2.0.20",

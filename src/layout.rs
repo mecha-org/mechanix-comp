@@ -163,15 +163,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Give `output` `mode`, if any, and its scale, then refit everything on it.
+    /// Give `output` `mode`, if any, and its scale and transform, then refit
+    /// everything on it.
     pub fn reconfigure_output(&mut self, output: &Output, mode: Option<Mode>) {
         let scale = self.output_scale(output);
         let scale = (scale != output.current_scale().fractional_scale())
             .then_some(Scale::Fractional(scale));
-        if mode.is_none() && scale.is_none() {
+        let transform = self.output_transform();
+        let transform = (transform != output.current_transform()).then_some(transform);
+        if mode.is_none() && scale.is_none() && transform.is_none() {
             return;
         }
-        output.change_current_state(mode, None, scale, None);
+        output.change_current_state(mode, transform, scale, None);
+        self.send_scale_transform_on(output);
         layer_map_for_output(output).arrange();
         self.apply_layout(output);
         self.update_capture_constraints(output);

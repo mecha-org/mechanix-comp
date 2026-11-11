@@ -358,8 +358,8 @@ impl ForeignToplevelManagerState {
     }
 }
 
-/// The wlr `state` payload for a toplevel in `mode` with `focused` focus.
-fn to_state_vec(mode: WindowMode, focused: bool) -> Vec<u8> {
+/// The wlr `state` payload for a toplevel in `mode`, `active` or not.
+fn to_state_vec(mode: WindowMode, active: bool) -> Vec<u8> {
     let mut states = Vec::new();
     if matches!(mode, WindowMode::Maximized) {
         states.extend((zwlr_foreign_toplevel_handle_v1::State::Maximized as u32).to_ne_bytes());
@@ -367,7 +367,7 @@ fn to_state_vec(mode: WindowMode, focused: bool) -> Vec<u8> {
     if matches!(mode, WindowMode::Fullscreen) {
         states.extend((zwlr_foreign_toplevel_handle_v1::State::Fullscreen as u32).to_ne_bytes());
     }
-    if focused {
+    if active {
         states.extend((zwlr_foreign_toplevel_handle_v1::State::Activated as u32).to_ne_bytes());
     }
     states
@@ -416,26 +416,28 @@ fn with_xdg_title_app_id<T>(
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
-    /// Reconcile both protocols with the current windows; focused last so old windows deactivate first.
+    /// Reconcile both protocols with the current windows; active last so old windows deactivate first.
     pub fn foreign_toplevel_refresh(&mut self) {
+        // Activated is what xdg `activated` is: the active window and its
+        // parents, whoever holds the keyboard (an open menu, an `Exclusive`
+        // layer).
+        let active = self.active_group();
         let Self {
             toplevels,
             space,
             foreign_toplevel: manager,
             foreign_toplevel_list: list,
             display_handle,
-            seat,
             ..
         } = self;
-        let focused = seat.get_keyboard().unwrap().current_focus();
 
         let mut seen: HashSet<WlSurface> = HashSet::new();
         let mut parent_targets: HashSet<WlSurface> = HashSet::new();
-        // Two passes so the focused window is announced last.
-        for focused_pass in [false, true] {
+        // Two passes so the active windows are announced last.
+        for active_pass in [false, true] {
             for (surface, ws) in toplevels.iter() {
-                let is_focused = focused.as_ref() == Some(surface);
-                if is_focused != focused_pass {
+                let is_active = active.contains(surface);
+                if is_active != active_pass {
                     continue;
                 }
                 if !surface.is_alive() || !has_buffer(surface) {
@@ -444,7 +446,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 seen.insert(surface.clone());
                 let output = space.outputs_for_element(&ws.window).into_iter().next();
                 let parent = ws.window.toplevel().and_then(|toplevel| toplevel.parent());
-                let states = to_state_vec(ws.mode, is_focused);
+                let states = to_state_vec(ws.mode, is_active);
                 let update = ToplevelUpdate {
                     surface: surface.clone(),
                     states,

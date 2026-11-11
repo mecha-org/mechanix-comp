@@ -767,7 +767,7 @@ impl State<UdevData> {
         let position = (x, 0).into();
         output.change_current_state(
             Some(wl_mode),
-            None,
+            Some(self.output_transform()),
             Some(Scale::Fractional(scale)),
             Some(position),
         );

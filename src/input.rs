@@ -99,9 +99,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
+    /// `dark`: every output is off (see [`Self::note_input`]).
     pub(crate) fn keyboard_key_to_action<B: InputBackend>(
         &mut self,
         evt: B::KeyboardKeyEvent,
+        dark: bool,
     ) -> KeyAction {
         let keycode = evt.key_code();
         let state = evt.state();
@@ -137,8 +139,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     // should be forwarded to the client or not.
                     if let KeyState::Pressed = state {
                         // Accelerator grabs win over shortcuts, shortcut
-                        // inhibitors and the lock screen.
-                        if state_.grab_press(keysym, (&*modifiers).into(), time.millis()) {
+                        // inhibitors, the lock screen and the dark.
+                        // Anything else pressed in the dark is dropped,
+                        // its release too.
+                        if state_.grab_press(keysym, modifiers.into(), time.millis()) || dark {
                             if !suppressed_keys.contains(&keysym) {
                                 suppressed_keys.push(keysym);
                             }
@@ -319,33 +323,46 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Note an input event as user activity. True when it woke blanked
-    /// outputs, which consumes it.
+    /// Note an input event as user activity, resetting the idle-notify
+    /// timers (the notifier itself keeps inhibited seats from idling).
+    /// Returns whether every output is off, the dark: there input reaches
+    /// no client and is not activity, so a touch in a pocket neither lands
+    /// nor keeps the session awake. Grabbed accelerators still reach their
+    /// owner, so the shell can turn the outputs back on with the power key.
     pub(crate) fn note_input(&mut self) -> bool {
-        if self.wake_outputs_if_off() {
-            return true;
+        let dark = self.is_dark();
+        if !dark {
+            self.idle_notifier_state.notify_activity(&self.seat);
         }
-        // Reset the idle-notify timers so `swayidle`-style clients don't go
-        // idle while the user is using the compositor. The notifier itself
-        // keeps inhibited seats (zwp-idle-inhibit-v1) from idling.
-        self.idle_notifier_state.notify_activity(&self.seat);
-        false
+        dark
     }
 
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
-        if self.note_input() {
-            return;
-        }
+        let dark = self.note_input();
         match event {
-            InputEvent::Keyboard { event, .. } => match self.keyboard_key_to_action::<I>(event) {
-                // TODO Separate for different backends e.g. VtSwitch
-                action => match action {
-                    KeyAction::VtSwitch(_)
-                    | KeyAction::None
-                    | KeyAction::Quit
-                    | KeyAction::Run(_) => self.process_common_key_action(action),
-                },
-            },
+            InputEvent::Keyboard { event, .. } => {
+                match self.keyboard_key_to_action::<I>(event, dark) {
+                    // TODO Separate for different backends e.g. VtSwitch
+                    action => match action {
+                        KeyAction::VtSwitch(_)
+                        | KeyAction::None
+                        | KeyAction::Quit
+                        | KeyAction::Run(_) => self.process_common_key_action(action),
+                    },
+                }
+            }
+            // In the dark, nothing new starts. A touch whose down was
+            // dropped stays dropped after the outputs are back: smithay
+            // ignores the motion and up of a touch it never saw. Its frames
+            // go too, or smithay warns of a frame with nothing in it.
+            InputEvent::PointerMotion { .. }
+            | InputEvent::PointerMotionAbsolute { .. }
+            | InputEvent::PointerAxis { .. }
+            | InputEvent::TouchDown { .. }
+            | InputEvent::TouchFrame { .. }
+                if dark => {}
+            InputEvent::PointerButton { event, .. }
+                if dark && event.state() == ButtonState::Pressed => {}
             InputEvent::PointerMotion { event } => {
                 let pointer = self.seat.get_pointer().unwrap();
                 let mut pos = pointer.current_location() + event.delta();

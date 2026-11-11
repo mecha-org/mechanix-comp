@@ -10,7 +10,7 @@ Smithay: ❌ means we hand-roll it.
 
 | Protocol | | Version | Smithay | Notes |
 | --- | --- | --- | --- | --- |
-| `wl_compositor` | ✅ | 5 / 6 | ✅ | |
+| `wl_compositor` | ✅ | 6 / 7 | ✅ | v7 (`get_release`) not in Smithay |
 | `wl_subcompositor` | ✅ | 1 / 1 | ✅ | |
 | `wl_shm` | ✅ | 2 / 2 | ✅ | |
 | `wl_seat` | ✅ | 9 / 9 | ✅ | |
@@ -58,7 +58,7 @@ Smithay: ❌ means we hand-roll it.
 | `zxdg_decoration_manager_v1` | ✅ | 1 / 1 | ✅ | server-side but no titlebars drawn (intentionally) |
 | `zxdg_output_manager_v1` | ✅ | 3 / 3 | ✅ | |
 | `zxdg_exporter_v2` / `zxdg_importer_v2` | ✅ | 1 / 1 | ✅ | |
-| `phosh_private_keyboard_event` | ✅ | 8 / 8 | ❌ | accelerator grabs; compositor-side repeat 400/120 ms, capped at 10 s; XML interface is v7, the object inherits the `phosh_private` bind version (8) |
+| `phosh_private` | ✅ | 8 / 8 | ❌ | thumbnail views and keyboard-event accelerator grabs (compositor-side repeat 400/120 ms, capped at 10 s); other requests are a protocol error |
 | `zwp_pointer_constraints_v1` | 🚧 | — / 1 | ✅ | no global |
 | `zwp_relative_pointer_v1` | ❌ | — / 1 | ✅ | |
 | `zwp_tablet_v2` | 🚧 | — / 1 | ✅ | no global |

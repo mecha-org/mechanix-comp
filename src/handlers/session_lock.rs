@@ -70,6 +70,7 @@ impl<BackendData: Backend + 'static> SessionLockHandler for State<BackendData> {
         }
 
         if let Some(output) = output {
+            self.send_scale_transform_to(surface.wl_surface(), &output);
             self.lock_surface_outputs
                 .insert(surface.wl_surface().id(), output);
         }

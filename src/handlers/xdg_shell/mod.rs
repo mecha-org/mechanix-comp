@@ -380,6 +380,14 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     {
         let window = state.toplevels[surface].window.clone();
         let mapped = state.is_mapped(surface);
+        // The scale and transform before the first configure, so the first
+        // buffer comes at the right size; later changes follow the output.
+        let configured = window
+            .toplevel()
+            .is_some_and(|toplevel| toplevel.is_initial_configure_sent());
+        if !configured && let Some(output) = state.output_of(surface) {
+            state.send_scale_transform_to(surface, &output);
+        }
         let buffered = with_renderer_surface_state(surface, |states| states.buffer().is_some())
             .unwrap_or(false);
 

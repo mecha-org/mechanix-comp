@@ -175,6 +175,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         }
         output.change_current_state(mode, transform, scale, None);
+        self.send_scale_transform_on(output);
         layer_map_for_output(output).arrange();
         self.apply_layout(output);
         self.update_capture_constraints(output);

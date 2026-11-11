@@ -111,6 +111,9 @@ pub fn handle_commit<BackendData: Backend + 'static>(
             .initial_configure_sent
     });
 
+    if !initial_configure_sent {
+        state.send_scale_transform_to(surface, &output);
+    }
     let zone_before = layer_map_for_output(&output).non_exclusive_zone();
     let (needs_configure, on_demand) = {
         let mut map = layer_map_for_output(&output);

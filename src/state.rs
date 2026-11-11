@@ -15,7 +15,7 @@ use smithay::desktop::utils::{
     update_surface_primary_scanout_output, with_surfaces_surface_tree,
 };
 use smithay::desktop::{
-    PopupManager, Space, Window, find_popup_root_surface, layer_map_for_output,
+    PopupManager, Space, Window, WindowSurfaceType, find_popup_root_surface, layer_map_for_output,
 };
 use smithay::input::keyboard::Keysym;
 use smithay::input::pointer::{
@@ -33,7 +33,7 @@ use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, ObjectId,
 };
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Size, Time, Transform};
+use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Size, Time};
 use smithay::wayland::commit_timing::{
     CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
 };
@@ -257,7 +257,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let seat_name = backend_data.seat_name();
 
         // Version 6 lets clients without fractional scale size their
-        // buffers from `preferred_buffer_scale` (see `push_preferred_scale`).
+        // buffers from `preferred_buffer_scale` (see `send_scale_transform`).
         let compositor_state = CompositorState::new_v6::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(
             &dh,
@@ -499,7 +499,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             }
             return;
         }
-        let scale = output.current_scale().fractional_scale();
         let thumbnailed = self.thumbnailed_on(output);
         // Only presented surfaces are acked; hidden ones are suspended instead,
         // unless a thumbnail on this output shows them.
@@ -508,13 +507,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             window.send_frame(output, now, None, |surface, data| {
                 frame_output(surface_primary_scanout_output(surface, data), shown, output)
             });
-            self.push_preferred_scale(window.toplevel().unwrap().wl_surface(), scale);
         }
         for layer_surface in layer_map_for_output(output).layers() {
             layer_surface.send_frame(output, now, None, |surface, data| {
                 surface_primary_scanout_output(surface, data)
             });
-            self.push_preferred_scale(layer_surface.wl_surface(), scale);
         }
     }
 
@@ -897,19 +894,45 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.update_idle_inhibit();
     }
 
-    /// Push the output's scale to `surface`: exactly, to a client with the
-    /// fractional-scale object, and as [`buffer_scale`] to one on
-    /// `wl_surface` version 6. Each is only sent when it changes.
-    fn push_preferred_scale(&self, surface: &WlSurface, scale: f64) {
-        if !surface.is_alive() {
-            return;
+    /// The output `surface` shows on, through subsurfaces and popups: its
+    /// window's, lock surface's or layer surface's.
+    pub fn output_for_surface(&self, surface: &WlSurface) -> Option<Output> {
+        let root = root_surface(surface);
+        let root = (self.popups.find_popup(&root))
+            .and_then(|popup| find_popup_root_surface(&popup).ok())
+            .unwrap_or(root);
+        if self.toplevels.contains_key(&root) {
+            return self.output_of(&root);
         }
-        with_states(surface, |states| {
-            with_fractional_scale(states, |fractional_scale| {
-                fractional_scale.set_preferred_scale(scale);
-            });
-            send_surface_state(surface, states, buffer_scale(scale), Transform::Normal);
-        });
+        if let Some(output) = self.lock_surface_outputs.get(&root.id()) {
+            return Some(output.clone());
+        }
+        self.space
+            .outputs()
+            .find(|o| {
+                layer_map_for_output(o)
+                    .layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+                    .is_some()
+            })
+            .cloned()
+    }
+
+    /// Tell `surface` and its subsurfaces the scale and transform of `output`.
+    pub fn send_scale_transform_to(&self, surface: &WlSurface, output: &Output) {
+        with_surfaces_surface_tree(surface, |s, data| send_scale_transform(s, data, output));
+    }
+
+    /// [`Self::send_scale_transform_to`] the output `surface` shows on, for
+    /// a caller that doesn't know it (a new subsurface, a popup).
+    pub fn send_scale_transform_to_its_output(&self, surface: &WlSurface) {
+        if let Some(output) = self.output_for_surface(surface) {
+            self.send_scale_transform_to(surface, &output);
+        }
+    }
+
+    /// Tell everything on `output` its new scale and transform.
+    pub fn send_scale_transform_on(&self, output: &Output) {
+        self.for_each_surface_on(output, |s, data| send_scale_transform(s, data, output));
     }
 
     /// The toplevel a surface belongs to, through subsurfaces and popups.
@@ -1047,11 +1070,20 @@ fn should_suspend(visible: bool, recorded: bool, thumbnailed: bool) -> bool {
     !visible && !recorded && !thumbnailed
 }
 
-/// The whole buffer scale for an output `scale`: the next whole number at
-/// or above it, so a client draws at least as sharp as the output and is
-/// scaled down, never up.
-fn buffer_scale(scale: f64) -> i32 {
-    scale.ceil().max(1.0) as i32
+/// Tell `surface` the scale and transform of `output`: the exact scale through
+/// fractional scale, the rounded-up one through `wl_surface`. Smithay sends
+/// only what changed.
+fn send_scale_transform(surface: &WlSurface, data: &SurfaceData, output: &Output) {
+    let scale = output.current_scale();
+    with_fractional_scale(data, |fractional_scale| {
+        fractional_scale.set_preferred_scale(scale.fractional_scale());
+    });
+    send_surface_state(
+        surface,
+        data,
+        scale.integer_scale(),
+        output.current_transform(),
+    );
 }
 
 /// Whether a mapped toplevel's commits can skip the output render.
@@ -1068,15 +1100,6 @@ fn frame_output<O: Clone>(scanout: Option<O>, thumbnailed: bool, output: &O) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_buffer_scale_rounds_up_to_a_whole_number() {
-        assert_eq!(buffer_scale(1.0), 1);
-        assert_eq!(buffer_scale(2.0), 2);
-        assert_eq!(buffer_scale(2.25), 3);
-        assert_eq!(buffer_scale(2.61), 3);
-        assert_eq!(buffer_scale(0.5), 1);
-    }
 
     #[test]
     fn thumbnailed_window_is_not_suspended() {

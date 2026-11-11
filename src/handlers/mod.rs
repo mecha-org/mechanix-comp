@@ -44,6 +44,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
             && !popup.is_initial_configure_sent()
         {
+            self.send_scale_transform_to_its_output(surface);
             popup.send_configure().expect("initial configure failed");
         }
     }

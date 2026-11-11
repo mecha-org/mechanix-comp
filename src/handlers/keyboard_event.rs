@@ -143,16 +143,19 @@ impl<C: PartialEq> Grabs<C> {
     }
 }
 
-/// A held grabbed key being repeated from the compositor.
+/// A held grabbed key, repeated from the compositor until its release or
+/// [`REPEAT_MAX`].
 struct Repeat {
     keysym: Keysym,
     owner: PhoshPrivateKeyboardEvent,
     action_id: u32,
-    token: RegistrationToken,
+    /// The repeat timer; `None` once it stopped at [`REPEAT_MAX`], with the
+    /// key still down and its release still to report.
+    token: Option<RegistrationToken>,
 }
 
 /// Accelerator grabs of all `phosh_private_keyboard_event` resources plus the
-/// one active repeat.
+/// one held key.
 #[derive(Default)]
 pub struct KeyboardGrabState {
     pub grabs: Grabs<PhoshPrivateKeyboardEvent>,
@@ -165,7 +168,9 @@ pub struct KeyboardEventUdata;
 impl<BackendData: Backend + 'static> State<BackendData> {
     fn cancel_repeat(&mut self) -> Option<(PhoshPrivateKeyboardEvent, u32)> {
         let r = self.keyboard_grabs.repeat.take()?;
-        self.loop_handle.remove(r.token);
+        if let Some(token) = r.token {
+            self.loop_handle.remove(token);
+        }
         Some((r.owner, r.action_id))
     }
 
@@ -180,13 +185,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         else {
             return false;
         };
-        owner.accelerator_activated_event(action_id, time);
-        // A new grabbed press replaces a running repeat; that key is done.
+        // A new grabbed press ends the held one, before it starts: an owner
+        // that ignores presses until a release sees this one.
         if let Some((old, old_id)) = self.cancel_repeat()
             && old.version() >= 7
         {
             old.accelerator_released_event(old_id, time);
         }
+        owner.accelerator_activated_event(action_id, time);
         let timer_owner = owner.clone();
         let mut first = None;
         let token = self.loop_handle.insert_source(
@@ -195,11 +201,13 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 let now = Duration::from(state.clock.now());
                 let first = *first.get_or_insert(now);
                 if repeat_expired(first, now) {
-                    // Stop quietly: the key is still down, so no release.
-                    // A replaced or cancelled repeat removed this timer, so
-                    // the active repeat is this one; forget it without
-                    // removing the source twice.
-                    state.keyboard_grabs.repeat = None;
+                    // Stop quietly: the key is still down, and its release
+                    // is still reported. A replaced or cancelled repeat
+                    // removed this timer, so the held key is this one;
+                    // forget the timer without removing the source twice.
+                    if let Some(r) = state.keyboard_grabs.repeat.as_mut() {
+                        r.token = None;
+                    }
                     return TimeoutAction::Drop;
                 }
                 timer_owner.accelerator_activated_event(action_id, now.as_millis() as u32);
@@ -212,15 +220,24 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     keysym,
                     owner,
                     action_id,
-                    token,
+                    token: Some(token),
                 });
             }
-            Err(e) => warn!(err = %e, "Failed to start accelerator repeat timer"),
+            Err(e) => {
+                warn!(err = %e, "Failed to start accelerator repeat timer");
+                // No repeat, but the release is still reported.
+                self.keyboard_grabs.repeat = Some(Repeat {
+                    keysym,
+                    owner,
+                    action_id,
+                    token: None,
+                });
+            }
         }
         true
     }
 
-    /// A key was released: end its repeat and report the release.
+    /// A key was released: end its repeat, if any, and report the release.
     pub fn grab_release(&mut self, keysym: Keysym, time: u32) {
         if self
             .keyboard_grabs

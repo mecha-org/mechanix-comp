@@ -318,9 +318,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
-        let config = Config::load(&event_loop.handle());
+        let config = Config::new(&event_loop.handle());
 
-        Self {
+        let mut state = Self {
             socket_name,
             config,
             xdg_activation_state,
@@ -367,7 +367,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             lock_surface_outputs: HashMap::new(),
             layer_shell_on_demand_focus: None,
             active_window: None,
-        }
+        };
+        // From files, the settings open now.
+        state.drain_config();
+        state
     }
 
     fn init_wayland_listener(display: Display<Self>, event_loop: &mut EventLoop<Self>) -> OsString {

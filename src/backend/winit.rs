@@ -50,6 +50,11 @@ impl Backend for WinitData {
         crate::backend::snap_scale(self.backend.scale_factor())
     }
 
+    /// GL draws the window upside down; the host window has its own orientation.
+    fn output_transform(&self, _configured: Option<Transform>) -> Transform {
+        Transform::Flipped180
+    }
+
     fn reset_buffers(&mut self, _output: &Output) {
         // The winit backend re-renders a full frame every time; there are no
         // scanout buffers to reset.
@@ -152,7 +157,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let scale = state.output_scale(&output);
     output.change_current_state(
         Some(mode),
-        Some(Transform::Flipped180),
+        Some(state.output_transform()),
         Some(Scale::Fractional(scale)),
         Some((0, 0).into()),
     );

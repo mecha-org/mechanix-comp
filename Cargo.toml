@@ -30,7 +30,7 @@ default-features = false
 
 [dependencies]
 bitflags = "2.13.0"
-mxconfig = { git = "https://github.com/mecha-org/mxconfig", rev = "510a018ef9e0a174fecac7cedb5369231a494e30" }
+mxconfig = { git = "https://github.com/mecha-org/mxconfig", rev = "c8f48426345e5dcc7e46ea29787a7ae706f9a82a" }
 sd-notify = "0.5.0"
 thiserror = "2.0.20"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }

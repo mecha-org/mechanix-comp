@@ -39,10 +39,8 @@ impl<BackendData: Backend + 'static> VirtualKeyboardHandler for State<BackendDat
                 });
             }
             InputEvent::Keyboard { event } => {
-                if self.note_input() {
-                    return;
-                }
-                match self.keyboard_key_to_action::<VirtualKeyboardBackend>(event) {
+                let dark = self.note_input();
+                match self.keyboard_key_to_action::<VirtualKeyboardBackend>(event, dark) {
                     // A client must not move the session off its VT.
                     KeyAction::VtSwitch(vt) => {
                         debug!(vt, "ignoring a VT switch from a virtual keyboard")

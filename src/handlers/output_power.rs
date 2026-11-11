@@ -84,6 +84,13 @@ impl OutputPowerManagerState {
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
+    /// Every output is off: the dark, where input is dropped (see
+    /// [`State::note_input`]).
+    pub(crate) fn is_dark(&self) -> bool {
+        let mut outputs = self.space.outputs().peekable();
+        outputs.peek().is_some() && outputs.all(|o| self.output_power.is_off(o))
+    }
+
     /// Apply DPMS for `output` and notify protocol clients; backend refusal sends `failed`.
     pub fn set_output_power(&mut self, output: &Output, on: bool) {
         if self.output_power.is_off(output) == !on {
@@ -105,26 +112,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             self.backend_data.schedule_render(output);
         } else {
             self.output_power.off.insert(output.clone());
-            // The wake-on-input path eats the next event, maybe a key release.
-            self.end_grab_repeat();
             self.release_fifo_barriers(output);
             self.maybe_send_locked();
         }
         self.output_power.send_mode(output, on);
-    }
-
-    /// Wake every blanked output. Returns true if anything was off, so the
-    /// caller can consume the input that woke the panel.
-    // TODO: remove.
-    pub fn wake_outputs_if_off(&mut self) -> bool {
-        if self.output_power.off.is_empty() {
-            return false;
-        }
-        let outputs: Vec<Output> = self.output_power.off.iter().cloned().collect();
-        for output in &outputs {
-            self.set_output_power(output, true);
-        }
-        true
     }
 
     /// Re-activate DRM after a VT switch, keeping DPMS-off outputs blanked.

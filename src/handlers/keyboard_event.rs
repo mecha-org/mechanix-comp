@@ -251,18 +251,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Outputs blanked: the wake-on-input path eats the next event, possibly
-    /// the key's release, so end any repeat now (reporting the release) and
-    /// forget its suppressed keysym.
-    pub fn end_grab_repeat(&mut self) {
-        let Some(keysym) = self.keyboard_grabs.repeat.as_ref().map(|r| r.keysym) else {
-            return;
-        };
-        let now = Duration::from(self.clock.now()).as_millis() as u32;
-        self.grab_release(keysym, now);
-        self.suppressed_keys.retain(|k| *k != keysym);
-    }
-
     fn drop_keyboard_owner(&mut self, owner: &PhoshPrivateKeyboardEvent) {
         self.keyboard_grabs.grabs.drop_owner(owner);
         if self

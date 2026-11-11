@@ -15,7 +15,8 @@ use smithay::desktop::utils::{
     update_surface_primary_scanout_output, with_surfaces_surface_tree,
 };
 use smithay::desktop::{
-    PopupManager, Space, Window, WindowSurfaceType, find_popup_root_surface, layer_map_for_output,
+    PopupKeyboardGrab, PopupManager, PopupPointerGrab, Space, Window, WindowSurfaceType,
+    find_popup_root_surface, layer_map_for_output,
 };
 use smithay::input::keyboard::Keysym;
 use smithay::input::pointer::{
@@ -966,13 +967,35 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         }
         let keyboard = self.seat.get_keyboard().unwrap();
-        if keyboard.is_grabbed() {
+        let focus = self.compute_keyboard_focus();
+        let current = keyboard.current_focus();
+        if current.as_ref() == focus.as_ref() {
             return;
         }
-        let focus = self.compute_keyboard_focus();
-        if keyboard.current_focus().as_ref() != focus.as_ref() {
-            keyboard.set_focus(self, focus, SERIAL_COUNTER.next_serial());
+        let serial = SERIAL_COUNTER.next_serial();
+        // A popup's grab keeps the keyboard only while its window would have
+        // it. Focus going anywhere else (a layer, another window) ends the
+        // grab's keyboard and pointer sides and leaves the popups
+        // open; its touch side stays, so a tap on another app still closes
+        // them. Other grabs (a drag) are left alone.
+        let popup_window = current
+            .and_then(|surface| self.popups.find_popup(&surface))
+            .and_then(|popup| find_popup_root_surface(&popup).ok());
+        if popup_window.is_some() && popup_window != focus {
+            if keyboard.with_grab(|_, grab| grab.is::<PopupKeyboardGrab<Self>>()) == Some(true) {
+                keyboard.unset_grab(self);
+            }
+            let pointer = self.seat.get_pointer().unwrap();
+            if pointer.with_grab(|_, grab| grab.is::<PopupPointerGrab<Self>>()) == Some(true) {
+                pointer.unset_grab(self, serial, InputTime::now());
+            }
         }
+        // Otherwise a grab decides: a popup grab ignores the change while
+        // its popups are open, and once they are gone takes it and ends.
+        // Asking every frame matters: a grab whose popups closed would hold
+        // the keyboard until the next key press, which a handheld may never
+        // send.
+        keyboard.set_focus(self, focus, serial);
     }
 
     /// The keyboard focus target: the top-most `Exclusive` layer (Overlay/Top),

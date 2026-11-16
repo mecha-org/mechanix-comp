@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 use crate::drawing::PointerRenderElement;
 use crate::handlers::thumbnail_view::{Thumbnail, ThumbnailViewState};
-use crate::layout::{StackEntry, StackMode, Stacked, StackingOrder};
+use crate::layout::{Slot, StackEntry, StackMode, Stacked, StackingOrder, role_slot};
 use crate::state::WindowState;
 
 // Background shown behind normal desktop contents.
@@ -86,6 +86,9 @@ pub fn output_elements(
             let loc = (loc - output_loc).to_physical_precise_round(scale);
             match entry {
                 StackEntry::Layer(layer, kind) => {
+                    if role_slot(layer) == Some(Slot::Edge) {
+                        continue;
+                    }
                     if kind.contains(WindowSurfaceType::POPUP) {
                         for (popup, popup_offset) in
                             PopupManager::popups_for_surface(layer.wl_surface())

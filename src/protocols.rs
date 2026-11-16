@@ -26,6 +26,12 @@ macro_rules! wayland_protocol {
     };
 }
 
+wayland_protocol!(
+    shell_surface,
+    "protocols/mx-shell-surface-v1.xml",
+    [smithay::reexports::wayland_protocols_wlr::layer_shell::v1::server]
+);
+
 pub mod phosh_private {
     //! Server bindings for Phosh's private protocol (`protocols/phosh-private.xml`,
     //! read through the copy `build.rs` prepares).

@@ -316,6 +316,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let image_copy_capture_state =
             ImageCopyCaptureState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
         let thumbnail_view = ThumbnailViewState::new::<Self>(&dh);
+        crate::handlers::shell_surface::init_shell_surface_manager::<Self>(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
@@ -510,8 +511,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             });
         }
         for layer_surface in layer_map_for_output(output).layers() {
+            let edge = crate::layout::role_slot(layer_surface) == Some(crate::layout::Slot::Edge);
             layer_surface.send_frame(output, now, None, |surface, data| {
-                surface_primary_scanout_output(surface, data)
+                frame_output(surface_primary_scanout_output(surface, data), edge, output)
             });
         }
     }

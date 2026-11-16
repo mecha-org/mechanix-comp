@@ -14,6 +14,7 @@ pub mod output_power;
 pub mod seat;
 pub mod security_context;
 pub mod session_lock;
+pub mod shell_surface;
 pub mod shm;
 pub mod thumbnail_view;
 pub mod virtual_keyboard;

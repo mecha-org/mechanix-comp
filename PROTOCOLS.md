@@ -71,6 +71,7 @@ Smithay: ❌ means we hand-roll it.
 | `zwlr_data_control_manager_v1` | ✅ | 2 / 2 | ✅ | |
 | `zwlr_foreign_toplevel_manager_v1` | ✅ | 3 / 3 | ❌ | `activate`/`close` works, state requests ignored |
 | `zwlr_output_power_manager_v1` | ✅ | 1 / 1 | ❌ | |
+| `mx_shell_surface_manager_v1` | ✅ | 1 / 1 | ❌ | shell roles for layer surfaces |
 
 ## Missing
 

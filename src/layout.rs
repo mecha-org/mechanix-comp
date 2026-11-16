@@ -372,14 +372,15 @@ pub struct StackMode {
     pub prompt_focused: bool,
 }
 
-/// Where surfaces stack, front to back. Shell roles come from layer-shell
-/// namespaces and only count in Top and Overlay; everything else keeps the
-/// protocol's layer order.
+/// Where surfaces stack, front to back. Shell roles come from
+/// `mx_shell_surface_manager_v1` (with `"osk"` namespace fallback) and only
+/// count in Top and Overlay; everything else keeps the protocol's layer order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Slot {
+pub(crate) enum Slot {
     KeyboardOverPrompt,
     Prompt,
-    Chrome,
+    Edge,
+    Bar,
     Osd,
     Keyboard,
     View,
@@ -393,25 +394,23 @@ enum Slot {
     Background,
 }
 
-/// A Top or Overlay layer surface's shell role, from its namespace.
-fn role_slot(layer: &LayerSurface) -> Option<Slot> {
+/// A Top or Overlay layer surface's shell role, from `mx_shell_surface_manager_v1`
+/// (with `"osk"` namespace fallback for standalone on-screen keyboards).
+pub(crate) fn role_slot(layer: &LayerSurface) -> Option<Slot> {
+    use crate::handlers::shell_surface::{ShellRole, shell_role};
+
     if !matches!(layer.layer(), Layer::Top | Layer::Overlay) {
         return None;
     }
-    let namespace = layer.namespace();
-    let has = |prefix: &str| namespace.starts_with(prefix);
-    if namespace == "osk" {
-        Some(Slot::Keyboard)
-    } else if has("mx-prompt-") {
-        Some(Slot::Prompt)
-    } else if has("mx-edge-") || has("mx-bar-") {
-        Some(Slot::Chrome)
-    } else if has("mx-osd-") {
-        Some(Slot::Osd)
-    } else if has("mx-view-") {
-        Some(Slot::View)
-    } else {
-        None
+    match shell_role(layer) {
+        Some(ShellRole::Prompt) => Some(Slot::Prompt),
+        Some(ShellRole::Edge) => Some(Slot::Edge),
+        Some(ShellRole::Bar) => Some(Slot::Bar),
+        Some(ShellRole::Osd) => Some(Slot::Osd),
+        Some(ShellRole::Osk) => Some(Slot::Keyboard),
+        Some(ShellRole::View) => Some(Slot::View),
+        None if layer.namespace() == "osk" => Some(Slot::Keyboard),
+        None => None,
     }
 }
 

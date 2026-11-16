@@ -4,7 +4,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
-use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::server::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::{
@@ -552,14 +552,9 @@ fn state_for_version(states: &[u8], version: u32) -> Vec<u8> {
         .collect()
 }
 
-/// True once the surface has committed a buffer (xdg mapped).
+/// True while the surface has a buffer (xdg mapped): a null buffer unmaps it.
 fn has_buffer(surface: &WlSurface) -> bool {
-    with_states(surface, |states| {
-        states
-            .data_map
-            .get::<RendererSurfaceStateUserData>()
-            .is_some()
-    })
+    with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
 }
 
 /// Runs `f` with the toplevel's (title, app_id) under the role lock.
@@ -1146,6 +1141,27 @@ mod tests {
             h.log.take(),
             vec![HandleEvent::Parent(v3_c, None), HandleEvent::Done(v3_c)]
         );
+    }
+
+    #[test]
+    fn unmap_closes_wlr_and_ext_and_remap_announces_fresh_handles() {
+        let mut h = Harness::new(&[(1, 3)]);
+        let first = h.refresh(&[(1, None)]);
+        let first_id = first[&1][0].id;
+        assert_eq!(h.log.take(), vec![HandleEvent::Done(first_id)]);
+
+        // Unmap: closed on wlr and removed from ext.
+        h.refresh(&[]);
+        assert_eq!(
+            h.log.take(),
+            vec![HandleEvent::ExtRemoved(10), HandleEvent::Closed(first_id)]
+        );
+
+        // Remap: fresh wlr handle is created; old handle receives nothing.
+        let second = h.refresh(&[(1, None)]);
+        let second_id = second[&1][0].id;
+        assert_ne!(first_id, second_id);
+        assert_eq!(h.log.take(), vec![HandleEvent::Done(second_id)]);
     }
 
     #[test]

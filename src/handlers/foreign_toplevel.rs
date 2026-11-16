@@ -1,4 +1,5 @@
-//! Our zwlr-foreign-toplevel-management-v1 + smithay's ext-foreign-toplevel-list-v1, driven by [`State::foreign_toplevel_refresh`].
+//! Our zwlr-foreign-toplevel-management-v1 + smithay's ext-foreign-toplevel-list-v1, driven by [`State::foreign_toplevel_refresh`],
+//! and mx-foreign-toplevel-info-v1 on top of the wlr handles.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -25,9 +26,14 @@ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::wayland::{Dispatch2, GlobalDispatch2};
 
 use crate::backend::Backend;
+use crate::protocols::foreign_toplevel_info::{
+    mx_foreign_toplevel_info_manager_v1::{self, MxForeignToplevelInfoManagerV1},
+    mx_foreign_toplevel_info_v1::{self, MxForeignToplevelInfoV1},
+};
 use crate::state::{State, WindowMode};
 
 const WLR_MANAGEMENT_VERSION: u32 = 3;
+const INFO_VERSION: u32 = 1;
 
 trait WlrHandle: Eq + Hash + Clone {
     type Client: PartialEq;
@@ -84,6 +90,10 @@ trait WlrEntry<S, H: WlrHandle, O> {
 #[derive(Default)]
 pub struct ForeignToplevelUdata;
 
+/// Marker so the `mx_foreign_toplevel_info_manager_v1` global and its
+/// objects dispatch here.
+pub struct ToplevelInfoUdata;
+
 /// What the foreign-toplevel protocols need to know about one toplevel.
 #[derive(Debug)]
 pub struct ToplevelData {
@@ -95,8 +105,12 @@ pub struct ToplevelData {
     output: Option<Output>,
     /// xdg parent, if any; the wlr `parent` event is sent once handles exist.
     parent: Option<WlSurface>,
+    /// The xdg-dialog modal hint.
+    modal: bool,
     /// Per-client wlr handles, each with entered outputs and parent sync state.
     wlr_management_instances: HashMap<ZwlrForeignToplevelHandleV1, WlrInstance<WlSurface, WlOutput>>,
+    /// mx info objects, each with the wlr handle it was made for.
+    infos: Vec<(MxForeignToplevelInfoV1, ZwlrForeignToplevelHandleV1)>,
     /// smithay's ext-list handle; owns all ext instance bookkeeping.
     ext_handle: Option<ForeignToplevelHandle>,
 }
@@ -177,7 +191,9 @@ impl ToplevelData {
             states: update.states.clone(),
             output: update.output.clone(),
             parent: update.parent.clone(),
+            modal: update.modal,
             wlr_management_instances: HashMap::new(),
+            infos: Vec::new(),
             ext_handle: None,
         }
     }
@@ -201,6 +217,7 @@ struct ToplevelUpdate {
     states: Vec<u8>,
     output: Option<Output>,
     parent: Option<WlSurface>,
+    modal: bool,
 }
 
 /// The foreign-toplevel module state, held by [`State`].
@@ -211,18 +228,21 @@ pub struct ForeignToplevelManagerState {
 }
 
 impl ForeignToplevelManagerState {
-    /// Register the wlr management global; ext-list lives in `State::foreign_toplevel_list`.
+    /// Register the wlr management and mx info globals; ext-list lives in
+    /// `State::foreign_toplevel_list`.
     pub fn new<D>(dh: &DisplayHandle) -> Self
     where
         D: GlobalDispatch<ZwlrForeignToplevelManagerV1, ForeignToplevelUdata>,
         D: Dispatch<ZwlrForeignToplevelManagerV1, ForeignToplevelUdata>,
         D: Dispatch<ZwlrForeignToplevelHandleV1, ForeignToplevelUdata>,
+        D: GlobalDispatch<MxForeignToplevelInfoManagerV1, ToplevelInfoUdata>,
         D: 'static,
     {
         dh.create_global::<D, ZwlrForeignToplevelManagerV1, _>(
             WLR_MANAGEMENT_VERSION,
             ForeignToplevelUdata,
         );
+        dh.create_global::<D, MxForeignToplevelInfoManagerV1, _>(INFO_VERSION, ToplevelInfoUdata);
         Self::default()
     }
 
@@ -286,8 +306,21 @@ impl ForeignToplevelManagerState {
                     parent_targets.insert(update.surface.clone());
                 }
 
-                if new_title.is_some() || new_app_id.is_some() || states_changed || output_changed {
+                let modal_changed = data.modal != update.modal;
+                data.modal = update.modal;
+
+                if new_title.is_some()
+                    || new_app_id.is_some()
+                    || states_changed
+                    || output_changed
+                    || modal_changed
+                {
                     for (instance, inst) in &mut data.wlr_management_instances {
+                        if modal_changed {
+                            for (info, _) in data.infos.iter().filter(|(_, h)| h == instance) {
+                                info.modal(u32::from(data.modal));
+                            }
+                        }
                         if let Some(title) = &new_title {
                             instance.title(title.clone());
                         }
@@ -388,6 +421,37 @@ impl ForeignToplevelManagerState {
     fn remove_wlr_instance(&mut self, resource: &ZwlrForeignToplevelHandleV1) {
         for data in self.toplevels.values_mut() {
             data.wlr_management_instances.remove(resource);
+            data.infos.retain(|(_, handle)| handle != resource);
+        }
+    }
+
+    /// Answer `get_info` for `handle`: its pid and modal hint, applied by a
+    /// `done`. A closed handle's info stays inert.
+    fn add_info(
+        &mut self,
+        dh: &DisplayHandle,
+        info: MxForeignToplevelInfoV1,
+        handle: ZwlrForeignToplevelHandleV1,
+    ) {
+        let Some(surface) = self.surface_for_wlr_handle(&handle) else {
+            return;
+        };
+        let Some(data) = self.toplevels.get_mut(&surface) else {
+            return;
+        };
+        let pid = surface
+            .client()
+            .and_then(|client| client.get_credentials(dh).ok())
+            .map_or(0, |credentials| credentials.pid);
+        info.pid(pid);
+        info.modal(u32::from(data.modal));
+        handle.done();
+        data.infos.push((info, handle));
+    }
+
+    fn remove_info(&mut self, info: &MxForeignToplevelInfoV1) {
+        for data in self.toplevels.values_mut() {
+            data.infos.retain(|(i, _)| i != info);
         }
     }
 }
@@ -636,6 +700,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     states,
                     output,
                     parent,
+                    modal: ws.modal,
                 };
                 manager.apply_one::<State<BackendData>>(
                     display_handle,
@@ -824,6 +889,74 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrForeignToplevelHandleV1, Stat
         resource: &ZwlrForeignToplevelHandleV1,
     ) {
         state.foreign_toplevel.remove_wlr_instance(resource);
+    }
+}
+
+impl<BackendData: Backend + 'static>
+    GlobalDispatch2<MxForeignToplevelInfoManagerV1, State<BackendData>> for ToplevelInfoUdata
+{
+    fn can_view(&self, client: &Client) -> bool {
+        crate::state::client_is_unrestricted(client)
+    }
+
+    fn bind(
+        &self,
+        _state: &mut State<BackendData>,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<MxForeignToplevelInfoManagerV1>,
+        data_init: &mut DataInit<'_, State<BackendData>>,
+    ) {
+        data_init.init(resource, ToplevelInfoUdata);
+    }
+}
+
+impl<BackendData: Backend + 'static> Dispatch2<MxForeignToplevelInfoManagerV1, State<BackendData>>
+    for ToplevelInfoUdata
+{
+    fn request(
+        &self,
+        state: &mut State<BackendData>,
+        _client: &Client,
+        _resource: &MxForeignToplevelInfoManagerV1,
+        request: mx_foreign_toplevel_info_manager_v1::Request,
+        dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, State<BackendData>>,
+    ) {
+        match request {
+            mx_foreign_toplevel_info_manager_v1::Request::Destroy => {}
+            mx_foreign_toplevel_info_manager_v1::Request::GetInfo { id, handle } => {
+                let info = data_init.init(id, ToplevelInfoUdata);
+                state.foreign_toplevel.add_info(dh, info, handle);
+            }
+        }
+    }
+}
+
+impl<BackendData: Backend + 'static> Dispatch2<MxForeignToplevelInfoV1, State<BackendData>>
+    for ToplevelInfoUdata
+{
+    fn request(
+        &self,
+        _state: &mut State<BackendData>,
+        _client: &Client,
+        _resource: &MxForeignToplevelInfoV1,
+        request: mx_foreign_toplevel_info_v1::Request,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, State<BackendData>>,
+    ) {
+        match request {
+            mx_foreign_toplevel_info_v1::Request::Destroy => {}
+        }
+    }
+
+    fn destroyed(
+        &self,
+        state: &mut State<BackendData>,
+        _client: ClientId,
+        resource: &MxForeignToplevelInfoV1,
+    ) {
+        state.foreign_toplevel.remove_info(resource);
     }
 }
 

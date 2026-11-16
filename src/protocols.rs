@@ -27,6 +27,12 @@ macro_rules! wayland_protocol {
 }
 
 wayland_protocol!(
+    foreign_toplevel_info,
+    "protocols/mx-foreign-toplevel-info-v1.xml",
+    [smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server]
+);
+
+wayland_protocol!(
     shell_surface,
     "protocols/mx-shell-surface-v1.xml",
     [smithay::reexports::wayland_protocols_wlr::layer_shell::v1::server]

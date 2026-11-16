@@ -72,6 +72,7 @@ Smithay: ❌ means we hand-roll it.
 | `zwlr_foreign_toplevel_manager_v1` | ✅ | 3 / 3 | ❌ | `activate`/`close` works, state requests ignored |
 | `zwlr_output_power_manager_v1` | ✅ | 1 / 1 | ❌ | |
 | `mx_shell_surface_manager_v1` | ✅ | 1 / 1 | ❌ | shell roles for layer surfaces |
+| `mx_foreign_toplevel_info_manager_v1` | ✅ | 1 / 1 | ❌ | pid and modal hint per wlr toplevel handle |
 
 ## Missing
 

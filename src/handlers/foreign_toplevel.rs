@@ -366,6 +366,25 @@ impl ForeignToplevelManagerState {
             .map(|(surface, _)| surface.clone())
     }
 
+    /// A client bound a `wl_output` for `output`: its handles of the
+    /// toplevels on that output enter it.
+    pub fn output_bound(&mut self, output: &Output, wl_output: &WlOutput) {
+        let client = wl_output.client();
+        for data in self.toplevels.values_mut() {
+            if data.output.as_ref() != Some(output) {
+                continue;
+            }
+            for (instance, inst) in &mut data.wlr_management_instances {
+                if instance.client() != client || inst.outputs.contains(wl_output) {
+                    continue;
+                }
+                instance.output_enter(wl_output);
+                inst.outputs.push(wl_output.clone());
+                instance.done();
+            }
+        }
+    }
+
     fn remove_wlr_instance(&mut self, resource: &ZwlrForeignToplevelHandleV1) {
         for data in self.toplevels.values_mut() {
             data.wlr_management_instances.remove(resource);

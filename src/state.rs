@@ -52,7 +52,7 @@ use smithay::wayland::image_capture_source::{
 };
 use smithay::wayland::image_copy_capture::ImageCopyCaptureState;
 use smithay::wayland::output::OutputManagerState;
-use smithay::wayland::presentation::{PresentationState, Refresh};
+use smithay::wayland::presentation::{PresentationFeedbackCachedState, PresentationState, Refresh};
 use smithay::wayland::session_lock::{LockSurface, SessionLocker};
 use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer, WlrLayerShellState};
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -515,6 +515,15 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             layer_surface.send_frame(output, now, None, |surface, data| {
                 frame_output(surface_primary_scanout_output(surface, data), edge, output)
             });
+            // Edge surfaces are never drawn, so their content is never presented.
+            if edge {
+                layer_surface.with_surfaces(|_, states| {
+                    let mut cached = states.cached_state.get::<PresentationFeedbackCachedState>();
+                    for callback in cached.current().callbacks.drain(..) {
+                        callback.discarded();
+                    }
+                });
+            }
         }
     }
 

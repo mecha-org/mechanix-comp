@@ -774,10 +774,18 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrForeignToplevelHandleV1, Stat
             | zwlr_foreign_toplevel_handle_v1::Request::UnsetMaximized
             | zwlr_foreign_toplevel_handle_v1::Request::SetMinimized
             | zwlr_foreign_toplevel_handle_v1::Request::UnsetMinimized
-            | zwlr_foreign_toplevel_handle_v1::Request::SetRectangle { .. }
             | zwlr_foreign_toplevel_handle_v1::Request::SetFullscreen { .. }
             | zwlr_foreign_toplevel_handle_v1::Request::UnsetFullscreen => {
                 // State is compositor-driven and reflected back on the next refresh.
+            }
+            zwlr_foreign_toplevel_handle_v1::Request::SetRectangle { width, height, .. } => {
+                // Unused, but still checked.
+                if width < 0 || height < 0 {
+                    resource.post_error(
+                        zwlr_foreign_toplevel_handle_v1::Error::InvalidRectangle,
+                        "negative rectangle size",
+                    );
+                }
             }
             zwlr_foreign_toplevel_handle_v1::Request::Activate { .. } => {
                 state.foreign_activate(&surface);

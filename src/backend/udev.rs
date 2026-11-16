@@ -581,9 +581,11 @@ impl State<UdevData> {
                 }
             };
             let egl_device = EGLDevice::device_for_display(&egl_display).ok();
+            // Emulators without host GL (e.g. QEMU virtio-gpu on macOS) only have llvmpipe; let them opt in.
             if egl_device
                 .as_ref()
                 .is_some_and(|device| device.is_software())
+                && std::env::var_os("MECHANIX_ALLOW_SOFTWARE_EGL").is_none()
             {
                 warn!("Ignoring {node}: software EGL renderer");
                 return Ok(());

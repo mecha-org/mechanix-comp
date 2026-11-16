@@ -34,7 +34,7 @@ smithay::backend::renderer::element::render_elements! {
     Thumbnail = ThumbnailElement<R>,
 }
 
-/// A toplevel's surface tree drawn into a layer surface by `phosh_private`:
+/// A toplevel's surface tree drawn into a layer surface by `mx_thumbnail_view_v1`:
 /// scaled, moved to its place in the layer, and clipped to the layer.
 pub type ThumbnailElement<R> =
     CropRenderElement<RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<R>>>>;

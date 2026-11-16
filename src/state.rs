@@ -201,7 +201,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub image_copy_capture_state: ImageCopyCaptureState,
     /// Live capture sessions and their in-flight frames.
     pub capture_sessions: Vec<CaptureSession>,
-    /// `phosh_private` thumbnail views drawn onto layer surfaces.
+    /// `mx_thumbnail_view_v1` thumbnails drawn onto layer surfaces.
     pub thumbnail_view: ThumbnailViewState,
     /// `phosh_private_keyboard_event` accelerator grabs and their repeat.
     pub keyboard_grabs: KeyboardGrabState,

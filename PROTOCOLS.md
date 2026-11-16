@@ -73,6 +73,7 @@ Smithay: ❌ means we hand-roll it.
 | `zwlr_output_power_manager_v1` | ✅ | 1 / 1 | ❌ | |
 | `mx_shell_surface_manager_v1` | ✅ | 1 / 1 | ❌ | shell roles for layer surfaces |
 | `mx_foreign_toplevel_info_manager_v1` | ✅ | 1 / 1 | ❌ | pid and modal hint per wlr toplevel handle |
+| `mx_thumbnail_view_manager_v1` | ✅ | 1 / 1 | ❌ | live toplevel thumbnails drawn onto the shell's layer surfaces |
 
 ## Missing
 

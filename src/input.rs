@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::time::Duration;
 
 use smithay::{
     backend::input::{
@@ -15,7 +16,10 @@ use smithay::{
             TouchDownGrab, TouchGrab, TouchInnerHandle, UpEvent,
         },
     },
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::{
+        calloop::{RegistrationToken, timer::{TimeoutAction, Timer}},
+        wayland_server::protocol::wl_surface::WlSurface,
+    },
     utils::{Logical, Point, SERIAL_COUNTER},
     wayland::shell::wlr_layer::{Anchor, KeyboardInteractivity},
 };
@@ -29,6 +33,12 @@ use crate::state::State;
 /// before it commits either to the edge strip (inward swipe) or to the surface
 /// underneath (any other direction).
 const EDGE_SWIPE_THRESHOLD: f64 = 8.0;
+
+/// Maximum time a touch on an edge gesture strip stays undecided before being
+/// delivered to the surface underneath as a press/hold. Touchscreens report
+/// the first motion as late as 33 ms after the touch-down, so this leaves room
+/// for a few reports.
+const EDGE_SLOP_DURATION: Duration = Duration::from_millis(150);
 
 impl<BackendData: Backend + 'static> State<BackendData> {
     /// The surface under `pos` and its location, topmost first in the order
@@ -256,6 +266,13 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         if !handle.is_grabbed() {
             if let Some((edge_surface, edge_loc, anchor)) = edge {
+                let timer = self
+                    .loop_handle
+                    .insert_source(Timer::from_duration(EDGE_SLOP_DURATION), move |_, _, state| {
+                        state.expire_edge_pending_grab(serial);
+                        TimeoutAction::Drop
+                    })
+                    .ok();
                 let grab = EdgePendingGrab {
                     start_data: GrabStartData {
                         focus: under,
@@ -265,6 +282,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     down_event,
                     edge_focus: (edge_surface, edge_loc),
                     anchor,
+                    timer,
                 };
                 handle.set_grab(self, grab, serial);
                 return;
@@ -273,6 +291,27 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
 
         handle.down(self, under, &down_event);
+    }
+
+    fn expire_edge_pending_grab(&mut self, serial: smithay::utils::Serial) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+        let pending = handle
+            .with_grab(|active_serial, grab| {
+                (active_serial == serial)
+                    .then(|| grab.downcast_ref::<EdgePendingGrab<BackendData>>())
+                    .flatten()
+                    .map(|g| (g.down_event.clone(), g.start_data.focus.clone()))
+            })
+            .flatten();
+        let Some((down_event, focus)) = pending else {
+            return;
+        };
+        handle.unset_grab(self);
+        self.assign_pointer_click_focus(down_event.location, down_event.serial);
+        handle.down(self, focus, &down_event);
+        handle.frame(self);
     }
 
     fn on_touch_up<B: InputBackend>(&mut self, evt: B::TouchUpEvent) {
@@ -617,12 +656,14 @@ fn classify_edge_motion(
 }
 
 /// Holds a touch that landed on a `Slot::Edge` layer surface until it either
-/// swipes inward (>= 8 px), moves in another direction (>= 8 px), or lifts.
+/// swipes inward (>= 8 px), moves in another direction (>= 8 px), lifts, or
+/// exceeds [`EDGE_SLOP_DURATION`] (150 ms).
 struct EdgePendingGrab<BackendData: Backend + 'static> {
     start_data: GrabStartData<State<BackendData>>,
     down_event: DownEvent,
     edge_focus: (WlSurface, Point<f64, Logical>),
     anchor: Anchor,
+    timer: Option<RegistrationToken>,
 }
 
 impl<BackendData: Backend + 'static> EdgePendingGrab<BackendData> {
@@ -742,7 +783,11 @@ impl<BackendData: Backend + 'static> TouchGrab<State<BackendData>>
         &self.start_data
     }
 
-    fn unset(&mut self, _data: &mut State<BackendData>) {}
+    fn unset(&mut self, data: &mut State<BackendData>) {
+        if let Some(token) = self.timer.take() {
+            data.loop_handle.remove(token);
+        }
+    }
 }
 
 #[cfg(test)]

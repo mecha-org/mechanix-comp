@@ -1,6 +1,5 @@
-//! Protocol bindings generated from XML specs under `protocols/`.
+//! Server bindings generated from XML specifications under `protocols/`.
 
-#[allow(unused_macros)]
 macro_rules! wayland_protocol {
     ($name:ident, $path:literal, [$($imports:path),* $(,)?]) => {
         pub mod $name {
@@ -26,6 +25,8 @@ macro_rules! wayland_protocol {
     };
 }
 
+wayland_protocol!(accelerators, "protocols/mx-accelerators-v1.xml", []);
+
 wayland_protocol!(
     thumbnail_view,
     "protocols/mx-thumbnail-view-v1.xml",
@@ -46,31 +47,3 @@ wayland_protocol!(
     "protocols/mx-shell-surface-v1.xml",
     [smithay::reexports::wayland_protocols_wlr::layer_shell::v1::server]
 );
-
-pub mod phosh_private {
-    //! Server bindings for Phosh's private protocol (`protocols/phosh-private.xml`,
-    //! read through the copy `build.rs` prepares).
-    //!
-    //! The XML references wlr interfaces; they come from smithay's
-    //! `wayland_protocols_wlr` re-export so the resource types match smithay's.
-
-    #![allow(dead_code, non_camel_case_types, unused_imports, unused_variables)]
-    #![allow(non_upper_case_globals, non_snake_case, missing_docs, clippy::all)]
-
-    use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::*;
-    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::server::*;
-    use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::*;
-    use wayland_server;
-    use wayland_server::protocol::*;
-
-    pub mod __interfaces {
-        use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::__interfaces::*;
-        use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::server::__interfaces::*;
-        use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::__interfaces::*;
-        use wayland_server::protocol::__interfaces::*;
-        include!(concat!(env!("OUT_DIR"), "/phosh_private_interfaces.rs"));
-    }
-    use self::__interfaces::*;
-
-    include!(concat!(env!("OUT_DIR"), "/phosh_private_server.rs"));
-}

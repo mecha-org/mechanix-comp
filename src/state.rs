@@ -82,9 +82,9 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::backend::Backend;
 use crate::config::Config;
+use crate::handlers::accelerators::KeyboardGrabState;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::image_copy_capture::CaptureSession;
-use crate::handlers::keyboard_event::KeyboardGrabState;
 use crate::handlers::output_power::OutputPowerManagerState;
 use crate::handlers::thumbnail_view::ThumbnailViewState;
 
@@ -203,7 +203,7 @@ pub struct State<BackendData: Backend + 'static> {
     pub capture_sessions: Vec<CaptureSession>,
     /// `mx_thumbnail_view_v1` thumbnails drawn onto layer surfaces.
     pub thumbnail_view: ThumbnailViewState,
-    /// `phosh_private_keyboard_event` accelerator grabs and their repeat.
+    /// `mx_accelerators_v1` grabs and their repeat.
     pub keyboard_grabs: KeyboardGrabState,
 
     pub seat: Seat<Self>,
@@ -316,6 +316,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let image_copy_capture_state =
             ImageCopyCaptureState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
         let thumbnail_view = ThumbnailViewState::new::<Self>(&dh);
+        let keyboard_grabs = KeyboardGrabState::new::<Self>(&dh);
         crate::handlers::shell_surface::init_shell_surface_manager::<Self>(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
@@ -340,7 +341,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             image_copy_capture_state,
             capture_sessions: Vec::new(),
             thumbnail_view,
-            keyboard_grabs: KeyboardGrabState::default(),
+            keyboard_grabs,
             idle_inhibitors: HashMap::new(),
             display_handle: dh,
             space,

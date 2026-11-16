@@ -864,6 +864,10 @@ impl State<UdevData> {
             self.stop_captures_for_output(&output);
             self.release_fifo_barriers(&output);
             self.output_power.output_removed(&output);
+            // Its layer surfaces won't be shown again; their clients make new ones.
+            for layer in layer_map_for_output(&output).layers() {
+                layer.layer_surface().send_close();
+            }
             self.space.unmap_output(&output);
             self.maybe_send_locked();
         }

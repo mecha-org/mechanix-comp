@@ -17,7 +17,10 @@ use smithay::{
         },
     },
     reexports::{
-        calloop::{RegistrationToken, timer::{TimeoutAction, Timer}},
+        calloop::{
+            RegistrationToken,
+            timer::{TimeoutAction, Timer},
+        },
         wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{Logical, Point, SERIAL_COUNTER},
@@ -49,6 +52,20 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
         self.hit_under(pos).0
+    }
+
+    /// The surface the pointer is over. Unlike [`Self::surface_under`], a
+    /// `Slot::Edge` gesture strip with nothing above it wins, so a mouse can
+    /// drive the edge gestures.
+    // FIXME: Temporary, for developer testing until mouse interactions are
+    // worked out. Strips take every pointer event over them, so a click there
+    // never reaches the surface beneath, unlike a touch that doesn't swipe in.
+    pub(crate) fn pointer_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let (under, edge) = self.hit_under(pos);
+        edge.map(|(surface, loc, _)| (surface, loc)).or(under)
     }
 
     /// Single front-to-back hit-test pass returning `(under, edge)`:
@@ -85,7 +102,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     (0, 0),
                     WindowSurfaceType::ALL,
                 ) {
-                    return (Some((s.clone(), p.to_f64() + output_geo.loc.to_f64())), None);
+                    return (
+                        Some((s.clone(), p.to_f64() + output_geo.loc.to_f64())),
+                        None,
+                    );
                 }
             }
             // If locked, don't fall through to other surfaces.
@@ -268,10 +288,13 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             if let Some((edge_surface, edge_loc, anchor)) = edge {
                 let timer = self
                     .loop_handle
-                    .insert_source(Timer::from_duration(EDGE_SLOP_DURATION), move |_, _, state| {
-                        state.expire_edge_pending_grab(serial);
-                        TimeoutAction::Drop
-                    })
+                    .insert_source(
+                        Timer::from_duration(EDGE_SLOP_DURATION),
+                        move |_, _, state| {
+                            state.expire_edge_pending_grab(serial);
+                            TimeoutAction::Drop
+                        },
+                    )
                     .ok();
                 let grab = EdgePendingGrab {
                     start_data: GrabStartData {
@@ -484,7 +507,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     pos.y = pos.y.clamp(y, y + bounds.size.h as f64 - 1.0);
                 }
                 let serial = SERIAL_COUNTER.next_serial();
-                let under = self.surface_under(pos);
+                let under = self.pointer_under(pos);
                 pointer.motion(
                     self,
                     under,
@@ -508,7 +531,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
                 let pointer = self.seat.get_pointer().unwrap();
 
-                let under = self.surface_under(pos);
+                let under = self.pointer_under(pos);
 
                 pointer.motion(
                     self,

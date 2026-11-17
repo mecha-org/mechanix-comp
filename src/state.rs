@@ -434,7 +434,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let under = self
             .backend_data
             .pointer_visible()
-            .then(|| self.surface_under(location))
+            .then(|| self.pointer_under(location))
             .flatten();
         if under.as_ref().map(|(surface, _)| surface) == pointer.current_focus().as_ref() {
             return;

@@ -1,0 +1,242 @@
+name: Build Compositor aarch64
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - canary
+    paths:
+      - ".github/workflows/build-app-aarch64.yml"
+      - "packaging/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**"
+      - "session/**"
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: 10
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  build:
+    name: mechanix-compositor
+    runs-on: ubuntu-24.04-arm
+    environment: canary
+    continue-on-error: true
+    outputs:
+      rpm_publication: ${{ steps.publish_rpm.outputs.publication }}
+      deb_publication: ${{ steps.publish_deb.outputs.publication }}
+
+    env:
+      MECHA_PULP_USERNAME: ${{ secrets.MECHA_PULP_USERNAME }}
+      MECHA_PULP_PASSWORD: ${{ secrets.MECHA_PULP_PASSWORD }}
+      MECHA_PULP_API_URL: ${{ vars.MECHA_PULP_API_URL }}
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y git tar unzip curl clang cmake pkg-config \
+            libwayland-dev libwayland-cursor0 libwayland-egl1 \
+            libwayland-egl-backend-dev libegl1-mesa-dev libgles2-mesa-dev libxkbcommon-dev \
+            libinput-dev libseat-dev libgbm-dev libdrm-dev libudev-dev libsystemd-dev \
+            build-essential jq pipx
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: aarch64-unknown-linux-gnu
+
+      - name: Install nfpm
+        env:
+          NFPM_VERSION: 2.47.0
+        run: |
+          curl -fsSL -o nfpm.deb "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_arm64.deb"
+          sudo dpkg -i nfpm.deb
+          rm nfpm.deb
+
+      - name: Install mechanix-packager
+        env:
+          MECHANIX_PACKAGER_VERSION: v0.0.1
+        run: |
+          mkdir -p "$RUNNER_TEMP/mechanix-packager"
+          curl -fsSL "https://github.com/mecha-org/mechanix-packager/archive/refs/tags/${MECHANIX_PACKAGER_VERSION}.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP/mechanix-packager" --strip-components=1
+          echo "MECHANIX_PACKAGER_DIR=$RUNNER_TEMP/mechanix-packager" >> "$GITHUB_ENV"
+
+      - name: Setup | Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build compositor
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Resolve versions
+        id: version
+        run: |
+          set -euo pipefail
+          RPM_JSON=$(python3 "$MECHANIX_PACKAGER_DIR/resolve_version.py" --format rpm) || { echo "[ERROR] rpm version resolution failed"; exit 1; }
+          DEB_JSON=$(python3 "$MECHANIX_PACKAGER_DIR/resolve_version.py" --format deb) || { echo "[ERROR] deb version resolution failed"; exit 1; }
+          echo "rpm_release=$(echo "$RPM_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
+          echo "deb_release=$(echo "$DEB_JSON" | jq -r .release)" >> "$GITHUB_OUTPUT"
+
+      - name: Package RPM
+        run: |
+          python3 "$MECHANIX_PACKAGER_DIR/package.py" ./dist --formats rpm --release "${{ steps.version.outputs.rpm_release }}"
+
+      - name: Package DEB
+        run: |
+          python3 "$MECHANIX_PACKAGER_DIR/package.py" ./dist --formats deb --release "${{ steps.version.outputs.deb_release }}"
+
+      - name: Check package sizes
+        run: |
+          for EXT in rpm deb; do
+            FILE=$(find ./dist -name "mechanix-compositor*.${EXT}" -type f | head -n1)
+
+            if [ -f "$FILE" ]; then
+              SIZE_MB=$(( $(stat -c%s "$FILE") / 1048576 ))
+              echo "$EXT size: $SIZE_MB MB"
+              if [ "$SIZE_MB" -lt 1 ]; then
+                echo "$EXT file too small: $SIZE_MB MB"
+                exit 1
+              fi
+            else
+              echo "$EXT file not found"
+              exit 1
+            fi
+          done
+
+      - name: Setup | Pulp CLI
+        run: |
+          pipx install --force pulp-cli
+          pipx inject pulp-cli pulp-cli-deb pulp_rpm
+
+      - name: Configure Pulp CLI
+        run: |
+          set -euo pipefail
+          PULP_API_URL="$(printf '%s' "${MECHA_PULP_API_URL}" | tr -d '[:space:]')"
+          PULP_API_URL="${PULP_API_URL%/}"
+          if [ -z "$PULP_API_URL" ]; then
+            echo "MECHA_PULP_API_URL is empty after trimming whitespace"
+            exit 1
+          fi
+
+          pulp config create \
+            --username "$MECHA_PULP_USERNAME" \
+            --password "$MECHA_PULP_PASSWORD" \
+            --base-url "$PULP_API_URL" \
+            --overwrite
+
+      - name: Publish RPM
+        id: publish_rpm
+        run: |
+          set -euo pipefail
+          RPM_FILE=$(find ./dist -name "mechanix-compositor*.rpm" -type f | head -n1)
+          echo "[INFO] Publishing RPM: $RPM_FILE"
+
+          OUTPUT=$(pulp rpm content upload --repository="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}" --file="$RPM_FILE")
+          echo "publication=$(echo "$OUTPUT" | jq -r '.pulp_href')" >> "$GITHUB_OUTPUT"
+
+      - name: Publish DEB
+        id: publish_deb
+        env:
+          DEB_SIGNING_SERVICE_HREF: /pulp/api/v3/signing-services/01a06111-aea8-744f-89a8-0d86ae025e5d/
+        run: |
+          set -euo pipefail
+          DEB_FILE=$(find ./dist -name "mechanix-compositor*.deb" -type f | head -n1)
+          echo "[INFO] Publishing DEB: $DEB_FILE"
+
+          pulp deb content upload \
+            --repository="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" \
+            --file="$DEB_FILE" \
+            --distribution="${{ vars.MECHA_PULP_DEB_DISTRIBUTION }}" \
+            --component=main
+
+          REPO_HREF=$(pulp deb repository show --name="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}" | jq -r '.pulp_href')
+
+          PULP_API_URL="$(printf '%s' "${MECHA_PULP_API_URL}" | tr -d '[:space:]')"
+          PULP_API_URL="${PULP_API_URL%/}"
+
+          TASK_HREF=$(curl -sf -u "${MECHA_PULP_USERNAME}:${MECHA_PULP_PASSWORD}" \
+            -X POST "${PULP_API_URL}/pulp/api/v3/publications/deb/apt/" \
+            -H "Content-Type: application/json" \
+            -d "{\"repository\": \"${REPO_HREF}\", \"signing_service\": \"${DEB_SIGNING_SERVICE_HREF}\"}" \
+            | jq -r '.task')
+
+          for i in $(seq 1 60); do
+            TASK_JSON=$(curl -sf -u "${MECHA_PULP_USERNAME}:${MECHA_PULP_PASSWORD}" "${PULP_API_URL}${TASK_HREF}")
+            STATE=$(echo "$TASK_JSON" | jq -r '.state')
+            [ "$STATE" = "completed" ] && break
+            if [ "$STATE" = "failed" ] || [ "$STATE" = "canceled" ]; then
+              echo "[ERROR] DEB publication task ${STATE}: $(echo "$TASK_JSON" | jq -r '.error')"
+              exit 1
+            fi
+            sleep 2
+          done
+          if [ "$STATE" != "completed" ]; then
+            echo "[ERROR] DEB publication task did not complete in time"
+            exit 1
+          fi
+
+          echo "publication=$(echo "$TASK_JSON" | jq -r '.created_resources[0]')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mechanix-compositor
+          path: |
+            ./target/aarch64-unknown-linux-gnu/release/compositor
+            ./dist/*.rpm
+            ./dist/*.deb
+
+  promote-stable:
+    name: Promote canary publication to stable
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    environment: stable
+
+    env:
+      MECHA_PULP_STABLE_USERNAME: ${{ secrets.MECHA_PULP_STABLE_USERNAME }}
+      MECHA_PULP_STABLE_PASSWORD: ${{ secrets.MECHA_PULP_STABLE_PASSWORD }}
+      MECHA_PULP_API_URL: ${{ vars.MECHA_PULP_API_URL }}
+
+    steps:
+      - name: Setup | Pulp CLI
+        run: |
+          pipx install --force pulp-cli
+          pipx inject pulp-cli pulp-cli-deb pulp_rpm
+
+      - name: Configure Pulp CLI
+        run: |
+          set -euo pipefail
+          PULP_API_URL="$(printf '%s' "${MECHA_PULP_API_URL}" | tr -d '[:space:]')"
+          PULP_API_URL="${PULP_API_URL%/}"
+          pulp config create \
+            --username "$MECHA_PULP_STABLE_USERNAME" \
+            --password "$MECHA_PULP_STABLE_PASSWORD" \
+            --base-url "$PULP_API_URL" \
+            --overwrite
+
+      - name: Promote RPM
+        if: needs.build.outputs.rpm_publication != ''
+        run: |
+          set -euo pipefail
+          pulp rpm distribution update \
+            --name="${{ vars.MECHA_PULP_RPMS_REPOSITORY_NAME }}-stable" \
+            --publication="${{ needs.build.outputs.rpm_publication }}"
+
+      - name: Promote DEB
+        if: needs.build.outputs.deb_publication != ''
+        run: |
+          set -euo pipefail
+          pulp deb distribution update \
+            --name="${{ vars.MECHA_PULP_DEBS_REPOSITORY_NAME }}-stable" \
+            --publication="${{ needs.build.outputs.deb_publication }}"

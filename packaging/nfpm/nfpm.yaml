@@ -1,0 +1,58 @@
+name: mechanix-compositor
+arch: "${PKG_ARCH}"
+platform: linux
+version: "${PKG_VERSION}"
+release: "${PKG_RELEASE}"
+section: utils
+priority: optional
+maintainer: "Mufeed Ali <mufeeda@mechasystems.com>, Ayaskant Panigrahi <ayaskantp@mechasystems.com>, Naman Agrawal <namana@mechasystems.com>, Shubham Patel <shubhamp@ext.mechasystems.com>"
+description: Wayland compositor for Mechanix OS
+homepage: https://github.com/mecha-org/mechanix-comp.git
+license: BSD
+
+contents:
+  - src: ./target/aarch64-unknown-linux-gnu/release/compositor
+    dst: /usr/bin/mechanix-compositor
+    file_info:
+      mode: 0755
+
+  - src: ./session/mechanix-session
+    dst: /usr/bin/mechanix-session
+    file_info:
+      mode: 0755
+
+  - src: ./session/mechanix.desktop
+    dst: /usr/share/wayland-sessions/mechanix.desktop
+    file_info:
+      mode: 0644
+
+  - src: ./session/mechanix-compositor.service
+    dst: /usr/lib/systemd/user/mechanix-compositor.service
+    file_info:
+      mode: 0644
+
+  - src: ./session/mechanix-shell.service
+    dst: /usr/lib/systemd/user/mechanix-shell.service
+    file_info:
+      mode: 0644
+
+  - src: ./session/mechanix-session.target
+    dst: /usr/lib/systemd/user/mechanix-session.target
+    file_info:
+      mode: 0644
+
+  - src: ./session/mechanix-session-shutdown.target
+    dst: /usr/lib/systemd/user/mechanix-session-shutdown.target
+    file_info:
+      mode: 0644
+
+  - src: ./session/mechanix-portals.conf
+    dst: /usr/share/xdg-desktop-portal/mechanix-portals.conf
+    file_info:
+      mode: 0644
+
+  - src: ./session/xdg-desktop-portal-wlr.conf
+    dst: /etc/xdg/xdg-desktop-portal-wlr/mechanix
+    type: config
+    file_info:
+      mode: 0644

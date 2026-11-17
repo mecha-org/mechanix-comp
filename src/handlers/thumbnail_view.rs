@@ -1,7 +1,5 @@
-//! Phosh's `phosh_private` v8: thumbnail views of toplevels drawn onto a
-//! layer surface. `add_thumbnail_view` and `get_keyboard_event` (accelerator
-//! grabs, see `keyboard_event`) are served; every other request is a protocol
-//! error. A thumbnail whose toplevel handle or layer surface is
+//! `mx_thumbnail_view_v1`: thumbnails of toplevels drawn onto a shell's
+//! layer surfaces. A thumbnail whose toplevel handle or layer surface is
 //! already gone is inert: never stored, never drawn, its requests no-ops.
 
 use std::collections::HashSet;
@@ -10,17 +8,18 @@ use std::hash::Hash;
 use smithay::reexports::wayland_server::backend::ClientId;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
+    Client, DataInit, DisplayHandle, GlobalDispatch, New, Resource,
 };
 use smithay::wayland::{Dispatch2, GlobalDispatch2};
 
 use crate::backend::Backend;
-use crate::handlers::keyboard_event::KeyboardEventUdata;
-use crate::protocols::phosh_private::phosh_private::{self, PhoshPrivate};
-use crate::protocols::phosh_private::phosh_private_thumbnail::{self, PhoshPrivateThumbnail};
+use crate::protocols::thumbnail_view::mx_thumbnail_view_manager_v1::{
+    self, MxThumbnailViewManagerV1,
+};
+use crate::protocols::thumbnail_view::mx_thumbnail_view_v1::{self, MxThumbnailViewV1};
 use crate::state::State;
 
-const PHOSH_PRIVATE_VERSION: u32 = 8;
+const VERSION: u32 = 1;
 
 /// One thumbnail: `toplevel`'s contents drawn onto `layer` with the last
 /// applied `set_properties`.
@@ -161,22 +160,20 @@ impl<T: PartialEq, S: Eq + Hash + Clone> Thumbnails<T, S> {
     }
 }
 
-/// The `phosh_private` module state, held by [`State`].
+/// The thumbnail views, held by [`State`].
 #[derive(Debug, Default)]
 pub struct ThumbnailViewState {
-    thumbnails: Thumbnails<PhoshPrivateThumbnail, WlSurface>,
+    thumbnails: Thumbnails<MxThumbnailViewV1, WlSurface>,
 }
 
 impl ThumbnailViewState {
-    /// Advertise `phosh_private` v8.
+    /// Advertise `mx_thumbnail_view_manager_v1`, to unrestricted clients
+    /// only.
     pub fn new<D>(dh: &DisplayHandle) -> Self
     where
-        D: GlobalDispatch<PhoshPrivate, PhoshPrivateUdata>,
-        D: Dispatch<PhoshPrivate, PhoshPrivateUdata>,
-        D: Dispatch<PhoshPrivateThumbnail, ThumbnailUdata>,
-        D: 'static,
+        D: GlobalDispatch<MxThumbnailViewManagerV1, ThumbnailUdata> + 'static,
     {
-        dh.create_global::<D, PhoshPrivate, _>(PHOSH_PRIVATE_VERSION, PhoshPrivateUdata);
+        dh.create_global::<D, MxThumbnailViewManagerV1, _>(VERSION, ThumbnailUdata);
         Self::default()
     }
 
@@ -212,17 +209,11 @@ impl ThumbnailViewState {
     }
 }
 
-/// Marker so the `phosh_private` global and resources dispatch here.
-pub struct PhoshPrivateUdata;
-
-/// Marker for `phosh_private_thumbnail` resources.
+/// Marker so the manager global and the thumbnails dispatch here.
 pub struct ThumbnailUdata;
 
-/// Objects created by unsupported requests; their requests are ignored.
-pub struct UnsupportedUdata;
-
-impl<BackendData: Backend + 'static> GlobalDispatch2<PhoshPrivate, State<BackendData>>
-    for PhoshPrivateUdata
+impl<BackendData: Backend + 'static> GlobalDispatch2<MxThumbnailViewManagerV1, State<BackendData>>
+    for ThumbnailUdata
 {
     fn can_view(&self, client: &Client) -> bool {
         crate::state::client_is_unrestricted(client)
@@ -233,27 +224,28 @@ impl<BackendData: Backend + 'static> GlobalDispatch2<PhoshPrivate, State<Backend
         _state: &mut State<BackendData>,
         _dh: &DisplayHandle,
         _client: &Client,
-        resource: New<PhoshPrivate>,
+        resource: New<MxThumbnailViewManagerV1>,
         data_init: &mut DataInit<'_, State<BackendData>>,
     ) {
-        data_init.init(resource, PhoshPrivateUdata);
+        data_init.init(resource, ThumbnailUdata);
     }
 }
 
-impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivate, State<BackendData>>
-    for PhoshPrivateUdata
+impl<BackendData: Backend + 'static> Dispatch2<MxThumbnailViewManagerV1, State<BackendData>>
+    for ThumbnailUdata
 {
     fn request(
         &self,
         state: &mut State<BackendData>,
         _client: &Client,
-        resource: &PhoshPrivate,
-        request: phosh_private::Request,
+        _resource: &MxThumbnailViewManagerV1,
+        request: mx_thumbnail_view_manager_v1::Request,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, State<BackendData>>,
     ) {
-        let unsupported = match request {
-            phosh_private::Request::AddThumbnailView {
+        match request {
+            mx_thumbnail_view_manager_v1::Request::Destroy => {}
+            mx_thumbnail_view_manager_v1::Request::GetThumbnail {
                 id,
                 toplevel,
                 layer_surface,
@@ -279,54 +271,31 @@ impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivate, State<BackendData>>
                         .thumbnails
                         .add(thumbnail, toplevel, layer);
                 }
-                return;
             }
-            phosh_private::Request::RotateDisplay { .. } => "rotate_display",
-            phosh_private::Request::GetXdgSwitcher { id } => {
-                data_init.init(id, UnsupportedUdata);
-                "get_xdg_switcher"
-            }
-            phosh_private::Request::GetThumbnail { id, .. } => {
-                data_init.init(id, UnsupportedUdata);
-                "get_thumbnail"
-            }
-            phosh_private::Request::GetKeyboardEvent { id } => {
-                data_init.init(id, KeyboardEventUdata);
-                return;
-            }
-            phosh_private::Request::GetStartupTracker { id } => {
-                data_init.init(id, UnsupportedUdata);
-                "get_startup_tracker"
-            }
-            phosh_private::Request::SetShellState { .. } => "set_shell_state",
-        };
-        resource.post_error(
-            phosh_private::Error::InvalidArgument,
-            format!("{unsupported} is not supported"),
-        );
+        }
     }
 }
 
-impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivateThumbnail, State<BackendData>>
+impl<BackendData: Backend + 'static> Dispatch2<MxThumbnailViewV1, State<BackendData>>
     for ThumbnailUdata
 {
     fn request(
         &self,
         state: &mut State<BackendData>,
         _client: &Client,
-        resource: &PhoshPrivateThumbnail,
-        request: phosh_private_thumbnail::Request,
+        resource: &MxThumbnailViewV1,
+        request: mx_thumbnail_view_v1::Request,
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, State<BackendData>>,
     ) {
         match request {
-            phosh_private_thumbnail::Request::SetProperties { x, y, scale, alpha } => {
+            mx_thumbnail_view_v1::Request::SetProperties { x, y, scale, alpha } => {
                 state
                     .thumbnail_view
                     .thumbnails
                     .set_properties(resource, x, y, scale, alpha as f32);
             }
-            phosh_private_thumbnail::Request::Destroy => {}
+            mx_thumbnail_view_v1::Request::Destroy => {}
         }
     }
 
@@ -334,26 +303,11 @@ impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivateThumbnail, State<Back
         &self,
         state: &mut State<BackendData>,
         _client: ClientId,
-        resource: &PhoshPrivateThumbnail,
+        resource: &MxThumbnailViewV1,
     ) {
         if let Some(layer) = state.thumbnail_view.thumbnails.remove(resource) {
             state.schedule_render_for_layers(&[layer]);
         }
-    }
-}
-
-impl<I: Resource, BackendData: Backend + 'static> Dispatch2<I, State<BackendData>>
-    for UnsupportedUdata
-{
-    fn request(
-        &self,
-        _state: &mut State<BackendData>,
-        _client: &Client,
-        _resource: &I,
-        _request: I::Request,
-        _dh: &DisplayHandle,
-        _data_init: &mut DataInit<'_, State<BackendData>>,
-    ) {
     }
 }
 
@@ -478,7 +432,7 @@ mod tests {
 
     #[test]
     fn inert_handle_makes_inert_thumbnail() {
-        // `add_thumbnail_view` with a closed handle or dead layer surface
+        // `get_thumbnail` with a closed handle or dead layer surface
         // stores nothing; the thumbnail's later requests must be harmless.
         let mut thumbnails = one_thumbnail();
         thumbnails.set_properties(&100, 10, 20, 0.5, 0.8);
@@ -489,23 +443,5 @@ mod tests {
 
         thumbnails.remove(&200);
         assert_eq!(drawn(&thumbnails, LAYER), vec![(10, 20, 0.5, 0.8)]);
-    }
-
-    #[test]
-    fn add_thumbnail_view_opcode_matches_upstream() {
-        let xml = include_str!("../../protocols/phosh-private.xml");
-        let start = xml
-            .find(r#"<interface name="phosh_private" "#)
-            .expect("phosh_private interface");
-        let end = start + xml[start..].find("</interface>").expect("interface end");
-        let index = xml[start..end]
-            .split("<request ")
-            .skip(1)
-            .position(|request| request.starts_with(r#"name="add_thumbnail_view""#))
-            .expect("add_thumbnail_view request");
-        assert_eq!(
-            usize::from(phosh_private::REQ_ADD_THUMBNAIL_VIEW_OPCODE),
-            index
-        );
     }
 }

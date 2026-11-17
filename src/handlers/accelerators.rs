@@ -1,6 +1,6 @@
-//! Accelerator-grab bookkeeping for Phosh's `phosh_private_keyboard_event`.
-//! Display-free: generic over the owner type (the protocol resource in
-//! production, `u32` in tests).
+//! `mx_accelerators_v1`: the shell's accelerator grabs, and the repeat of
+//! a held grabbed key. The bookkeeping is display-free: generic over the
+//! owner type (the protocol resource in production, `u32` in tests).
 
 use std::time::Duration;
 
@@ -8,15 +8,17 @@ use smithay::input::keyboard::{Keysym, ModifiersState, xkb};
 use smithay::reexports::calloop::RegistrationToken;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_server::backend::ClientId;
-use smithay::reexports::wayland_server::{Client, DataInit, DisplayHandle, Resource};
-use smithay::wayland::Dispatch2;
+use smithay::reexports::wayland_server::{Client, DataInit, DisplayHandle, GlobalDispatch, New};
+use smithay::wayland::{Dispatch2, GlobalDispatch2};
 use tracing::warn;
 
 use crate::backend::Backend;
-use crate::protocols::phosh_private::phosh_private_keyboard_event::{
-    self, Error as ProtoError, PhoshPrivateKeyboardEvent,
+use crate::protocols::accelerators::mx_accelerators_v1::{
+    self, GrabError as ProtoError, MxAcceleratorsV1,
 };
 use crate::state::State;
+
+const VERSION: u32 = 1;
 
 /// Delay before the first repeat of a held grabbed key.
 pub const REPEAT_DELAY: Duration = Duration::from_millis(400);
@@ -84,9 +86,7 @@ pub fn parse_accelerator(s: &str) -> Option<Accelerator> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrabError {
-    #[allow(dead_code)] // parsing rejects bad keysyms before `grab`
-    InvalidKeysym,
-    AlreadySubscribed,
+    AlreadyGrabbed,
 }
 
 /// All live grabs, keyed by owner.
@@ -108,7 +108,7 @@ impl<C> Default for Grabs<C> {
 impl<C: PartialEq> Grabs<C> {
     pub fn grab(&mut self, owner: C, acc: Accelerator) -> Result<u32, GrabError> {
         if self.entries.iter().any(|(_, _, a)| *a == acc) {
-            return Err(GrabError::AlreadySubscribed);
+            return Err(GrabError::AlreadyGrabbed);
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -147,26 +147,37 @@ impl<C: PartialEq> Grabs<C> {
 /// [`REPEAT_MAX`].
 struct Repeat {
     keysym: Keysym,
-    owner: PhoshPrivateKeyboardEvent,
+    owner: MxAcceleratorsV1,
     action_id: u32,
     /// The repeat timer; `None` once it stopped at [`REPEAT_MAX`], with the
     /// key still down and its release still to report.
     token: Option<RegistrationToken>,
 }
 
-/// Accelerator grabs of all `phosh_private_keyboard_event` resources plus the
-/// one held key.
+/// Accelerator grabs of all `mx_accelerators_v1` objects plus the one held
+/// key.
 #[derive(Default)]
 pub struct KeyboardGrabState {
-    pub grabs: Grabs<PhoshPrivateKeyboardEvent>,
+    pub grabs: Grabs<MxAcceleratorsV1>,
     repeat: Option<Repeat>,
 }
 
-/// Marker for `phosh_private_keyboard_event` resources.
-pub struct KeyboardEventUdata;
+impl KeyboardGrabState {
+    /// Advertise `mx_accelerators_v1`, to unrestricted clients only.
+    pub fn new<D>(dh: &DisplayHandle) -> Self
+    where
+        D: GlobalDispatch<MxAcceleratorsV1, AcceleratorsUdata> + 'static,
+    {
+        dh.create_global::<D, MxAcceleratorsV1, _>(VERSION, AcceleratorsUdata);
+        Self::default()
+    }
+}
+
+/// Marker so the `mx_accelerators_v1` global and objects dispatch here.
+pub struct AcceleratorsUdata;
 
 impl<BackendData: Backend + 'static> State<BackendData> {
-    fn cancel_repeat(&mut self) -> Option<(PhoshPrivateKeyboardEvent, u32)> {
+    fn cancel_repeat(&mut self) -> Option<(MxAcceleratorsV1, u32)> {
         let r = self.keyboard_grabs.repeat.take()?;
         if let Some(token) = r.token {
             self.loop_handle.remove(token);
@@ -187,12 +198,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         };
         // A new grabbed press ends the held one, before it starts: an owner
         // that ignores presses until a release sees this one.
-        if let Some((old, old_id)) = self.cancel_repeat()
-            && old.version() >= 7
-        {
-            old.accelerator_released_event(old_id, time);
+        if let Some((old, old_id)) = self.cancel_repeat() {
+            old.released(old_id, time);
         }
-        owner.accelerator_activated_event(action_id, time);
+        owner.pressed(action_id, time);
         let timer_owner = owner.clone();
         let mut first = None;
         let token = self.loop_handle.insert_source(
@@ -210,7 +219,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     }
                     return TimeoutAction::Drop;
                 }
-                timer_owner.accelerator_activated_event(action_id, now.as_millis() as u32);
+                timer_owner.pressed(action_id, now.as_millis() as u32);
                 TimeoutAction::ToDuration(REPEAT_INTERVAL)
             },
         );
@@ -245,13 +254,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .as_ref()
             .is_some_and(|r| r.keysym == keysym)
             && let Some((owner, action_id)) = self.cancel_repeat()
-            && owner.version() >= 7
         {
-            owner.accelerator_released_event(action_id, time);
+            owner.released(action_id, time);
         }
     }
 
-    fn drop_keyboard_owner(&mut self, owner: &PhoshPrivateKeyboardEvent) {
+    fn drop_keyboard_owner(&mut self, owner: &MxAcceleratorsV1) {
         self.keyboard_grabs.grabs.drop_owner(owner);
         if self
             .keyboard_grabs
@@ -264,47 +272,60 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 }
 
-impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivateKeyboardEvent, State<BackendData>>
-    for KeyboardEventUdata
+impl<BackendData: Backend + 'static> GlobalDispatch2<MxAcceleratorsV1, State<BackendData>>
+    for AcceleratorsUdata
+{
+    fn can_view(&self, client: &Client) -> bool {
+        crate::state::client_is_unrestricted(client)
+    }
+
+    fn bind(
+        &self,
+        _state: &mut State<BackendData>,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<MxAcceleratorsV1>,
+        data_init: &mut DataInit<'_, State<BackendData>>,
+    ) {
+        data_init.init(resource, AcceleratorsUdata);
+    }
+}
+
+impl<BackendData: Backend + 'static> Dispatch2<MxAcceleratorsV1, State<BackendData>>
+    for AcceleratorsUdata
 {
     fn request(
         &self,
         state: &mut State<BackendData>,
         _client: &Client,
-        resource: &PhoshPrivateKeyboardEvent,
-        request: phosh_private_keyboard_event::Request,
+        resource: &MxAcceleratorsV1,
+        request: mx_accelerators_v1::Request,
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, State<BackendData>>,
     ) {
-        use phosh_private_keyboard_event::Request;
+        use mx_accelerators_v1::Request;
         match request {
-            Request::GrabAcceleratorRequest { accelerator } => {
+            Request::Grab { accelerator } => {
                 let Some(acc) = parse_accelerator(&accelerator) else {
-                    resource.grab_failed_event(accelerator, ProtoError::InvalidKeysym as u32);
+                    resource.grab_failed(accelerator, ProtoError::InvalidAccelerator);
                     return;
                 };
                 match state.keyboard_grabs.grabs.grab(resource.clone(), acc) {
-                    Ok(id) => resource.grab_success_event(accelerator, id),
-                    Err(GrabError::AlreadySubscribed) => resource
-                        .grab_failed_event(accelerator, ProtoError::AlreadySubscribed as u32),
-                    Err(GrabError::InvalidKeysym) => {
-                        resource.grab_failed_event(accelerator, ProtoError::InvalidKeysym as u32)
+                    Ok(id) => resource.grabbed(accelerator, id),
+                    Err(GrabError::AlreadyGrabbed) => {
+                        resource.grab_failed(accelerator, ProtoError::AlreadyGrabbed)
                     }
                 }
             }
-            Request::UngrabAcceleratorRequest { action_id } => {
-                if state.keyboard_grabs.grabs.ungrab(resource, action_id) {
-                    if state
+            Request::Ungrab { action_id } => {
+                if state.keyboard_grabs.grabs.ungrab(resource, action_id)
+                    && state
                         .keyboard_grabs
                         .repeat
                         .as_ref()
                         .is_some_and(|r| r.owner == *resource && r.action_id == action_id)
-                    {
-                        state.cancel_repeat();
-                    }
-                    resource.ungrab_success_event(action_id);
-                } else {
-                    resource.ungrab_failed_event(action_id, ProtoError::InvalidArgument as u32);
+                {
+                    state.cancel_repeat();
                 }
             }
             Request::Destroy => state.drop_keyboard_owner(resource),
@@ -315,7 +336,7 @@ impl<BackendData: Backend + 'static> Dispatch2<PhoshPrivateKeyboardEvent, State<
         &self,
         state: &mut State<BackendData>,
         _client: ClientId,
-        resource: &PhoshPrivateKeyboardEvent,
+        resource: &MxAcceleratorsV1,
     ) {
         state.drop_keyboard_owner(resource);
     }
@@ -373,11 +394,11 @@ mod tests {
     }
 
     #[test]
-    fn same_accelerator_twice_is_already_subscribed() {
+    fn same_accelerator_twice_is_already_grabbed() {
         let mut g = Grabs::<u32>::default();
         g.grab(1, vol()).unwrap();
-        assert_eq!(g.grab(1, vol()), Err(GrabError::AlreadySubscribed));
-        assert_eq!(g.grab(2, vol()), Err(GrabError::AlreadySubscribed));
+        assert_eq!(g.grab(1, vol()), Err(GrabError::AlreadyGrabbed));
+        assert_eq!(g.grab(2, vol()), Err(GrabError::AlreadyGrabbed));
     }
 
     #[test]

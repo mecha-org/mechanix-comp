@@ -30,13 +30,15 @@ default-features = false
 
 [dependencies]
 bitflags = "2.13.0"
-mxconfig = { git = "https://github.com/mecha-org/mxconfig", rev = "c8f48426345e5dcc7e46ea29787a7ae706f9a82a" }
+# Smithay's calloop, for its `signals` feature.
+calloop = { version = "0.14.5", features = ["signals"] }
+mxconfig = { git = "https://github.com/mecha-org/mxconfig", rev = "e0fcff69b5fcc8a7b6a1834714b80d1fc133cc18" }
 sd-notify = "0.5.0"
 thiserror = "2.0.20"
 tracing = { version = "0.1", features = ["release_max_level_debug"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Not named in src: the phosh_private code wayland-scanner generates refers
-# to `wayland_backend::` paths.
+# Not named in src: the protocol code wayland-scanner generates refers to
+# `wayland_backend::` paths.
 wayland-backend = "0.3.16"
 wayland-scanner = "0.31.11"
 wayland-server = "0.31.14"

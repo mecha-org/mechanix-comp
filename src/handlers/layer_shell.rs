@@ -30,11 +30,14 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
             .as_ref()
             .and_then(Output::from_resource)
             .or_else(|| self.space.outputs().next().cloned());
-        if let Some(output) = output {
-            let mut map = layer_map_for_output(&output);
-            map.map_layer(&LayerSurface::new(surface, namespace))
-                .unwrap();
-        }
+        let Some(output) = output else {
+            // Nowhere to show it.
+            surface.send_close();
+            return;
+        };
+        let mut map = layer_map_for_output(&output);
+        map.map_layer(&LayerSurface::new(surface, namespace))
+            .unwrap();
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {

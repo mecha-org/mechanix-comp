@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::time::Duration;
 
 use smithay::{
     backend::input::{
@@ -10,31 +11,69 @@ use smithay::{
     input::{
         keyboard::{FilterResult, Keysym, ModifiersState, keysyms, xkb},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
-        touch::{DownEvent, TouchDownGrab, UpEvent},
+        touch::{
+            DownEvent, GrabStartData, MotionEvent as TouchMotion, OrientationEvent, ShapeEvent,
+            TouchDownGrab, TouchGrab, TouchInnerHandle, UpEvent,
+        },
     },
-    reexports::wayland_server::protocol::wl_surface::WlSurface,
+    reexports::{
+        calloop::{RegistrationToken, timer::{TimeoutAction, Timer}},
+        wayland_server::protocol::wl_surface::WlSurface,
+    },
     utils::{Logical, Point, SERIAL_COUNTER},
-    wayland::shell::wlr_layer::KeyboardInteractivity,
+    wayland::shell::wlr_layer::{Anchor, KeyboardInteractivity},
 };
 use tracing::{debug, error, info};
 
 use crate::backend::Backend;
-use crate::layout::{StackEntry, StackingOrder};
+use crate::layout::{Slot, StackEntry, StackingOrder, role_slot};
 use crate::state::State;
+
+/// Distance in logical pixels a touch on an edge gesture strip must travel
+/// before it commits either to the edge strip (inward swipe) or to the surface
+/// underneath (any other direction).
+const EDGE_SWIPE_THRESHOLD: f64 = 8.0;
+
+/// Maximum time a touch on an edge gesture strip stays undecided before being
+/// delivered to the surface underneath as a press/hold. Touchscreens report
+/// the first motion as late as 33 ms after the touch-down, so this leaves room
+/// for a few reports.
+const EDGE_SLOP_DURATION: Duration = Duration::from_millis(150);
 
 impl<BackendData: Backend + 'static> State<BackendData> {
     /// The surface under `pos` and its location, topmost first in the order
-    /// the output is drawn.
+    /// the output is drawn. `Slot::Edge` gesture strips are skipped so pointer
+    /// events and non-swipe touches pass through to surfaces beneath them.
     pub fn surface_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let output = self
+        self.hit_under(pos).0
+    }
+
+    /// Single front-to-back hit-test pass returning `(under, edge)`:
+    /// - `under`: topmost non-`Slot::Edge` surface at `pos`.
+    /// - `edge`: topmost `Slot::Edge` layer at `pos` if nothing stacked above
+    ///   it (such as a system prompt) already hit `pos`.
+    #[allow(clippy::type_complexity)]
+    fn hit_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> (
+        Option<(WlSurface, Point<f64, Logical>)>,
+        Option<(WlSurface, Point<f64, Logical>, Anchor)>,
+    ) {
+        let Some(output) = self
             .space
             .output_under(pos)
             .next()
-            .or_else(|| self.space.outputs().next())?;
-        let output_geo = self.space.output_geometry(output)?;
+            .or_else(|| self.space.outputs().next())
+        else {
+            return (None, None);
+        };
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return (None, None);
+        };
 
         if self.is_locked() {
             // Find if the pos is within any lock surface.
@@ -46,17 +85,28 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     (0, 0),
                     WindowSurfaceType::ALL,
                 ) {
-                    return Some((s.clone(), p.to_f64() + output_geo.loc.to_f64()));
+                    return (Some((s.clone(), p.to_f64() + output_geo.loc.to_f64())), None);
                 }
             }
             // If locked, don't fall through to other surfaces.
-            return None;
+            return (None, None);
         }
 
         let visible = self.visible_surfaces(output);
         let mode = self.stack_mode(output);
         let order = StackingOrder::new(&self.space, output, &visible, mode);
+        let mut edge = None;
         for stacked in order.iter() {
+            if let StackEntry::Layer(layer, _) = stacked.entry
+                && role_slot(layer) == Some(Slot::Edge)
+            {
+                if edge.is_none()
+                    && let Some((surface, loc)) = stacked.surface_under(pos)
+                {
+                    edge = Some((surface, loc, layer.cached_state().anchor));
+                }
+                continue;
+            }
             let Some(found) = stacked.surface_under(pos) else {
                 continue;
             };
@@ -66,11 +116,11 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     .toplevel()
                     .is_some_and(|t| self.modal_blocks(&visible, t.wl_surface()))
             {
-                return None;
+                return (None, edge);
             }
-            return Some(found);
+            return (Some(found), edge);
         }
-        None
+        (None, edge)
     }
 
     pub(crate) fn process_common_key_action(&mut self, action: KeyAction) {
@@ -206,21 +256,64 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         };
 
         let serial = SERIAL_COUNTER.next_serial();
+        let down_event = DownEvent {
+            slot: evt.slot(),
+            location: touch_location,
+            serial,
+            time: evt.time(),
+        };
+        let (under, edge) = self.hit_under(touch_location);
+
         if !handle.is_grabbed() {
+            if let Some((edge_surface, edge_loc, anchor)) = edge {
+                let timer = self
+                    .loop_handle
+                    .insert_source(Timer::from_duration(EDGE_SLOP_DURATION), move |_, _, state| {
+                        state.expire_edge_pending_grab(serial);
+                        TimeoutAction::Drop
+                    })
+                    .ok();
+                let grab = EdgePendingGrab {
+                    start_data: GrabStartData {
+                        focus: under,
+                        slot: down_event.slot,
+                        location: down_event.location,
+                    },
+                    down_event,
+                    edge_focus: (edge_surface, edge_loc),
+                    anchor,
+                    timer,
+                };
+                handle.set_grab(self, grab, serial);
+                return;
+            }
             self.assign_pointer_click_focus(touch_location, serial);
+            self.touch_went_down(under.as_ref(), serial);
         }
 
-        let under = self.surface_under(touch_location);
-        handle.down(
-            self,
-            under,
-            &DownEvent {
-                slot: evt.slot(),
-                location: touch_location,
-                serial,
-                time: evt.time(),
-            },
-        );
+        handle.down(self, under, &down_event);
+    }
+
+    fn expire_edge_pending_grab(&mut self, serial: smithay::utils::Serial) {
+        let Some(handle) = self.seat.get_touch() else {
+            return;
+        };
+        let pending = handle
+            .with_grab(|active_serial, grab| {
+                (active_serial == serial)
+                    .then(|| grab.downcast_ref::<EdgePendingGrab<BackendData>>())
+                    .flatten()
+                    .map(|g| (g.down_event.clone(), g.start_data.focus.clone()))
+            })
+            .flatten();
+        let Some((down_event, focus)) = pending else {
+            return;
+        };
+        handle.unset_grab(self);
+        self.assign_pointer_click_focus(down_event.location, down_event.serial);
+        self.touch_went_down(focus.as_ref(), down_event.serial);
+        handle.down(self, focus, &down_event);
+        handle.frame(self);
     }
 
     fn on_touch_up<B: InputBackend>(&mut self, evt: B::TouchUpEvent) {
@@ -246,10 +339,13 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         };
 
-        // The touch-down grab keeps the surface first touched and ignores the
-        // focus, so only other grabs (drag-and-drop) need the hit test.
+        // The touch-down and edge-pending grabs keep the surface(s) first
+        // touched and ignore `focus`, so only other grabs (drag-and-drop) need
+        // the hit test.
         let keeps_focus = handle
-            .with_grab(|_, grab| grab.is::<TouchDownGrab<Self>>())
+            .with_grab(|_, grab| {
+                grab.is::<TouchDownGrab<Self>>() || grab.is::<EdgePendingGrab<BackendData>>()
+            })
             .unwrap_or(false);
         let under = (!keeps_focus)
             .then(|| self.surface_under(touch_location))
@@ -257,7 +353,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         handle.motion(
             self,
             under,
-            &smithay::input::touch::MotionEvent {
+            &TouchMotion {
                 slot: evt.slot(),
                 location: touch_location,
                 time: evt.time(),
@@ -286,6 +382,16 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     fn on_device_removed<B: InputBackend>(&mut self, _device: B::Device) {}
+
+    /// A first touch went down on `focus`: remembered for the activation
+    /// tokens its serial may be asked for with.
+    fn touch_went_down(
+        &mut self,
+        focus: Option<&(WlSurface, Point<f64, Logical>)>,
+        serial: smithay::utils::Serial,
+    ) {
+        self.last_touch_down = focus.map(|(surface, _)| (surface.clone(), serial));
+    }
 
     /// Same focus policy for pointer press and touch down: the surface under
     /// the point takes focus, OnDemand layers only through `layer_shell_on_demand_focus`.
@@ -522,5 +628,228 @@ fn process_keyboard_shortcut(modifiers: ModifiersState, keysym: Keysym) -> Optio
         Some(KeyAction::Run("weston-terminal".into()))
     } else {
         None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeDecision {
+    Pending,
+    EdgeSwipe,
+    PassThrough,
+}
+
+fn classify_edge_motion(
+    anchor: Anchor,
+    start: Point<f64, Logical>,
+    pos: Point<f64, Logical>,
+) -> EdgeDecision {
+    let dx = pos.x - start.x;
+    let dy = pos.y - start.y;
+    let (inward, cross) = match (
+        anchor.contains(Anchor::TOP),
+        anchor.contains(Anchor::BOTTOM),
+        anchor.contains(Anchor::LEFT),
+        anchor.contains(Anchor::RIGHT),
+    ) {
+        (true, false, _, _) => (dy, dx.abs()),
+        (false, true, _, _) => (-dy, dx.abs()),
+        (_, _, true, false) => (dx, dy.abs()),
+        (_, _, false, true) => (-dx, dy.abs()),
+        _ => (0.0, dx.hypot(dy)),
+    };
+
+    if inward >= EDGE_SWIPE_THRESHOLD && inward > cross {
+        EdgeDecision::EdgeSwipe
+    } else if dx.hypot(dy) >= EDGE_SWIPE_THRESHOLD {
+        EdgeDecision::PassThrough
+    } else {
+        EdgeDecision::Pending
+    }
+}
+
+/// Holds a touch that landed on a `Slot::Edge` layer surface until it either
+/// swipes inward (>= 8 px), moves in another direction (>= 8 px), lifts, or
+/// exceeds [`EDGE_SLOP_DURATION`] (150 ms).
+struct EdgePendingGrab<BackendData: Backend + 'static> {
+    start_data: GrabStartData<State<BackendData>>,
+    down_event: DownEvent,
+    edge_focus: (WlSurface, Point<f64, Logical>),
+    anchor: Anchor,
+    timer: Option<RegistrationToken>,
+}
+
+impl<BackendData: Backend + 'static> EdgePendingGrab<BackendData> {
+    /// Flush the buffered touch-down to either the edge surface (`to_edge`) or
+    /// the surface beneath it, and hand the gesture to `TouchDownGrab` (or
+    /// unset the grab when `touch_points == 0`).
+    fn commit(
+        &mut self,
+        data: &mut State<BackendData>,
+        handle: &mut TouchInnerHandle<'_, State<BackendData>>,
+        to_edge: bool,
+        touch_points: usize,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let serial = self.down_event.serial;
+        let focus = if to_edge {
+            Some(self.edge_focus.clone())
+        } else {
+            data.assign_pointer_click_focus(self.down_event.location, serial);
+            self.start_data.focus.clone()
+        };
+        data.touch_went_down(focus.as_ref(), serial);
+        handle.down(data, focus.clone(), &self.down_event);
+        if touch_points > 0 {
+            let grab = TouchDownGrab {
+                start_data: GrabStartData {
+                    focus: focus.clone(),
+                    ..self.start_data.clone()
+                },
+                touch_points,
+            };
+            handle.set_grab(self, data, serial, grab);
+        } else {
+            handle.unset_grab(self, data);
+        }
+        focus
+    }
+}
+
+impl<BackendData: Backend + 'static> TouchGrab<State<BackendData>>
+    for EdgePendingGrab<BackendData>
+{
+    fn down(
+        &mut self,
+        data: &mut State<BackendData>,
+        handle: &mut TouchInnerHandle<'_, State<BackendData>>,
+        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &DownEvent,
+    ) {
+        let focus = self.commit(data, handle, false, 2);
+        handle.down(data, focus, event);
+    }
+
+    fn up(
+        &mut self,
+        data: &mut State<BackendData>,
+        handle: &mut TouchInnerHandle<'_, State<BackendData>>,
+        event: &UpEvent,
+    ) {
+        if event.slot == self.down_event.slot {
+            self.commit(data, handle, false, 0);
+            handle.frame(data);
+            handle.up(data, event);
+        }
+    }
+
+    fn motion(
+        &mut self,
+        data: &mut State<BackendData>,
+        handle: &mut TouchInnerHandle<'_, State<BackendData>>,
+        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &TouchMotion,
+    ) {
+        if event.slot != self.down_event.slot {
+            return;
+        }
+        let to_edge =
+            match classify_edge_motion(self.anchor, self.down_event.location, event.location) {
+                EdgeDecision::Pending => return,
+                EdgeDecision::EdgeSwipe => true,
+                EdgeDecision::PassThrough => false,
+            };
+        let focus = self.commit(data, handle, to_edge, 1);
+        handle.motion(data, focus, event);
+    }
+
+    fn frame(
+        &mut self,
+        _data: &mut State<BackendData>,
+        _handle: &mut TouchInnerHandle<'_, State<BackendData>>,
+    ) {
+    }
+
+    fn cancel(
+        &mut self,
+        data: &mut State<BackendData>,
+        handle: &mut TouchInnerHandle<'_, State<BackendData>>,
+    ) {
+        handle.unset_grab(self, data);
+    }
+
+    fn shape(
+        &mut self,
+        _data: &mut State<BackendData>,
+        _handle: &mut TouchInnerHandle<'_, State<BackendData>>,
+        _event: &ShapeEvent,
+    ) {
+    }
+
+    fn orientation(
+        &mut self,
+        _data: &mut State<BackendData>,
+        _handle: &mut TouchInnerHandle<'_, State<BackendData>>,
+        _event: &OrientationEvent,
+    ) {
+    }
+
+    fn start_data(&self) -> &GrabStartData<State<BackendData>> {
+        &self.start_data
+    }
+
+    fn unset(&mut self, data: &mut State<BackendData>) {
+        if let Some(token) = self.timer.take() {
+            data.loop_handle.remove(token);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bottom_edge_classifies_upward_swipe_vs_horizontal_or_tap() {
+        let bottom = Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT;
+        let start = Point::from((200.0, 718.0));
+
+        assert_eq!(
+            classify_edge_motion(bottom, start, Point::from((200.0, 714.0))),
+            EdgeDecision::Pending
+        );
+        assert_eq!(
+            classify_edge_motion(bottom, start, Point::from((202.0, 709.0))),
+            EdgeDecision::EdgeSwipe
+        );
+        assert_eq!(
+            classify_edge_motion(bottom, start, Point::from((212.0, 716.0))),
+            EdgeDecision::PassThrough
+        );
+        assert_eq!(
+            classify_edge_motion(bottom, start, Point::from((200.0, 728.0))),
+            EdgeDecision::PassThrough
+        );
+    }
+
+    #[test]
+    fn top_edge_classifies_downward_swipe_vs_horizontal_or_upward() {
+        let top = Anchor::TOP | Anchor::LEFT | Anchor::RIGHT;
+        let start = Point::from((120.0, 10.0));
+
+        assert_eq!(
+            classify_edge_motion(top, start, Point::from((120.0, 15.0))),
+            EdgeDecision::Pending
+        );
+        assert_eq!(
+            classify_edge_motion(top, start, Point::from((122.0, 19.0))),
+            EdgeDecision::EdgeSwipe
+        );
+        assert_eq!(
+            classify_edge_motion(top, start, Point::from((132.0, 12.0))),
+            EdgeDecision::PassThrough
+        );
+        assert_eq!(
+            classify_edge_motion(top, start, Point::from((120.0, 1.0))),
+            EdgeDecision::PassThrough
+        );
     }
 }

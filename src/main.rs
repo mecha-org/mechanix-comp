@@ -7,6 +7,7 @@ mod input;
 mod layout;
 mod protocols;
 mod render;
+mod shutdown;
 mod state;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

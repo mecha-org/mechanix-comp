@@ -34,7 +34,7 @@ use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, ObjectId,
 };
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Size, Time};
+use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Serial, Size, Time};
 use smithay::wayland::commit_timing::{
     CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
 };
@@ -52,7 +52,7 @@ use smithay::wayland::image_capture_source::{
 };
 use smithay::wayland::image_copy_capture::ImageCopyCaptureState;
 use smithay::wayland::output::OutputManagerState;
-use smithay::wayland::presentation::{PresentationState, Refresh};
+use smithay::wayland::presentation::{PresentationFeedbackCachedState, PresentationState, Refresh};
 use smithay::wayland::session_lock::{LockSurface, SessionLocker};
 use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer, WlrLayerShellState};
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -82,9 +82,9 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::backend::Backend;
 use crate::config::Config;
+use crate::handlers::accelerators::KeyboardGrabState;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::image_copy_capture::CaptureSession;
-use crate::handlers::keyboard_event::KeyboardGrabState;
 use crate::handlers::output_power::OutputPowerManagerState;
 use crate::handlers::thumbnail_view::ThumbnailViewState;
 
@@ -201,9 +201,9 @@ pub struct State<BackendData: Backend + 'static> {
     pub image_copy_capture_state: ImageCopyCaptureState,
     /// Live capture sessions and their in-flight frames.
     pub capture_sessions: Vec<CaptureSession>,
-    /// `phosh_private` thumbnail views drawn onto layer surfaces.
+    /// `mx_thumbnail_view_v1` thumbnails drawn onto layer surfaces.
     pub thumbnail_view: ThumbnailViewState,
-    /// `phosh_private_keyboard_event` accelerator grabs and their repeat.
+    /// `mx_accelerators_v1` grabs and their repeat.
     pub keyboard_grabs: KeyboardGrabState,
 
     pub seat: Seat<Self>,
@@ -230,6 +230,9 @@ pub struct State<BackendData: Backend + 'static> {
     /// focuses it while it stays a mapped OnDemand layer, so launchers and
     /// panels take keyboard focus on open.
     pub layer_shell_on_demand_focus: Option<WlSurface>,
+    /// The surface the last first touch went down on, and its serial: what
+    /// the keyboard's and pointer's focus and last enter are to them.
+    pub last_touch_down: Option<(WlSurface, Serial)>,
     /// The toplevel surface last focused; the fallback keyboard focus when no
     /// layer-shell surface holds it.
     pub active_window: Option<WlSurface>,
@@ -316,6 +319,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let image_copy_capture_state =
             ImageCopyCaptureState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
         let thumbnail_view = ThumbnailViewState::new::<Self>(&dh);
+        let keyboard_grabs = KeyboardGrabState::new::<Self>(&dh);
+        crate::handlers::shell_surface::init_shell_surface_manager::<Self>(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
@@ -339,7 +344,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             image_copy_capture_state,
             capture_sessions: Vec::new(),
             thumbnail_view,
-            keyboard_grabs: KeyboardGrabState::default(),
+            keyboard_grabs,
             idle_inhibitors: HashMap::new(),
             display_handle: dh,
             space,
@@ -367,6 +372,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             lock_surfaces: Vec::new(),
             lock_surface_outputs: HashMap::new(),
             layer_shell_on_demand_focus: None,
+            last_touch_down: None,
             active_window: None,
         };
         // From files, the settings open now.
@@ -510,9 +516,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             });
         }
         for layer_surface in layer_map_for_output(output).layers() {
+            let edge = crate::layout::role_slot(layer_surface) == Some(crate::layout::Slot::Edge);
             layer_surface.send_frame(output, now, None, |surface, data| {
-                surface_primary_scanout_output(surface, data)
+                frame_output(surface_primary_scanout_output(surface, data), edge, output)
             });
+            // Edge surfaces are never drawn, so their content is never presented.
+            if edge {
+                layer_surface.with_surfaces(|_, states| {
+                    let mut cached = states.cached_state.get::<PresentationFeedbackCachedState>();
+                    for callback in cached.current().callbacks.drain(..) {
+                        callback.discarded();
+                    }
+                });
+            }
         }
     }
 

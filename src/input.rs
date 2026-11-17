@@ -288,6 +288,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 return;
             }
             self.assign_pointer_click_focus(touch_location, serial);
+            self.touch_went_down(under.as_ref(), serial);
         }
 
         handle.down(self, under, &down_event);
@@ -310,6 +311,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         };
         handle.unset_grab(self);
         self.assign_pointer_click_focus(down_event.location, down_event.serial);
+        self.touch_went_down(focus.as_ref(), down_event.serial);
         handle.down(self, focus, &down_event);
         handle.frame(self);
     }
@@ -380,6 +382,16 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     fn on_device_removed<B: InputBackend>(&mut self, _device: B::Device) {}
+
+    /// A first touch went down on `focus`: remembered for the activation
+    /// tokens its serial may be asked for with.
+    fn touch_went_down(
+        &mut self,
+        focus: Option<&(WlSurface, Point<f64, Logical>)>,
+        serial: smithay::utils::Serial,
+    ) {
+        self.last_touch_down = focus.map(|(surface, _)| (surface.clone(), serial));
+    }
 
     /// Same focus policy for pointer press and touch down: the surface under
     /// the point takes focus, OnDemand layers only through `layer_shell_on_demand_focus`.
@@ -684,6 +696,7 @@ impl<BackendData: Backend + 'static> EdgePendingGrab<BackendData> {
             data.assign_pointer_click_focus(self.down_event.location, serial);
             self.start_data.focus.clone()
         };
+        data.touch_went_down(focus.as_ref(), serial);
         handle.down(data, focus.clone(), &self.down_event);
         if touch_points > 0 {
             let grab = TouchDownGrab {

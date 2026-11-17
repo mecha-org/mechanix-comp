@@ -34,7 +34,7 @@ use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, ObjectId,
 };
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Size, Time};
+use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Serial, Size, Time};
 use smithay::wayland::commit_timing::{
     CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
 };
@@ -230,6 +230,9 @@ pub struct State<BackendData: Backend + 'static> {
     /// focuses it while it stays a mapped OnDemand layer, so launchers and
     /// panels take keyboard focus on open.
     pub layer_shell_on_demand_focus: Option<WlSurface>,
+    /// The surface the last first touch went down on, and its serial: what
+    /// the keyboard's and pointer's focus and last enter are to them.
+    pub last_touch_down: Option<(WlSurface, Serial)>,
     /// The toplevel surface last focused; the fallback keyboard focus when no
     /// layer-shell surface holds it.
     pub active_window: Option<WlSurface>,
@@ -369,6 +372,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             lock_surfaces: Vec::new(),
             lock_surface_outputs: HashMap::new(),
             layer_shell_on_demand_focus: None,
+            last_touch_down: None,
             active_window: None,
         };
         // From files, the settings open now.

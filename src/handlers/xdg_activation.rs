@@ -19,8 +19,8 @@ impl<BackendData: Backend + 'static> XdgActivationHandler for State<BackendData>
     }
 
     /// A token without a serial is taken as is; one with a serial must
-    /// come from input the client got while it held the keyboard or the
-    /// pointer (the serial no older than that focus).
+    /// come from input the client got while it held the keyboard, the
+    /// pointer or the last touch (the serial no older than that focus).
     fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
         // Smithay never drops a token itself.
         self.xdg_activation_state
@@ -39,8 +39,10 @@ impl<BackendData: Backend + 'static> XdgActivationHandler for State<BackendData>
         };
         let keyboard = self.seat.get_keyboard().unwrap();
         let pointer = self.seat.get_pointer().unwrap();
+        let (touched, touch_down) = self.last_touch_down.clone().unzip();
         since_focus(keyboard.current_focus(), keyboard.last_enter())
             || since_focus(pointer.current_focus(), pointer.last_enter())
+            || since_focus(touched, touch_down)
     }
 
     fn request_activation(

@@ -10,7 +10,9 @@ use smithay::{
     desktop::LayerSurface,
     reexports::{
         wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
-        wayland_server::{Client, DataInit, DisplayHandle, New, Resource, WEnum, backend::GlobalId},
+        wayland_server::{
+            Client, DataInit, DisplayHandle, New, Resource, WEnum, backend::GlobalId,
+        },
     },
     wayland::{
         Dispatch2, GlobalDispatch2, compositor::with_states, shell::wlr_layer::LayerSurfaceData,

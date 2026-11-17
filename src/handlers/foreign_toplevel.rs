@@ -108,7 +108,8 @@ pub struct ToplevelData {
     /// The xdg-dialog modal hint.
     modal: bool,
     /// Per-client wlr handles, each with entered outputs and parent sync state.
-    wlr_management_instances: HashMap<ZwlrForeignToplevelHandleV1, WlrInstance<WlSurface, WlOutput>>,
+    wlr_management_instances:
+        HashMap<ZwlrForeignToplevelHandleV1, WlrInstance<WlSurface, WlOutput>>,
     /// mx info objects, each with the wlr handle it was made for.
     infos: Vec<(MxForeignToplevelInfoV1, ZwlrForeignToplevelHandleV1)>,
     /// smithay's ext-list handle; owns all ext instance bookkeeping.
@@ -1293,7 +1294,11 @@ mod tests {
         let v3_c = created[&2][2].id;
         let v3_p = created[&1][2].id;
         let events = h.log.take();
-        assert!(!events.iter().any(|e| matches!(e, HandleEvent::Parent(id, _) if *id == v1_c || *id == v2_c)));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, HandleEvent::Parent(id, _) if *id == v1_c || *id == v2_c))
+        );
         assert!(events.contains(&HandleEvent::Parent(v3_c, Some(v3_p))));
 
         h.refresh(&[(1, None), (2, None)]);

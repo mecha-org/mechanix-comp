@@ -17,7 +17,10 @@ use smithay::{
         },
     },
     reexports::{
-        calloop::{RegistrationToken, timer::{TimeoutAction, Timer}},
+        calloop::{
+            RegistrationToken,
+            timer::{TimeoutAction, Timer},
+        },
         wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{Logical, Point, SERIAL_COUNTER},
@@ -85,7 +88,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     (0, 0),
                     WindowSurfaceType::ALL,
                 ) {
-                    return (Some((s.clone(), p.to_f64() + output_geo.loc.to_f64())), None);
+                    return (
+                        Some((s.clone(), p.to_f64() + output_geo.loc.to_f64())),
+                        None,
+                    );
                 }
             }
             // If locked, don't fall through to other surfaces.
@@ -268,10 +274,13 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             if let Some((edge_surface, edge_loc, anchor)) = edge {
                 let timer = self
                     .loop_handle
-                    .insert_source(Timer::from_duration(EDGE_SLOP_DURATION), move |_, _, state| {
-                        state.expire_edge_pending_grab(serial);
-                        TimeoutAction::Drop
-                    })
+                    .insert_source(
+                        Timer::from_duration(EDGE_SLOP_DURATION),
+                        move |_, _, state| {
+                            state.expire_edge_pending_grab(serial);
+                            TimeoutAction::Drop
+                        },
+                    )
                     .ok();
                 let grab = EdgePendingGrab {
                     start_data: GrabStartData {

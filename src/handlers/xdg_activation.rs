@@ -25,6 +25,10 @@ impl<BackendData: Backend + 'static> XdgActivationHandler for State<BackendData>
         // Smithay never drops a token itself.
         self.xdg_activation_state
             .retain_tokens(|_, data| data.timestamp.elapsed() < TOKEN_LIFETIME);
+        // FIXME: any client can focus a window with a token without a serial,
+        // with no input behind it. Potentially take those from our shell
+        // alone, and let the rest only ask for attention; how the shell is
+        // told apart decides whether another shell can launch apps here.
         let Some((serial, seat)) = &data.serial else {
             return true;
         };

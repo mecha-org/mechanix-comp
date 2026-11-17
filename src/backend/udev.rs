@@ -359,6 +359,7 @@ fn is_kms_card(fd: &DrmDeviceFd) -> bool {
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<'static, State<UdevData>> = EventLoop::try_new()?;
+    crate::shutdown::stop_on_signals(&event_loop);
     let display: Display<State<UdevData>> = Display::new()?;
 
     let (session, notifier) = LibSeatSession::new()?;
@@ -538,6 +539,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.update_suspended();
         let _ = state.display_handle.flush_clients();
     })?;
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
 
     Ok(())
 }

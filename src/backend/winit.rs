@@ -89,6 +89,7 @@ impl Backend for WinitData {
 /// event loop to completion.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<State<WinitData>> = EventLoop::try_new()?;
+    crate::shutdown::stop_on_signals(&event_loop);
     let display: Display<State<WinitData>> = Display::new()?;
 
     let (backend, winit) = smithay::backend::winit::init::<GlesRenderer>()?;
@@ -329,6 +330,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.update_suspended();
         let _ = state.display_handle.flush_clients();
     })?;
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
 
     Ok(())
 }

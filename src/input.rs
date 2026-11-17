@@ -54,6 +54,20 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.hit_under(pos).0
     }
 
+    /// The surface the pointer is over. Unlike [`Self::surface_under`], a
+    /// `Slot::Edge` gesture strip with nothing above it wins, so a mouse can
+    /// drive the edge gestures.
+    // FIXME: Temporary, for developer testing until mouse interactions are
+    // worked out. Strips take every pointer event over them, so a click there
+    // never reaches the surface beneath, unlike a touch that doesn't swipe in.
+    pub(crate) fn pointer_under(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        let (under, edge) = self.hit_under(pos);
+        edge.map(|(surface, loc, _)| (surface, loc)).or(under)
+    }
+
     /// Single front-to-back hit-test pass returning `(under, edge)`:
     /// - `under`: topmost non-`Slot::Edge` surface at `pos`.
     /// - `edge`: topmost `Slot::Edge` layer at `pos` if nothing stacked above
@@ -493,7 +507,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     pos.y = pos.y.clamp(y, y + bounds.size.h as f64 - 1.0);
                 }
                 let serial = SERIAL_COUNTER.next_serial();
-                let under = self.surface_under(pos);
+                let under = self.pointer_under(pos);
                 pointer.motion(
                     self,
                     under,
@@ -517,7 +531,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
                 let pointer = self.seat.get_pointer().unwrap();
 
-                let under = self.surface_under(pos);
+                let under = self.pointer_under(pos);
 
                 pointer.motion(
                     self,

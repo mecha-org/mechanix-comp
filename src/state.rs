@@ -279,7 +279,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let popups = PopupManager::default();
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, seat_name);
-        seat.add_keyboard(Default::default(), 200, 25).unwrap();
+        seat.add_keyboard(Default::default(), 500, 15).unwrap();
         let pointer = seat.add_pointer();
 
         ViewporterState::new::<Self>(&dh);

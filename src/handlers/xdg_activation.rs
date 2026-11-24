@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::backend::Backend;
-use crate::state::State;
+use crate::state::{ActivatedWith, State};
 use smithay::input::Seat;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -49,14 +49,23 @@ impl<BackendData: Backend + 'static> XdgActivationHandler for State<BackendData>
             || since_focus(touched, touch_down)
     }
 
+    /// A live token focuses the toplevel if it's mapped, and is kept on it
+    /// either way, so the client that got the token can tell which toplevel
+    /// used it (`mx_foreign_toplevel_info_v1.activation_token`).
     fn request_activation(
         &mut self,
-        _token: XdgActivationToken,
+        token: XdgActivationToken,
         token_data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
         if token_data.timestamp.elapsed() >= TOKEN_LIFETIME {
             return;
+        }
+        if let (Some(ws), Some(client)) = (self.toplevels.get_mut(&surface), token_data.client_id) {
+            ws.activated_with = Some(ActivatedWith {
+                token: token.as_str().to_owned(),
+                client,
+            });
         }
         let window = self
             .space
@@ -64,7 +73,7 @@ impl<BackendData: Backend + 'static> XdgActivationHandler for State<BackendData>
             .find(|w| w.toplevel().is_some_and(|tl| tl.wl_surface() == &surface))
             .cloned();
         if let Some(window) = window {
-            self.focus_window(&window);
+            self.show_window(&window);
         }
     }
 }

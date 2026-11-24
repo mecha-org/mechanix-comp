@@ -2,6 +2,7 @@
 //! layer surfaces. A thumbnail whose toplevel handle or layer surface is
 //! already gone is inert: never stored, never drawn, its requests no-ops.
 
+#[cfg(test)]
 use std::collections::HashSet;
 use std::hash::Hash;
 
@@ -123,6 +124,7 @@ impl<T: PartialEq, S: Eq + Hash + Clone> Thumbnails<T, S> {
             .filter(move |thumbnail| &thumbnail.layer == layer && thumbnail.drawable())
     }
 
+    #[cfg(test)]
     fn shown_toplevels(&self) -> HashSet<S> {
         self.entries
             .iter()
@@ -191,13 +193,6 @@ impl ThumbnailViewState {
         self.thumbnails
             .for_layer(layer)
             .filter(|thumbnail| thumbnail.toplevel.is_alive())
-    }
-
-    /// Toplevels shown through at least one drawable thumbnail.
-    pub fn shown_toplevels(&self) -> HashSet<WlSurface> {
-        let mut shown = self.thumbnails.shown_toplevels();
-        shown.retain(WlSurface::is_alive);
-        shown
     }
 
     /// `s` is gone: drop thumbnails on it as a layer; those of it as a

@@ -86,7 +86,9 @@ use crate::handlers::accelerators::KeyboardGrabState;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::image_copy_capture::CaptureSession;
 use crate::handlers::output_power::OutputPowerManagerState;
+use crate::handlers::shell_surface::{osk_role_held, shown_layers};
 use crate::handlers::thumbnail_view::ThumbnailViewState;
+use crate::protocols::shell_surface::mx_shell_surface_v1::MxShellSurfaceV1;
 
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -110,6 +112,16 @@ pub struct WindowState {
     pub modal: bool,
     /// Size at the last layout.
     pub layout_size: Size<i32, Logical>,
+    /// The activation token the toplevel last asked to be activated with.
+    pub activated_with: Option<ActivatedWith>,
+}
+
+/// An `xdg_activation_v1` token a toplevel asked to be activated with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivatedWith {
+    pub token: String,
+    /// The client that got the token.
+    pub client: ClientId,
 }
 
 /// The icon surface a client sets for an active drag-and-drop, drawn next to
@@ -230,6 +242,12 @@ pub struct State<BackendData: Backend + 'static> {
     /// focuses it while it stays a mapped OnDemand layer, so launchers and
     /// panels take keyboard focus on open.
     pub layer_shell_on_demand_focus: Option<WlSurface>,
+    /// The outputs showing home: their toplevels hidden, so what the shell
+    /// shows below them is what shows (`mx_shell_surface_v1`).
+    pub showing_home: HashSet<Output>,
+    /// The shell surfaces that asked to show home, and their surfaces: told
+    /// when their output starts or stops showing it.
+    pub home_watchers: Vec<(MxShellSurfaceV1, WlSurface)>,
     /// The surface the last first touch went down on, and its serial: what
     /// the keyboard's and pointer's focus and last enter are to them.
     pub last_touch_down: Option<(WlSurface, Serial)>,
@@ -279,7 +297,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let popups = PopupManager::default();
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, seat_name);
-        seat.add_keyboard(Default::default(), 200, 25).unwrap();
+        seat.add_keyboard(Default::default(), 500, 15).unwrap();
         let pointer = seat.add_pointer();
 
         ViewporterState::new::<Self>(&dh);
@@ -372,6 +390,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             lock_surfaces: Vec::new(),
             lock_surface_outputs: HashMap::new(),
             layer_shell_on_demand_focus: None,
+            showing_home: HashSet::new(),
+            home_watchers: Vec::new(),
             last_touch_down: None,
             active_window: None,
         };
@@ -515,7 +535,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 frame_output(surface_primary_scanout_output(surface, data), shown, output)
             });
         }
-        for layer_surface in layer_map_for_output(output).layers() {
+        // A hidden layer surface gets none: its callbacks wait for the frame
+        // that shows it.
+        for layer_surface in shown_layers(&layer_map_for_output(output)) {
             let edge = crate::layout::role_slot(layer_surface) == Some(crate::layout::Slot::Edge);
             layer_surface.send_frame(output, now, None, |surface, data| {
                 frame_output(surface_primary_scanout_output(surface, data), edge, output)
@@ -548,10 +570,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         })
     }
 
-    /// Toplevels drawn through a thumbnail on one of `output`'s layer surfaces.
+    /// Toplevels drawn through a thumbnail on one of `output`'s shown layer
+    /// surfaces.
     pub fn thumbnailed_on(&self, output: &Output) -> HashSet<WlSurface> {
-        layer_map_for_output(output)
-            .layers()
+        shown_layers(&layer_map_for_output(output))
             .flat_map(|layer| {
                 self.thumbnail_view
                     .for_layer(layer.wl_surface())
@@ -561,9 +583,16 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .collect()
     }
 
-    /// Whether a drawable thumbnail shows the toplevel `toplevel`.
+    /// Whether a thumbnail on a shown layer surface shows the toplevel
+    /// `toplevel`.
     pub fn is_thumbnailed(&self, toplevel: &WlSurface) -> bool {
-        self.thumbnail_view.shown_toplevels().contains(toplevel)
+        self.space.outputs().any(|output| {
+            shown_layers(&layer_map_for_output(output)).any(|layer| {
+                self.thumbnail_view
+                    .for_layer(layer.wl_surface())
+                    .any(|thumbnail| thumbnail.toplevel == *toplevel)
+            })
+        })
     }
 
     /// Suspend mapped toplevels nothing shows, unless they are being recorded.
@@ -1015,7 +1044,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     /// The keyboard focus target: the top-most `Exclusive` layer (Overlay/Top),
-    /// else the opened/clicked `OnDemand` layer, else the active window.
+    /// else the opened/clicked `OnDemand` layer, else the active window,
+    /// unless its output shows home.
     fn compute_keyboard_focus(&self) -> Option<WlSurface> {
         for kind in [Layer::Overlay, Layer::Top] {
             if let Some(surface) = self.topmost_exclusive_layer(kind) {
@@ -1031,29 +1061,41 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
         self.active_window
             .clone()
-            .filter(|surface| surface.is_alive())
+            .filter(|surface| surface.is_alive() && !self.under_home(surface))
     }
 
-    /// The top-most mapped layer on `kind` with `Exclusive` keyboard interactivity.
+    /// The top-most mapped layer on `kind` with `Exclusive` keyboard
+    /// interactivity: by shell role, then newest first.
     fn topmost_exclusive_layer(&self, kind: Layer) -> Option<WlSurface> {
+        use crate::layout::{Slot, stack_slot};
+
+        let osk_held = osk_role_held(&self.layer_shell_state);
+        let plain = if kind == Layer::Overlay {
+            Slot::Overlay
+        } else {
+            Slot::Top
+        };
         self.space.outputs().find_map(|output| {
-            layer_map_for_output(output)
-                .layers_on(kind)
+            shown_layers(&layer_map_for_output(output))
                 .rev()
-                .find(|layer| {
-                    layer.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
+                .filter(|layer| {
+                    layer.layer() == kind
+                        && layer.cached_state().keyboard_interactivity
+                            == KeyboardInteractivity::Exclusive
                 })
+                .min_by_key(|layer| stack_slot(layer, osk_held).unwrap_or(plain))
                 .map(|layer| layer.wl_surface().clone())
         })
     }
 
-    /// Whether `surface` is still a mapped layer with `OnDemand` interactivity.
+    /// Whether `surface` is still a mapped, shown layer with `OnDemand`
+    /// interactivity.
     fn is_mapped_on_demand_layer(&self, surface: &WlSurface) -> bool {
         if !surface.is_alive() {
             return false;
         }
         self.space.outputs().any(|output| {
-            layer_map_for_output(output).layers().any(|layer| {
+            shown_layers(&layer_map_for_output(output)).any(|layer| {
                 layer.wl_surface() == surface
                     && layer.cached_state().keyboard_interactivity
                         == KeyboardInteractivity::OnDemand

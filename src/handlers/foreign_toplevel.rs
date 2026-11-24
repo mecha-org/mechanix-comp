@@ -30,7 +30,7 @@ use crate::protocols::foreign_toplevel_info::{
     mx_foreign_toplevel_info_manager_v1::{self, MxForeignToplevelInfoManagerV1},
     mx_foreign_toplevel_info_v1::{self, MxForeignToplevelInfoV1},
 };
-use crate::state::{State, WindowMode};
+use crate::state::{ActivatedWith, State, WindowMode};
 
 const WLR_MANAGEMENT_VERSION: u32 = 3;
 const INFO_VERSION: u32 = 1;
@@ -107,6 +107,8 @@ pub struct ToplevelData {
     parent: Option<WlSurface>,
     /// The xdg-dialog modal hint.
     modal: bool,
+    /// The activation token the toplevel last asked to be activated with.
+    activated_with: Option<ActivatedWith>,
     /// Per-client wlr handles, each with entered outputs and parent sync state.
     wlr_management_instances:
         HashMap<ZwlrForeignToplevelHandleV1, WlrInstance<WlSurface, WlOutput>>,
@@ -193,6 +195,7 @@ impl ToplevelData {
             output: update.output.clone(),
             parent: update.parent.clone(),
             modal: update.modal,
+            activated_with: update.activated_with.cloned(),
             wlr_management_instances: HashMap::new(),
             infos: Vec::new(),
             ext_handle: None,
@@ -213,12 +216,13 @@ impl ToplevelData {
 }
 
 /// One toplevel's freshly observed state, applied to the announced set.
-struct ToplevelUpdate {
+struct ToplevelUpdate<'a> {
     surface: WlSurface,
     states: Vec<u8>,
     output: Option<Output>,
     parent: Option<WlSurface>,
     modal: bool,
+    activated_with: Option<&'a ActivatedWith>,
 }
 
 /// The foreign-toplevel module state, held by [`State`].
@@ -347,6 +351,22 @@ impl ForeignToplevelManagerState {
                     }
                 }
 
+                if data.activated_with.as_ref() != update.activated_with {
+                    data.activated_with = update.activated_with.cloned();
+                    if let Some(activated) = &data.activated_with {
+                        let ours = data
+                            .infos
+                            .iter()
+                            .filter(|(info, _)| got_token(info, activated));
+                        for (info, handle) in ours {
+                            info.activation_token(activated.token.clone());
+                            if let Some(inst) = data.wlr_management_instances.get_mut(handle) {
+                                inst.needs_done = true;
+                            }
+                        }
+                    }
+                }
+
                 // Clean up dead wl_outputs.
                 for inst in data.wlr_management_instances.values_mut() {
                     inst.outputs.retain(|wl_output| wl_output.is_alive());
@@ -426,8 +446,8 @@ impl ForeignToplevelManagerState {
         }
     }
 
-    /// Answer `get_info` for `handle`: its pid and modal hint, applied by a
-    /// `done`. A closed handle's info stays inert.
+    /// Answer `get_info` for `handle`: its pid, modal hint and activation
+    /// token, applied by a `done`. A closed handle's info stays inert.
     fn add_info(
         &mut self,
         dh: &DisplayHandle,
@@ -446,6 +466,9 @@ impl ForeignToplevelManagerState {
             .map_or(0, |credentials| credentials.pid);
         info.pid(pid);
         info.modal(u32::from(data.modal));
+        if let Some(activated) = data.activated_with.as_ref().filter(|a| got_token(&info, a)) {
+            info.activation_token(activated.token.clone());
+        }
         handle.done();
         data.infos.push((info, handle));
     }
@@ -455,6 +478,12 @@ impl ForeignToplevelManagerState {
             data.infos.retain(|(i, _)| i != info);
         }
     }
+}
+
+/// Whether `info`'s client is the one that got the activation token: only
+/// it hears which toplevel used it.
+fn got_token(info: &MxForeignToplevelInfoV1, activated: &ActivatedWith) -> bool {
+    info.client().is_some_and(|c| c.id() == activated.client)
 }
 
 /// Emit `done` on every handle of `data` with pending changes.
@@ -702,6 +731,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                     output,
                     parent,
                     modal: ws.modal,
+                    activated_with: ws.activated_with.as_ref(),
                 };
                 manager.apply_one::<State<BackendData>>(
                     display_handle,

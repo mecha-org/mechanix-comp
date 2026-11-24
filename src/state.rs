@@ -110,6 +110,16 @@ pub struct WindowState {
     pub modal: bool,
     /// Size at the last layout.
     pub layout_size: Size<i32, Logical>,
+    /// The activation token the toplevel last asked to be activated with.
+    pub activated_with: Option<ActivatedWith>,
+}
+
+/// An `xdg_activation_v1` token a toplevel asked to be activated with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivatedWith {
+    pub token: String,
+    /// The client that got the token.
+    pub client: ClientId,
 }
 
 /// The icon surface a client sets for an active drag-and-drop, drawn next to

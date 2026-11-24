@@ -37,6 +37,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
                 output: None,
                 modal: false,
                 layout_size: Size::default(),
+                activated_with: None,
             },
         );
     }

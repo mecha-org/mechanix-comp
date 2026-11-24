@@ -120,6 +120,11 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     let zone_before = layer_map_for_output(&output).non_exclusive_zone();
     let (needs_configure, on_demand) = {
         let mut map = layer_map_for_output(&output);
+        // A hidden surface reserves no space; the commit that hides or shows
+        // it re-arranges the rest with it.
+        if let Some(layer) = map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL) {
+            layer.set_exclusive_zone_ignored(crate::handlers::shell_surface::hidden(layer));
+        }
         map.arrange();
         let layer = map
             .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)

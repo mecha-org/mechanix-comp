@@ -558,10 +558,12 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         })
     }
 
-    /// Toplevels drawn through a thumbnail on one of `output`'s layer surfaces.
+    /// Toplevels drawn through a thumbnail on one of `output`'s shown layer
+    /// surfaces.
     pub fn thumbnailed_on(&self, output: &Output) -> HashSet<WlSurface> {
         layer_map_for_output(output)
             .layers()
+            .filter(|layer| !crate::handlers::shell_surface::hidden(layer))
             .flat_map(|layer| {
                 self.thumbnail_view
                     .for_layer(layer.wl_surface())
@@ -1044,7 +1046,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .filter(|surface| surface.is_alive())
     }
 
-    /// The top-most mapped layer on `kind` with `Exclusive` keyboard interactivity.
+    /// The top-most mapped, shown layer on `kind` with `Exclusive` keyboard
+    /// interactivity.
     fn topmost_exclusive_layer(&self, kind: Layer) -> Option<WlSurface> {
         self.space.outputs().find_map(|output| {
             layer_map_for_output(output)
@@ -1052,12 +1055,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 .rev()
                 .find(|layer| {
                     layer.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
+                        && !crate::handlers::shell_surface::hidden(layer)
                 })
                 .map(|layer| layer.wl_surface().clone())
         })
     }
 
-    /// Whether `surface` is still a mapped layer with `OnDemand` interactivity.
+    /// Whether `surface` is still a mapped, shown layer with `OnDemand`
+    /// interactivity.
     fn is_mapped_on_demand_layer(&self, surface: &WlSurface) -> bool {
         if !surface.is_alive() {
             return false;
@@ -1067,6 +1072,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 layer.wl_surface() == surface
                     && layer.cached_state().keyboard_interactivity
                         == KeyboardInteractivity::OnDemand
+                    && !crate::handlers::shell_surface::hidden(layer)
             })
         })
     }

@@ -410,6 +410,7 @@ pub(crate) fn role_slot(layer: &LayerSurface) -> Option<Slot> {
         Some(ShellRole::Osk) => Some(Slot::Keyboard),
         Some(ShellRole::View) => Some(Slot::View),
         None if layer.namespace() == "osk" => Some(Slot::Keyboard),
+        Some(ShellRole::None) => None,
         None => None,
     }
 }
@@ -443,12 +444,16 @@ impl<'a> StackingOrder<'a> {
     /// focus), prompts, edges and bars, OSDs, the keyboard otherwise, views,
     /// other Overlay layers, a fullscreen family, other Top layers,
     /// Bottom/Background popups, other windows, Bottom/Background surfaces.
-    /// Within a slot, newest first.
+    /// Within a slot, newest first. Hidden layer surfaces are left out.
     pub fn iter(&self) -> impl Iterator<Item = Stacked<'_>> {
         let popups = WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE;
         let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
         let mut layers = Vec::new();
         for surface in self.map.layers().rev() {
+            // Hidden: not drawn, and no input reaches it.
+            if crate::handlers::shell_surface::hidden(surface) {
+                continue;
+            }
             let Some(geo) = self.map.layer_geometry(surface) else {
                 continue;
             };

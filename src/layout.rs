@@ -19,7 +19,7 @@ use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::backend::Backend;
-use crate::handlers::shell_surface::{ShellRole, osk_role_held, shell_role};
+use crate::handlers::shell_surface::{ShellRole, osk_role_held, shell_role, shown_layers};
 use crate::state::State;
 use crate::state::WindowMode;
 
@@ -473,11 +473,8 @@ impl<'a> StackingOrder<'a> {
         let popups = WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE;
         let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
         let mut layers = Vec::new();
-        for surface in self.map.layers().rev() {
-            // Hidden: not drawn, and no input reaches it.
-            if crate::handlers::shell_surface::hidden(surface) {
-                continue;
-            }
+        // Hidden ones: not drawn, and no input reaches them.
+        for surface in shown_layers(&self.map).rev() {
             let Some(geo) = self.map.layer_geometry(surface) else {
                 continue;
             };

@@ -416,6 +416,51 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.last_touch_down = focus.map(|(surface, _)| (surface.clone(), serial));
     }
 
+    /// The layer surface `layer` on `output` was just hidden: what it had
+    /// ends. Its OnDemand keyboard focus goes, and a touch sequence or pointer
+    /// grab that began on it, or on its popups or subsurfaces, is cancelled.
+    /// Keyboard and pointer focus move on at the next refresh, as a hidden
+    /// surface is in no [`StackingOrder`] and can have no focus.
+    pub fn layer_hidden(&mut self, output: &smithay::output::Output, layer: &WlSurface) {
+        if self.layer_shell_on_demand_focus.as_ref() == Some(layer) {
+            self.layer_shell_on_demand_focus = None;
+        }
+        let on_layer = |surface: &WlSurface| {
+            layer_map_for_output(output)
+                .layer_for_surface(surface, WindowSurfaceType::ALL)
+                .is_some_and(|l| l.wl_surface() == layer)
+        };
+        if let Some(touch) = self.seat.get_touch() {
+            let started = touch
+                .grab_start_data()
+                .and_then(|data| data.focus)
+                .is_some_and(|(surface, _)| on_layer(&surface));
+            // A touch held on an edge strip has not reached the strip yet.
+            let held = touch
+                .with_grab(|_, grab| {
+                    grab.downcast_ref::<EdgePendingGrab<BackendData>>()
+                        .is_some_and(|g| on_layer(&g.edge_focus.0))
+                })
+                .unwrap_or(false);
+            if started || held {
+                touch.cancel(self);
+            }
+        }
+        if let Some(pointer) = self.seat.get_pointer() {
+            let started = pointer
+                .grab_start_data()
+                .and_then(|data| data.focus)
+                .is_some_and(|(surface, _)| on_layer(&surface));
+            if started {
+                pointer.unset_grab(
+                    self,
+                    SERIAL_COUNTER.next_serial(),
+                    smithay::backend::input::InputTime::now(),
+                );
+            }
+        }
+    }
+
     /// Same focus policy for pointer press and touch down: the surface under
     /// the point takes focus, OnDemand layers only through `layer_shell_on_demand_focus`.
     fn assign_pointer_click_focus(

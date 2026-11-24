@@ -86,6 +86,7 @@ use crate::handlers::accelerators::KeyboardGrabState;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::image_copy_capture::CaptureSession;
 use crate::handlers::output_power::OutputPowerManagerState;
+use crate::handlers::shell_surface::{osk_role_held, shown_layers};
 use crate::handlers::thumbnail_view::ThumbnailViewState;
 
 /// How a toplevel is arranged right now.
@@ -525,7 +526,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
                 frame_output(surface_primary_scanout_output(surface, data), shown, output)
             });
         }
-        for layer_surface in layer_map_for_output(output).layers() {
+        // A hidden layer surface gets none: its callbacks wait for the frame
+        // that shows it.
+        for layer_surface in shown_layers(&layer_map_for_output(output)) {
             let edge = crate::layout::role_slot(layer_surface) == Some(crate::layout::Slot::Edge);
             layer_surface.send_frame(output, now, None, |surface, data| {
                 frame_output(surface_primary_scanout_output(surface, data), edge, output)
@@ -561,9 +564,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     /// Toplevels drawn through a thumbnail on one of `output`'s shown layer
     /// surfaces.
     pub fn thumbnailed_on(&self, output: &Output) -> HashSet<WlSurface> {
-        layer_map_for_output(output)
-            .layers()
-            .filter(|layer| !crate::handlers::shell_surface::hidden(layer))
+        shown_layers(&layer_map_for_output(output))
             .flat_map(|layer| {
                 self.thumbnail_view
                     .for_layer(layer.wl_surface())
@@ -573,9 +574,16 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .collect()
     }
 
-    /// Whether a drawable thumbnail shows the toplevel `toplevel`.
+    /// Whether a thumbnail on a shown layer surface shows the toplevel
+    /// `toplevel`.
     pub fn is_thumbnailed(&self, toplevel: &WlSurface) -> bool {
-        self.thumbnail_view.shown_toplevels().contains(toplevel)
+        self.space.outputs().any(|output| {
+            shown_layers(&layer_map_for_output(output)).any(|layer| {
+                self.thumbnail_view
+                    .for_layer(layer.wl_surface())
+                    .any(|thumbnail| thumbnail.toplevel == *toplevel)
+            })
+        })
     }
 
     /// Suspend mapped toplevels nothing shows, unless they are being recorded.
@@ -1051,19 +1059,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     fn topmost_exclusive_layer(&self, kind: Layer) -> Option<WlSurface> {
         use crate::layout::{Slot, stack_slot};
 
-        let osk_held = crate::handlers::shell_surface::osk_role_held(&self.layer_shell_state);
+        let osk_held = osk_role_held(&self.layer_shell_state);
         let plain = if kind == Layer::Overlay {
             Slot::Overlay
         } else {
             Slot::Top
         };
         self.space.outputs().find_map(|output| {
-            layer_map_for_output(output)
-                .layers_on(kind)
+            shown_layers(&layer_map_for_output(output))
                 .rev()
                 .filter(|layer| {
-                    layer.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
-                        && !crate::handlers::shell_surface::hidden(layer)
+                    layer.layer() == kind
+                        && layer.cached_state().keyboard_interactivity
+                            == KeyboardInteractivity::Exclusive
                 })
                 .min_by_key(|layer| stack_slot(layer, osk_held).unwrap_or(plain))
                 .map(|layer| layer.wl_surface().clone())
@@ -1077,11 +1085,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return false;
         }
         self.space.outputs().any(|output| {
-            layer_map_for_output(output).layers().any(|layer| {
+            shown_layers(&layer_map_for_output(output)).any(|layer| {
                 layer.wl_surface() == surface
                     && layer.cached_state().keyboard_interactivity
                         == KeyboardInteractivity::OnDemand
-                    && !crate::handlers::shell_surface::hidden(layer)
             })
         })
     }

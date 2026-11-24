@@ -10,10 +10,10 @@
 //! place that shows a layer surface, routes input or focus to it or reserves
 //! its zone skips one that is [`hidden`].
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use smithay::{
-    desktop::LayerSurface,
+    desktop::{LayerMap, LayerSurface},
     reexports::{
         wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         wayland_server::{
@@ -63,7 +63,7 @@ impl Cacheable for ShellState {
 
 /// Whether a layer surface has a shell surface now: at most one at a time.
 #[derive(Default)]
-struct Constructed(Mutex<bool>);
+struct Constructed(AtomicBool);
 
 /// The current shell state of the layer surface `surface`.
 fn state_of(surface: &WlSurface) -> ShellState {
@@ -83,6 +83,38 @@ pub fn hidden(layer: &LayerSurface) -> bool {
     state_of(layer.wl_surface()).hidden
 }
 
+/// The layer surfaces of `map` that are shown. Whatever draws a layer
+/// surface, gives it input, focus or frames, or counts it as on screen goes
+/// through this, so a hidden one is left out of all of them at once.
+pub fn shown_layers(map: &LayerMap) -> impl DoubleEndedIterator<Item = &LayerSurface> {
+    map.layers().filter(|layer| !hidden(layer))
+}
+
+/// The layer surface on `surface` is gone: its shell state goes with it, so
+/// a new layer surface on the same `wl_surface` starts shown, without a
+/// role, and may get a shell surface of its own.
+pub fn layer_destroyed(surface: &WlSurface) {
+    // A `wl_surface` destroyed first takes its state with it.
+    if !surface.is_alive() {
+        return;
+    }
+    release(surface);
+    with_states(surface, |states| {
+        *states.cached_state.get::<ShellState>().current() = ShellState::default();
+    });
+}
+
+/// The layer surface on `surface` gives up its shell state: shown and
+/// without a role from its next commit, and free to get a new shell surface.
+fn release(surface: &WlSurface) {
+    with_states(surface, |states| {
+        *states.cached_state.get::<ShellState>().pending() = ShellState::default();
+        if let Some(constructed) = states.data_map.get::<Constructed>() {
+            constructed.0.store(false, Ordering::Relaxed);
+        }
+    });
+}
+
 /// Whether some layer surface has the osk role, on any layer, mapped or
 /// hidden or not.
 pub fn osk_role_held(layer_shell: &WlrLayerShellState) -> bool {
@@ -94,9 +126,27 @@ pub fn osk_role_held(layer_shell: &WlrLayerShellState) -> bool {
 /// Marker so the `mx_shell_surface_manager_v1` global and resources dispatch here.
 pub struct ShellSurfaceManagerUdata;
 
-/// The layer surface a `mx_shell_surface_v1` extends; `None` for one made
-/// inert because its layer surface was already gone.
-pub struct ShellSurfaceUdata(Option<WlSurface>);
+/// The layer surface a `mx_shell_surface_v1` extends, and its `wl_surface`.
+struct Extended {
+    layer_surface: ZwlrLayerSurfaceV1,
+    surface: WlSurface,
+}
+
+/// What a `mx_shell_surface_v1` extends; `None` for one made inert because
+/// its layer surface was already gone.
+pub struct ShellSurfaceUdata(Option<Extended>);
+
+impl ShellSurfaceUdata {
+    /// The `wl_surface` this shell surface drives, while its layer surface
+    /// lives: once that is destroyed the shell surface is inert, even if the
+    /// `wl_surface` gets a new layer surface.
+    fn surface(&self) -> Option<&WlSurface> {
+        self.0
+            .as_ref()
+            .filter(|extended| extended.layer_surface.is_alive())
+            .map(|extended| &extended.surface)
+    }
+}
 
 /// Registers the `mx_shell_surface_manager_v1` global, restricted to
 /// unrestricted (host/shell) clients.
@@ -176,7 +226,7 @@ fn construct<BackendData: Backend>(
     state: &mut State<BackendData>,
     layer_surface: &ZwlrLayerSurfaceV1,
     role: Option<ShellRole>,
-) -> Result<Option<WlSurface>, Error> {
+) -> Result<Option<Extended>, Error> {
     // On the surface, not the mapped layer: a surface that is not on an
     // output yet keeps its state for when it is.
     let Some(layer) = state
@@ -198,24 +248,20 @@ fn construct<BackendData: Backend>(
         states
             .data_map
             .insert_if_missing_threadsafe(Constructed::default);
-        let mut constructed = states
-            .data_map
-            .get::<Constructed>()
-            .unwrap()
-            .0
-            .lock()
-            .unwrap();
-        if *constructed {
+        let constructed = &states.data_map.get::<Constructed>().unwrap().0;
+        if constructed.swap(true, Ordering::Relaxed) {
             return Err(Error::AlreadyConstructed);
         }
-        *constructed = true;
         *states.cached_state.get::<ShellState>().pending() = ShellState {
             role,
             hidden: false,
         };
         Ok(())
     })?;
-    Ok(Some(surface))
+    Ok(Some(Extended {
+        layer_surface: layer_surface.clone(),
+        surface,
+    }))
 }
 
 impl<BackendData: Backend + 'static> Dispatch2<MxShellSurfaceV1, State<BackendData>>
@@ -232,7 +278,7 @@ impl<BackendData: Backend + 'static> Dispatch2<MxShellSurfaceV1, State<BackendDa
     ) {
         match request {
             mx_shell_surface_v1::Request::SetHidden { hidden } => {
-                let Some(surface) = self.0.as_ref().filter(|s| s.is_alive()) else {
+                let Some(surface) = self.surface() else {
                     return;
                 };
                 with_states(surface, |states| {
@@ -251,15 +297,9 @@ impl<BackendData: Backend + 'static> Dispatch2<MxShellSurfaceV1, State<BackendDa
         _client: ClientId,
         _resource: &MxShellSurfaceV1,
     ) {
-        let Some(surface) = self.0.as_ref().filter(|s| s.is_alive()) else {
-            return;
-        };
-        with_states(surface, |states| {
-            *states.cached_state.get::<ShellState>().pending() = ShellState::default();
-            if let Some(constructed) = states.data_map.get::<Constructed>() {
-                *constructed.0.lock().unwrap() = false;
-            }
-        });
+        if let Some(surface) = self.surface() {
+            release(surface);
+        }
     }
 }
 

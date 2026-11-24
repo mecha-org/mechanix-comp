@@ -773,7 +773,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         };
         let window = ws.window.clone();
-        self.focus_window(&window);
+        self.show_window(&window);
     }
 
     /// wlr `close` request: ask the toplevel to close.

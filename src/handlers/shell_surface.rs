@@ -13,7 +13,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use smithay::{
-    desktop::{LayerMap, LayerSurface},
+    desktop::{LayerMap, LayerSurface, WindowSurfaceType, layer_map_for_output},
     reexports::{
         wayland_protocols_wlr::layer_shell::v1::server::zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
         wayland_server::{
@@ -269,21 +269,42 @@ impl<BackendData: Backend + 'static> Dispatch2<MxShellSurfaceV1, State<BackendDa
 {
     fn request(
         &self,
-        _state: &mut State<BackendData>,
+        state: &mut State<BackendData>,
         _client: &Client,
-        _resource: &MxShellSurfaceV1,
+        resource: &MxShellSurfaceV1,
         request: mx_shell_surface_v1::Request,
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, State<BackendData>>,
     ) {
+        let Some(surface) = self.surface() else {
+            return;
+        };
         match request {
             mx_shell_surface_v1::Request::SetHidden { hidden } => {
-                let Some(surface) = self.surface() else {
-                    return;
-                };
                 with_states(surface, |states| {
                     states.cached_state.get::<ShellState>().pending().hidden = hidden != 0;
                 });
+            }
+            mx_shell_surface_v1::Request::SetShowingHome { showing } => {
+                // On the output its layer surface is on; none, nothing to show.
+                let Some(output) = state
+                    .space
+                    .outputs()
+                    .find(|o| {
+                        layer_map_for_output(o)
+                            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                            .is_some()
+                    })
+                    .cloned()
+                else {
+                    return;
+                };
+                if !state.home_watchers.iter().any(|(w, _)| w == resource) {
+                    state
+                        .home_watchers
+                        .push((resource.clone(), surface.clone()));
+                }
+                state.set_showing_home(&output, showing != 0);
             }
             mx_shell_surface_v1::Request::Destroy => {}
         }
@@ -293,10 +314,11 @@ impl<BackendData: Backend + 'static> Dispatch2<MxShellSurfaceV1, State<BackendDa
     /// may then be made, before the first configure only.
     fn destroyed(
         &self,
-        _state: &mut State<BackendData>,
+        state: &mut State<BackendData>,
         _client: ClientId,
-        _resource: &MxShellSurfaceV1,
+        resource: &MxShellSurfaceV1,
     ) {
+        state.home_watchers.retain(|(w, _)| w != resource);
         if let Some(surface) = self.surface() {
             release(surface);
         }

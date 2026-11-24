@@ -88,6 +88,7 @@ use crate::handlers::image_copy_capture::CaptureSession;
 use crate::handlers::output_power::OutputPowerManagerState;
 use crate::handlers::shell_surface::{osk_role_held, shown_layers};
 use crate::handlers::thumbnail_view::ThumbnailViewState;
+use crate::protocols::shell_surface::mx_shell_surface_v1::MxShellSurfaceV1;
 
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -241,6 +242,12 @@ pub struct State<BackendData: Backend + 'static> {
     /// focuses it while it stays a mapped OnDemand layer, so launchers and
     /// panels take keyboard focus on open.
     pub layer_shell_on_demand_focus: Option<WlSurface>,
+    /// The outputs showing home: their toplevels hidden, so what the shell
+    /// shows below them is what shows (`mx_shell_surface_v1`).
+    pub showing_home: HashSet<Output>,
+    /// The shell surfaces that asked to show home, and their surfaces: told
+    /// when their output starts or stops showing it.
+    pub home_watchers: Vec<(MxShellSurfaceV1, WlSurface)>,
     /// The surface the last first touch went down on, and its serial: what
     /// the keyboard's and pointer's focus and last enter are to them.
     pub last_touch_down: Option<(WlSurface, Serial)>,
@@ -383,6 +390,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             lock_surfaces: Vec::new(),
             lock_surface_outputs: HashMap::new(),
             layer_shell_on_demand_focus: None,
+            showing_home: HashSet::new(),
+            home_watchers: Vec::new(),
             last_touch_down: None,
             active_window: None,
         };
@@ -1035,7 +1044,8 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     }
 
     /// The keyboard focus target: the top-most `Exclusive` layer (Overlay/Top),
-    /// else the opened/clicked `OnDemand` layer, else the active window.
+    /// else the opened/clicked `OnDemand` layer, else the active window,
+    /// unless its output shows home.
     fn compute_keyboard_focus(&self) -> Option<WlSurface> {
         for kind in [Layer::Overlay, Layer::Top] {
             if let Some(surface) = self.topmost_exclusive_layer(kind) {
@@ -1051,7 +1061,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
         self.active_window
             .clone()
-            .filter(|surface| surface.is_alive())
+            .filter(|surface| surface.is_alive() && !self.under_home(surface))
     }
 
     /// The top-most mapped layer on `kind` with `Exclusive` keyboard

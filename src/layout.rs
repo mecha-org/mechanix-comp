@@ -295,11 +295,15 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .unwrap()
     }
 
-    /// The active family's windows mapped on `output`, the ones it shows.
+    /// The active family's windows mapped on `output`, the ones it shows:
+    /// none while it shows home.
     pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
         let Some(focused) = &self.active_window else {
             return HashSet::new();
         };
+        if self.showing_home.contains(output) {
+            return HashSet::new();
+        }
         let root = self.root_of(focused);
         self.space
             .elements()
@@ -314,14 +318,15 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     /// How `output` stacks: whether its shown windows are a fullscreen family,
     /// and whether a prompt has the keyboard focus.
     pub fn stack_mode(&self, output: &Output) -> StackMode {
-        let fullscreen = self.active_window.as_ref().is_some_and(|focused| {
-            let root = self.root_of(focused);
-            self.is_on(&root, output)
-                && self
-                    .toplevels
-                    .get(&root)
-                    .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
-        });
+        let fullscreen = !self.showing_home.contains(output)
+            && self.active_window.as_ref().is_some_and(|focused| {
+                let root = self.root_of(focused);
+                self.is_on(&root, output)
+                    && self
+                        .toplevels
+                        .get(&root)
+                        .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
+            });
         let focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
         let prompt_focused = focus.is_some_and(|focus| {
             layer_map_for_output(output)

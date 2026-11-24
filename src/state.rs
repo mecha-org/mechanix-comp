@@ -1046,17 +1046,26 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .filter(|surface| surface.is_alive())
     }
 
-    /// The top-most mapped, shown layer on `kind` with `Exclusive` keyboard
-    /// interactivity.
+    /// The top-most mapped layer on `kind` with `Exclusive` keyboard
+    /// interactivity: by shell role, then newest first.
     fn topmost_exclusive_layer(&self, kind: Layer) -> Option<WlSurface> {
+        use crate::layout::{Slot, stack_slot};
+
+        let osk_held = crate::handlers::shell_surface::osk_role_held(&self.layer_shell_state);
+        let plain = if kind == Layer::Overlay {
+            Slot::Overlay
+        } else {
+            Slot::Top
+        };
         self.space.outputs().find_map(|output| {
             layer_map_for_output(output)
                 .layers_on(kind)
                 .rev()
-                .find(|layer| {
+                .filter(|layer| {
                     layer.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
                         && !crate::handlers::shell_surface::hidden(layer)
                 })
+                .min_by_key(|layer| stack_slot(layer, osk_held).unwrap_or(plain))
                 .map(|layer| layer.wl_surface().clone())
         })
     }

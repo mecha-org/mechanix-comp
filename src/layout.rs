@@ -19,6 +19,7 @@ use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::backend::Backend;
+use crate::handlers::shell_surface::{ShellRole, osk_role_held, shell_role};
 use crate::state::State;
 use crate::state::WindowMode;
 
@@ -330,6 +331,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         StackMode {
             fullscreen,
             prompt_focused,
+            osk_role_held: osk_role_held(&self.layer_shell_state),
         }
     }
 
@@ -370,11 +372,15 @@ pub struct StackMode {
     pub fullscreen: bool,
     /// A prompt has the keyboard focus: the keyboard goes above prompts.
     pub prompt_focused: bool,
+    /// Some surface has the osk role: no other is taken for the keyboard by
+    /// its `"osk"` namespace.
+    pub osk_role_held: bool,
 }
 
 /// Where surfaces stack, front to back. Shell roles come from
-/// `mx_shell_surface_manager_v1` (with `"osk"` namespace fallback) and only
-/// count in Top and Overlay; everything else keeps the protocol's layer order.
+/// `mx_shell_surface_manager_v1` and only count in Overlay (the `"osk"`
+/// namespace fallback in Top too, see [`stack_slot`]); everything else keeps
+/// the protocol's layer order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Slot {
     KeyboardOverPrompt,
@@ -394,25 +400,41 @@ pub(crate) enum Slot {
     Background,
 }
 
-/// A Top or Overlay layer surface's shell role, from `mx_shell_surface_manager_v1`
-/// (with `"osk"` namespace fallback for standalone on-screen keyboards).
+/// An Overlay layer surface's shell role, from `mx_shell_surface_manager_v1`.
 pub(crate) fn role_slot(layer: &LayerSurface) -> Option<Slot> {
-    use crate::handlers::shell_surface::{ShellRole, shell_role};
-
-    if !matches!(layer.layer(), Layer::Top | Layer::Overlay) {
+    if layer.layer() != Layer::Overlay {
         return None;
     }
-    match shell_role(layer) {
-        Some(ShellRole::Prompt) => Some(Slot::Prompt),
-        Some(ShellRole::Edge) => Some(Slot::Edge),
-        Some(ShellRole::Bar) => Some(Slot::Bar),
-        Some(ShellRole::Osd) => Some(Slot::Osd),
-        Some(ShellRole::Osk) => Some(Slot::Keyboard),
-        Some(ShellRole::View) => Some(Slot::View),
-        None if layer.namespace() == "osk" => Some(Slot::Keyboard),
-        Some(ShellRole::None) => None,
-        None => None,
-    }
+    shell_role(layer).and_then(slot_of)
+}
+
+fn slot_of(role: ShellRole) -> Option<Slot> {
+    Some(match role {
+        ShellRole::None => return None,
+        ShellRole::Prompt => Slot::Prompt,
+        ShellRole::Edge => Slot::Edge,
+        ShellRole::Bar => Slot::Bar,
+        ShellRole::Osd => Slot::Osd,
+        ShellRole::Osk => Slot::Keyboard,
+        ShellRole::View => Slot::View,
+    })
+}
+
+/// Whether `layer` is a standalone on-screen keyboard's: no role, in the
+/// `"osk"` namespace.
+fn standalone_osk(layer: &LayerSurface) -> bool {
+    layer.namespace() == "osk" && shell_role(layer).is_none()
+}
+
+/// A layer surface's [`role_slot`], else the keyboard's for a Top or Overlay
+/// [`standalone_osk`] one, while no surface holds the osk role.
+pub(crate) fn stack_slot(layer: &LayerSurface, osk_role_held: bool) -> Option<Slot> {
+    role_slot(layer).or_else(|| {
+        let fallback = matches!(layer.layer(), Layer::Top | Layer::Overlay)
+            && standalone_osk(layer)
+            && !osk_role_held;
+        fallback.then_some(Slot::Keyboard)
+    })
 }
 
 /// An output's shown surfaces, holding its layer map while in use.
@@ -462,7 +484,10 @@ impl<'a> StackingOrder<'a> {
                 let entry = StackEntry::Layer(surface, kind);
                 layers.push((slot, Stacked { entry, loc }));
             };
-            match (surface.layer(), role_slot(surface)) {
+            match (
+                surface.layer(),
+                stack_slot(surface, self.mode.osk_role_held),
+            ) {
                 (_, Some(Slot::Keyboard)) if self.mode.prompt_focused => {
                     push(Slot::KeyboardOverPrompt, WindowSurfaceType::ALL)
                 }

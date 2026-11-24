@@ -25,7 +25,7 @@ use smithay::{
     wayland::{
         Dispatch2, GlobalDispatch2,
         compositor::{Cacheable, with_states},
-        shell::wlr_layer::LayerSurfaceData,
+        shell::wlr_layer::{LayerSurfaceData, WlrLayerShellState},
     },
 };
 
@@ -81,6 +81,14 @@ pub fn shell_role(layer: &LayerSurface) -> Option<ShellRole> {
 /// reserved zone.
 pub fn hidden(layer: &LayerSurface) -> bool {
     state_of(layer.wl_surface()).hidden
+}
+
+/// Whether some layer surface has the osk role, on any layer, mapped or
+/// hidden or not.
+pub fn osk_role_held(layer_shell: &WlrLayerShellState) -> bool {
+    layer_shell
+        .layer_surfaces()
+        .any(|layer| state_of(layer.wl_surface()).role == Some(ShellRole::Osk))
 }
 
 /// Marker so the `mx_shell_surface_manager_v1` global and resources dispatch here.

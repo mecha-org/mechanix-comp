@@ -388,6 +388,7 @@ pub(crate) enum Slot {
     Edge,
     Bar,
     Osd,
+    Panel,
     Keyboard,
     View,
     Overlay,
@@ -409,15 +410,16 @@ pub(crate) fn role_slot(layer: &LayerSurface) -> Option<Slot> {
 }
 
 fn slot_of(role: ShellRole) -> Option<Slot> {
-    Some(match role {
-        ShellRole::None => return None,
-        ShellRole::Prompt => Slot::Prompt,
-        ShellRole::Edge => Slot::Edge,
-        ShellRole::Bar => Slot::Bar,
-        ShellRole::Osd => Slot::Osd,
-        ShellRole::Osk => Slot::Keyboard,
-        ShellRole::View => Slot::View,
-    })
+    match role {
+        ShellRole::None => None,
+        ShellRole::Prompt => Some(Slot::Prompt),
+        ShellRole::Edge => Some(Slot::Edge),
+        ShellRole::Bar => Some(Slot::Bar),
+        ShellRole::Osd => Some(Slot::Osd),
+        ShellRole::Panel => Some(Slot::Panel),
+        ShellRole::Osk => Some(Slot::Keyboard),
+        ShellRole::View => Some(Slot::View),
+    }
 }
 
 /// Whether `layer` is a standalone on-screen keyboard's: no role, in the
@@ -463,8 +465,8 @@ impl<'a> StackingOrder<'a> {
     }
 
     /// Front to back, by [`Slot`]: the keyboard (above prompts while one has
-    /// focus), prompts, edges and bars, OSDs, the keyboard otherwise, views,
-    /// other Overlay layers, a fullscreen family, other Top layers,
+    /// focus), prompts, edges and bars, OSDs, panels, the keyboard otherwise,
+    /// views, other Overlay layers, a fullscreen family, other Top layers,
     /// Bottom/Background popups, other windows, Bottom/Background surfaces.
     /// Within a slot, newest first. Hidden layer surfaces are left out.
     pub fn iter(&self) -> impl Iterator<Item = Stacked<'_>> {
@@ -567,4 +569,20 @@ fn layer_under(
             region.is_none_or(|region| region.contains(local.to_i32_round()))
         });
     hits.then(|| (main.clone(), Point::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panel goes over the keyboard and views, under OSDs and the bar, as
+    /// the protocol orders the roles.
+    #[test]
+    fn a_panel_stacks_between_osds_and_the_keyboard() {
+        let slot = |role| slot_of(role).unwrap();
+        assert!(slot(ShellRole::Bar) < slot(ShellRole::Panel));
+        assert!(slot(ShellRole::Osd) < slot(ShellRole::Panel));
+        assert!(slot(ShellRole::Panel) < slot(ShellRole::Osk));
+        assert!(slot(ShellRole::Panel) < slot(ShellRole::View));
+    }
 }

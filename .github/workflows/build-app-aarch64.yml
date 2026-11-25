@@ -161,7 +161,7 @@ jobs:
           WANT="$(basename "$RPM_FILE")"
           for _ in $(seq 1 40); do
             PRIMARY=$(curl -fsSL "$BASE/repodata/repomd.xml" | grep -oP 'href="\Krepodata/[^"]*primary\.xml[^"]*')
-            if curl -fsSL "$BASE/$PRIMARY" | { zcat 2>/dev/null || cat; } | grep -q "<location href=\"[^\"]*/${WANT}\""; then
+            if curl -fsSL "$BASE/$PRIMARY" | { zcat 2>/dev/null || cat; } | grep "<location href=\"[^\"]*/${WANT}\"" >/dev/null; then
               echo "[INFO] served at $BASE: $WANT"
               exit 0
             fi

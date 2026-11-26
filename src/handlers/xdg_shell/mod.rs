@@ -1,6 +1,9 @@
 pub mod decoration;
+mod popup_touch;
 
 use std::collections::HashSet;
+
+use popup_touch::PopupTouchGrab;
 
 use crate::backend::Backend;
 use crate::layout::is_dialog;
@@ -11,7 +14,9 @@ use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
 };
 use smithay::input::{Seat, pointer::Focus};
+use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::{wl_output, wl_seat, wl_surface::WlSurface};
 use smithay::utils::{Serial, Size};
 use smithay::wayland::shell::xdg::{
@@ -34,6 +39,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
                 output: None,
                 modal: false,
                 layout_size: Size::default(),
+                activated_with: None,
             },
         );
     }
@@ -63,6 +69,18 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
         self.popups.cleanup();
+        // Touches are back to normal as soon as the grab's popups are gone:
+        // left in place, the ended grab would keep the next tap from
+        // focusing what it lands on.
+        if let Some(touch) = self.seat.get_touch() {
+            let ended = touch.with_grab(|_, grab| {
+                grab.downcast_ref::<PopupTouchGrab<Self>>()
+                    .is_some_and(PopupTouchGrab::has_ended)
+            });
+            if ended == Some(true) {
+                touch.unset_grab(self);
+            }
+        }
         // A closed popup damages the window it belonged to.
         self.schedule_render();
         if let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(surface)) {
@@ -104,6 +122,9 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
                     return;
                 }
                 pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+            }
+            if let Some(touch) = seat.get_touch() {
+                touch.set_grab(self, PopupTouchGrab::new(&grab), serial);
             }
         }
     }
@@ -192,6 +213,7 @@ impl<BackendData: Backend + 'static> XdgShellHandler for State<BackendData> {
 impl<BackendData: Backend + 'static> State<BackendData> {
     /// Make `window` the active one, raised with its family. The keyboard
     /// follows unless an `Exclusive` layer holds it, until that layer goes.
+    /// An output showing home keeps showing it: see [`Self::show_window`].
     pub fn focus_window(&mut self, window: &Window) {
         let focused_surface = window.toplevel().unwrap().wl_surface().clone();
         let already = self.active_window.as_ref() == Some(&focused_surface);
@@ -200,10 +222,68 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         if !already {
             self.relayout(&focused_surface);
-            let group = self.active_group();
+            let group = self.shown_active_group();
             self.set_activated_group(&group);
         }
         self.update_keyboard_focus();
+    }
+
+    /// The active family, to be activated: none while it is under home.
+    fn shown_active_group(&self) -> HashSet<WlSurface> {
+        match &self.active_window {
+            Some(active) if self.under_home(active) => HashSet::new(),
+            _ => self.active_group(),
+        }
+    }
+
+    /// Bring `window` to the front, as activating it asks: the active one,
+    /// and shown, its output no longer showing home.
+    pub fn show_window(&mut self, window: &Window) {
+        let surface = window.toplevel().unwrap().wl_surface().clone();
+        self.focus_window(window);
+        if let Some(output) = self.toplevel_output(&surface) {
+            self.set_showing_home(&output, false);
+        }
+    }
+
+    /// The output toplevel `surface` is on, if it is on one.
+    fn toplevel_output(&self, surface: &WlSurface) -> Option<Output> {
+        self.toplevels.get(surface)?.output.clone()
+    }
+
+    /// Whether toplevel `surface` is on an output showing home: hidden, and
+    /// neither activated nor focused.
+    pub fn under_home(&self, surface: &WlSurface) -> bool {
+        self.toplevel_output(surface)
+            .is_some_and(|output| self.showing_home.contains(&output))
+    }
+
+    /// Start or stop showing home on `output`: its toplevels hidden and not
+    /// activated, the keyboard off them, and the shell surfaces that asked
+    /// told. Whether it changed.
+    pub fn set_showing_home(&mut self, output: &Output, showing: bool) -> bool {
+        let changed = if showing {
+            self.showing_home.insert(output.clone())
+        } else {
+            self.showing_home.remove(output)
+        };
+        if !changed {
+            return false;
+        }
+        let group = self.shown_active_group();
+        self.set_activated_group(&group);
+        self.update_keyboard_focus();
+        self.home_watchers.retain(|(watcher, _)| watcher.is_alive());
+        for (watcher, surface) in &self.home_watchers {
+            let on_output = layer_map_for_output(output)
+                .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                .is_some();
+            if on_output {
+                watcher.showing_home(u32::from(showing));
+            }
+        }
+        self.schedule_render();
+        true
     }
 
     /// Set the xdg `activated` state on every toplevel in `group` and clear it
@@ -246,10 +326,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
 
         self.toplevels.get_mut(surface).unwrap().output = output.clone();
         self.space.map_element(window.clone(), loc, false);
-        // A new window takes focus; a parent mapped after its focused dialog
-        // leaves the focus on the dialog.
+        // A new window takes focus, and shows even over home; a parent mapped
+        // after its focused dialog leaves the focus on the dialog.
         if !self.active_group().contains(surface) {
-            self.focus_window(window);
+            self.show_window(window);
         } else if let Some(output) = &output {
             self.apply_layout(output);
         }
@@ -380,6 +460,14 @@ pub fn handle_commit<BackendData: Backend + 'static>(
     {
         let window = state.toplevels[surface].window.clone();
         let mapped = state.is_mapped(surface);
+        // The scale and transform before the first configure, so the first
+        // buffer comes at the right size; later changes follow the output.
+        let configured = window
+            .toplevel()
+            .is_some_and(|toplevel| toplevel.is_initial_configure_sent());
+        if !configured && let Some(output) = state.output_of(surface) {
+            state.send_scale_transform_to(surface, &output);
+        }
         let buffered = with_renderer_surface_state(surface, |states| states.buffer().is_some())
             .unwrap_or(false);
 

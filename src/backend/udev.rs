@@ -359,6 +359,7 @@ fn is_kms_card(fd: &DrmDeviceFd) -> bool {
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut event_loop: EventLoop<'static, State<UdevData>> = EventLoop::try_new()?;
+    crate::shutdown::stop_on_signals(&event_loop);
     let display: Display<State<UdevData>> = Display::new()?;
 
     let (session, notifier) = LibSeatSession::new()?;
@@ -538,6 +539,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         state.update_suspended();
         let _ = state.display_handle.flush_clients();
     })?;
+    let _ = sd_notify::notify(&[sd_notify::NotifyState::Stopping]);
 
     Ok(())
 }
@@ -581,9 +583,11 @@ impl State<UdevData> {
                 }
             };
             let egl_device = EGLDevice::device_for_display(&egl_display).ok();
+            // Emulators without host GL (e.g. QEMU virtio-gpu on macOS) only have llvmpipe; let them opt in.
             if egl_device
                 .as_ref()
                 .is_some_and(|device| device.is_software())
+                && std::env::var_os("MECHANIX_ALLOW_SOFTWARE_EGL").is_none()
             {
                 warn!("Ignoring {node}: software EGL renderer");
                 return Ok(());
@@ -767,7 +771,7 @@ impl State<UdevData> {
         let position = (x, 0).into();
         output.change_current_state(
             Some(wl_mode),
-            None,
+            Some(self.output_transform()),
             Some(Scale::Fractional(scale)),
             Some(position),
         );
@@ -862,6 +866,11 @@ impl State<UdevData> {
             self.stop_captures_for_output(&output);
             self.release_fifo_barriers(&output);
             self.output_power.output_removed(&output);
+            self.showing_home.remove(&output);
+            // Its layer surfaces won't be shown again; their clients make new ones.
+            for layer in layer_map_for_output(&output).layers() {
+                layer.layer_surface().send_close();
+            }
             self.space.unmap_output(&output);
             self.maybe_send_locked();
         }

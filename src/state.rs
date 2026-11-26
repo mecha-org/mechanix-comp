@@ -15,7 +15,8 @@ use smithay::desktop::utils::{
     update_surface_primary_scanout_output, with_surfaces_surface_tree,
 };
 use smithay::desktop::{
-    PopupManager, Space, Window, find_popup_root_surface, layer_map_for_output,
+    PopupKeyboardGrab, PopupManager, PopupPointerGrab, Space, Window, WindowSurfaceType,
+    find_popup_root_surface, layer_map_for_output,
 };
 use smithay::input::keyboard::Keysym;
 use smithay::input::pointer::{
@@ -33,7 +34,7 @@ use smithay::reexports::wayland_server::backend::{
     ClientData, ClientId, DisconnectReason, ObjectId,
 };
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle};
-use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Size, Time, Transform};
+use smithay::utils::{Clock, Logical, Monotonic, Point, SERIAL_COUNTER, Serial, Size, Time};
 use smithay::wayland::commit_timing::{
     CommitTimerBarrierStateUserData, CommitTimingManagerState, Timestamp,
 };
@@ -51,7 +52,7 @@ use smithay::wayland::image_capture_source::{
 };
 use smithay::wayland::image_copy_capture::ImageCopyCaptureState;
 use smithay::wayland::output::OutputManagerState;
-use smithay::wayland::presentation::{PresentationState, Refresh};
+use smithay::wayland::presentation::{PresentationFeedbackCachedState, PresentationState, Refresh};
 use smithay::wayland::session_lock::{LockSurface, SessionLocker};
 use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer, WlrLayerShellState};
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -81,11 +82,13 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::backend::Backend;
 use crate::config::Config;
+use crate::handlers::accelerators::KeyboardGrabState;
 use crate::handlers::foreign_toplevel::ForeignToplevelManagerState;
 use crate::handlers::image_copy_capture::CaptureSession;
-use crate::handlers::keyboard_event::KeyboardGrabState;
 use crate::handlers::output_power::OutputPowerManagerState;
+use crate::handlers::shell_surface::{osk_role_held, shown_layers};
 use crate::handlers::thumbnail_view::ThumbnailViewState;
+use crate::protocols::shell_surface::mx_shell_surface_v1::MxShellSurfaceV1;
 
 /// How a toplevel is arranged right now.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -109,6 +112,16 @@ pub struct WindowState {
     pub modal: bool,
     /// Size at the last layout.
     pub layout_size: Size<i32, Logical>,
+    /// The activation token the toplevel last asked to be activated with.
+    pub activated_with: Option<ActivatedWith>,
+}
+
+/// An `xdg_activation_v1` token a toplevel asked to be activated with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivatedWith {
+    pub token: String,
+    /// The client that got the token.
+    pub client: ClientId,
 }
 
 /// The icon surface a client sets for an active drag-and-drop, drawn next to
@@ -200,9 +213,9 @@ pub struct State<BackendData: Backend + 'static> {
     pub image_copy_capture_state: ImageCopyCaptureState,
     /// Live capture sessions and their in-flight frames.
     pub capture_sessions: Vec<CaptureSession>,
-    /// `phosh_private` thumbnail views drawn onto layer surfaces.
+    /// `mx_thumbnail_view_v1` thumbnails drawn onto layer surfaces.
     pub thumbnail_view: ThumbnailViewState,
-    /// `phosh_private_keyboard_event` accelerator grabs and their repeat.
+    /// `mx_accelerators_v1` grabs and their repeat.
     pub keyboard_grabs: KeyboardGrabState,
 
     pub seat: Seat<Self>,
@@ -229,6 +242,15 @@ pub struct State<BackendData: Backend + 'static> {
     /// focuses it while it stays a mapped OnDemand layer, so launchers and
     /// panels take keyboard focus on open.
     pub layer_shell_on_demand_focus: Option<WlSurface>,
+    /// The outputs showing home: their toplevels hidden, so what the shell
+    /// shows below them is what shows (`mx_shell_surface_v1`).
+    pub showing_home: HashSet<Output>,
+    /// The shell surfaces that asked to show home, and their surfaces: told
+    /// when their output starts or stops showing it.
+    pub home_watchers: Vec<(MxShellSurfaceV1, WlSurface)>,
+    /// The surface the last first touch went down on, and its serial: what
+    /// the keyboard's and pointer's focus and last enter are to them.
+    pub last_touch_down: Option<(WlSurface, Serial)>,
     /// The toplevel surface last focused; the fallback keyboard focus when no
     /// layer-shell surface holds it.
     pub active_window: Option<WlSurface>,
@@ -257,7 +279,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let seat_name = backend_data.seat_name();
 
         // Version 6 lets clients without fractional scale size their
-        // buffers from `preferred_buffer_scale` (see `push_preferred_scale`).
+        // buffers from `preferred_buffer_scale` (see `send_scale_transform`).
         let compositor_state = CompositorState::new_v6::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new_with_capabilities::<Self>(
             &dh,
@@ -275,7 +297,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let popups = PopupManager::default();
         let mut seat_state = SeatState::new();
         let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, seat_name);
-        seat.add_keyboard(Default::default(), 200, 25).unwrap();
+        seat.add_keyboard(Default::default(), 500, 15).unwrap();
         let pointer = seat.add_pointer();
 
         ViewporterState::new::<Self>(&dh);
@@ -315,12 +337,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let image_copy_capture_state =
             ImageCopyCaptureState::new_with_filter::<Self, _>(&dh, client_is_unrestricted);
         let thumbnail_view = ThumbnailViewState::new::<Self>(&dh);
+        let keyboard_grabs = KeyboardGrabState::new::<Self>(&dh);
+        crate::handlers::shell_surface::init_shell_surface_manager::<Self>(&dh);
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
         let loop_signal = event_loop.get_signal();
-        let config = Config::load(&event_loop.handle());
+        let config = Config::new(&event_loop.handle());
 
-        Self {
+        let mut state = Self {
             socket_name,
             config,
             xdg_activation_state,
@@ -338,7 +362,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             image_copy_capture_state,
             capture_sessions: Vec::new(),
             thumbnail_view,
-            keyboard_grabs: KeyboardGrabState::default(),
+            keyboard_grabs,
             idle_inhibitors: HashMap::new(),
             display_handle: dh,
             space,
@@ -366,8 +390,14 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             lock_surfaces: Vec::new(),
             lock_surface_outputs: HashMap::new(),
             layer_shell_on_demand_focus: None,
+            showing_home: HashSet::new(),
+            home_watchers: Vec::new(),
+            last_touch_down: None,
             active_window: None,
-        }
+        };
+        // From files, the settings open now.
+        state.drain_config();
+        state
     }
 
     fn init_wayland_listener(display: Display<Self>, event_loop: &mut EventLoop<Self>) -> OsString {
@@ -424,7 +454,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         let under = self
             .backend_data
             .pointer_visible()
-            .then(|| self.surface_under(location))
+            .then(|| self.pointer_under(location))
             .flatten();
         if under.as_ref().map(|(surface, _)| surface) == pointer.current_focus().as_ref() {
             return;
@@ -496,7 +526,6 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             }
             return;
         }
-        let scale = output.current_scale().fractional_scale();
         let thumbnailed = self.thumbnailed_on(output);
         // Only presented surfaces are acked; hidden ones are suspended instead,
         // unless a thumbnail on this output shows them.
@@ -505,13 +534,23 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             window.send_frame(output, now, None, |surface, data| {
                 frame_output(surface_primary_scanout_output(surface, data), shown, output)
             });
-            self.push_preferred_scale(window.toplevel().unwrap().wl_surface(), scale);
         }
-        for layer_surface in layer_map_for_output(output).layers() {
+        // A hidden layer surface gets none: its callbacks wait for the frame
+        // that shows it.
+        for layer_surface in shown_layers(&layer_map_for_output(output)) {
+            let edge = crate::layout::role_slot(layer_surface) == Some(crate::layout::Slot::Edge);
             layer_surface.send_frame(output, now, None, |surface, data| {
-                surface_primary_scanout_output(surface, data)
+                frame_output(surface_primary_scanout_output(surface, data), edge, output)
             });
-            self.push_preferred_scale(layer_surface.wl_surface(), scale);
+            // Edge surfaces are never drawn, so their content is never presented.
+            if edge {
+                layer_surface.with_surfaces(|_, states| {
+                    let mut cached = states.cached_state.get::<PresentationFeedbackCachedState>();
+                    for callback in cached.current().callbacks.drain(..) {
+                        callback.discarded();
+                    }
+                });
+            }
         }
     }
 
@@ -531,10 +570,10 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         })
     }
 
-    /// Toplevels drawn through a thumbnail on one of `output`'s layer surfaces.
+    /// Toplevels drawn through a thumbnail on one of `output`'s shown layer
+    /// surfaces.
     pub fn thumbnailed_on(&self, output: &Output) -> HashSet<WlSurface> {
-        layer_map_for_output(output)
-            .layers()
+        shown_layers(&layer_map_for_output(output))
             .flat_map(|layer| {
                 self.thumbnail_view
                     .for_layer(layer.wl_surface())
@@ -544,9 +583,16 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .collect()
     }
 
-    /// Whether a drawable thumbnail shows the toplevel `toplevel`.
+    /// Whether a thumbnail on a shown layer surface shows the toplevel
+    /// `toplevel`.
     pub fn is_thumbnailed(&self, toplevel: &WlSurface) -> bool {
-        self.thumbnail_view.shown_toplevels().contains(toplevel)
+        self.space.outputs().any(|output| {
+            shown_layers(&layer_map_for_output(output)).any(|layer| {
+                self.thumbnail_view
+                    .for_layer(layer.wl_surface())
+                    .any(|thumbnail| thumbnail.toplevel == *toplevel)
+            })
+        })
     }
 
     /// Suspend mapped toplevels nothing shows, unless they are being recorded.
@@ -894,19 +940,45 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         self.update_idle_inhibit();
     }
 
-    /// Push the output's scale to `surface`: exactly, to a client with the
-    /// fractional-scale object, and as [`buffer_scale`] to one on
-    /// `wl_surface` version 6. Each is only sent when it changes.
-    fn push_preferred_scale(&self, surface: &WlSurface, scale: f64) {
-        if !surface.is_alive() {
-            return;
+    /// The output `surface` shows on, through subsurfaces and popups: its
+    /// window's, lock surface's or layer surface's.
+    pub fn output_for_surface(&self, surface: &WlSurface) -> Option<Output> {
+        let root = root_surface(surface);
+        let root = (self.popups.find_popup(&root))
+            .and_then(|popup| find_popup_root_surface(&popup).ok())
+            .unwrap_or(root);
+        if self.toplevels.contains_key(&root) {
+            return self.output_of(&root);
         }
-        with_states(surface, |states| {
-            with_fractional_scale(states, |fractional_scale| {
-                fractional_scale.set_preferred_scale(scale);
-            });
-            send_surface_state(surface, states, buffer_scale(scale), Transform::Normal);
-        });
+        if let Some(output) = self.lock_surface_outputs.get(&root.id()) {
+            return Some(output.clone());
+        }
+        self.space
+            .outputs()
+            .find(|o| {
+                layer_map_for_output(o)
+                    .layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+                    .is_some()
+            })
+            .cloned()
+    }
+
+    /// Tell `surface` and its subsurfaces the scale and transform of `output`.
+    pub fn send_scale_transform_to(&self, surface: &WlSurface, output: &Output) {
+        with_surfaces_surface_tree(surface, |s, data| send_scale_transform(s, data, output));
+    }
+
+    /// [`Self::send_scale_transform_to`] the output `surface` shows on, for
+    /// a caller that doesn't know it (a new subsurface, a popup).
+    pub fn send_scale_transform_to_its_output(&self, surface: &WlSurface) {
+        if let Some(output) = self.output_for_surface(surface) {
+            self.send_scale_transform_to(surface, &output);
+        }
+    }
+
+    /// Tell everything on `output` its new scale and transform.
+    pub fn send_scale_transform_on(&self, output: &Output) {
+        self.for_each_surface_on(output, |s, data| send_scale_transform(s, data, output));
     }
 
     /// The toplevel a surface belongs to, through subsurfaces and popups.
@@ -940,17 +1012,40 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         }
         let keyboard = self.seat.get_keyboard().unwrap();
-        if keyboard.is_grabbed() {
+        let focus = self.compute_keyboard_focus();
+        let current = keyboard.current_focus();
+        if current.as_ref() == focus.as_ref() {
             return;
         }
-        let focus = self.compute_keyboard_focus();
-        if keyboard.current_focus().as_ref() != focus.as_ref() {
-            keyboard.set_focus(self, focus, SERIAL_COUNTER.next_serial());
+        let serial = SERIAL_COUNTER.next_serial();
+        // A popup's grab keeps the keyboard only while its window would have
+        // it. Focus going anywhere else (a layer, another window) ends the
+        // grab's keyboard and pointer sides and leaves the popups
+        // open; its touch side stays, so a tap on another app still closes
+        // them. Other grabs (a drag) are left alone.
+        let popup_window = current
+            .and_then(|surface| self.popups.find_popup(&surface))
+            .and_then(|popup| find_popup_root_surface(&popup).ok());
+        if popup_window.is_some() && popup_window != focus {
+            if keyboard.with_grab(|_, grab| grab.is::<PopupKeyboardGrab<Self>>()) == Some(true) {
+                keyboard.unset_grab(self);
+            }
+            let pointer = self.seat.get_pointer().unwrap();
+            if pointer.with_grab(|_, grab| grab.is::<PopupPointerGrab<Self>>()) == Some(true) {
+                pointer.unset_grab(self, serial, InputTime::now());
+            }
         }
+        // Otherwise a grab decides: a popup grab ignores the change while
+        // its popups are open, and once they are gone takes it and ends.
+        // Asking every frame matters: a grab whose popups closed would hold
+        // the keyboard until the next key press, which a handheld may never
+        // send.
+        keyboard.set_focus(self, focus, serial);
     }
 
     /// The keyboard focus target: the top-most `Exclusive` layer (Overlay/Top),
-    /// else the opened/clicked `OnDemand` layer, else the active window.
+    /// else the opened/clicked `OnDemand` layer, else the active window,
+    /// unless its output shows home.
     fn compute_keyboard_focus(&self) -> Option<WlSurface> {
         for kind in [Layer::Overlay, Layer::Top] {
             if let Some(surface) = self.topmost_exclusive_layer(kind) {
@@ -966,29 +1061,41 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
         self.active_window
             .clone()
-            .filter(|surface| surface.is_alive())
+            .filter(|surface| surface.is_alive() && !self.under_home(surface))
     }
 
-    /// The top-most mapped layer on `kind` with `Exclusive` keyboard interactivity.
+    /// The top-most mapped layer on `kind` with `Exclusive` keyboard
+    /// interactivity: by shell role, then newest first.
     fn topmost_exclusive_layer(&self, kind: Layer) -> Option<WlSurface> {
+        use crate::layout::{Slot, stack_slot};
+
+        let osk_held = osk_role_held(&self.layer_shell_state);
+        let plain = if kind == Layer::Overlay {
+            Slot::Overlay
+        } else {
+            Slot::Top
+        };
         self.space.outputs().find_map(|output| {
-            layer_map_for_output(output)
-                .layers_on(kind)
+            shown_layers(&layer_map_for_output(output))
                 .rev()
-                .find(|layer| {
-                    layer.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive
+                .filter(|layer| {
+                    layer.layer() == kind
+                        && layer.cached_state().keyboard_interactivity
+                            == KeyboardInteractivity::Exclusive
                 })
+                .min_by_key(|layer| stack_slot(layer, osk_held).unwrap_or(plain))
                 .map(|layer| layer.wl_surface().clone())
         })
     }
 
-    /// Whether `surface` is still a mapped layer with `OnDemand` interactivity.
+    /// Whether `surface` is still a mapped, shown layer with `OnDemand`
+    /// interactivity.
     fn is_mapped_on_demand_layer(&self, surface: &WlSurface) -> bool {
         if !surface.is_alive() {
             return false;
         }
         self.space.outputs().any(|output| {
-            layer_map_for_output(output).layers().any(|layer| {
+            shown_layers(&layer_map_for_output(output)).any(|layer| {
                 layer.wl_surface() == surface
                     && layer.cached_state().keyboard_interactivity
                         == KeyboardInteractivity::OnDemand
@@ -1044,11 +1151,20 @@ fn should_suspend(visible: bool, recorded: bool, thumbnailed: bool) -> bool {
     !visible && !recorded && !thumbnailed
 }
 
-/// The whole buffer scale for an output `scale`: the next whole number at
-/// or above it, so a client draws at least as sharp as the output and is
-/// scaled down, never up.
-fn buffer_scale(scale: f64) -> i32 {
-    scale.ceil().max(1.0) as i32
+/// Tell `surface` the scale and transform of `output`: the exact scale through
+/// fractional scale, the rounded-up one through `wl_surface`. Smithay sends
+/// only what changed.
+fn send_scale_transform(surface: &WlSurface, data: &SurfaceData, output: &Output) {
+    let scale = output.current_scale();
+    with_fractional_scale(data, |fractional_scale| {
+        fractional_scale.set_preferred_scale(scale.fractional_scale());
+    });
+    send_surface_state(
+        surface,
+        data,
+        scale.integer_scale(),
+        output.current_transform(),
+    );
 }
 
 /// Whether a mapped toplevel's commits can skip the output render.
@@ -1065,15 +1181,6 @@ fn frame_output<O: Clone>(scanout: Option<O>, thumbnailed: bool, output: &O) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_buffer_scale_rounds_up_to_a_whole_number() {
-        assert_eq!(buffer_scale(1.0), 1);
-        assert_eq!(buffer_scale(2.0), 2);
-        assert_eq!(buffer_scale(2.25), 3);
-        assert_eq!(buffer_scale(2.61), 3);
-        assert_eq!(buffer_scale(0.5), 1);
-    }
 
     #[test]
     fn thumbnailed_window_is_not_suspended() {

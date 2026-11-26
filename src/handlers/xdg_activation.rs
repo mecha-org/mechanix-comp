@@ -1,30 +1,79 @@
+use std::time::Duration;
+
 use crate::backend::Backend;
-use crate::state::State;
+use crate::state::{ActivatedWith, State};
+use smithay::input::Seat;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::Serial;
 use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
+
+/// How long a token stays usable.
+const TOKEN_LIFETIME: Duration = Duration::from_secs(30);
 
 impl<BackendData: Backend + 'static> XdgActivationHandler for State<BackendData> {
     fn activation_state(&mut self) -> &mut XdgActivationState {
         &mut self.xdg_activation_state
     }
 
+    /// A token without a serial is taken as is; one with a serial must
+    /// come from input the client got while it held the keyboard, the
+    /// pointer or the last touch (the serial no older than that focus).
+    fn token_created(&mut self, _token: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        // Smithay never drops a token itself.
+        self.xdg_activation_state
+            .retain_tokens(|_, data| data.timestamp.elapsed() < TOKEN_LIFETIME);
+        // FIXME: any client can focus a window with a token without a serial,
+        // with no input behind it. Potentially take those from our shell
+        // alone, and let the rest only ask for attention; how the shell is
+        // told apart decides whether another shell can launch apps here.
+        let Some((serial, seat)) = &data.serial else {
+            return true;
+        };
+        if Seat::from_resource(seat).as_ref() != Some(&self.seat) {
+            return false;
+        }
+        let since_focus = |focus: Option<WlSurface>, enter: Option<Serial>| {
+            focus.zip(enter).is_some_and(|(surface, enter)| {
+                serial.is_no_older_than(&enter)
+                    && surface.client().map(|c| c.id()) == data.client_id
+            })
+        };
+        let keyboard = self.seat.get_keyboard().unwrap();
+        let pointer = self.seat.get_pointer().unwrap();
+        let (touched, touch_down) = self.last_touch_down.clone().unzip();
+        since_focus(keyboard.current_focus(), keyboard.last_enter())
+            || since_focus(pointer.current_focus(), pointer.last_enter())
+            || since_focus(touched, touch_down)
+    }
+
+    /// A live token focuses the toplevel if it's mapped, and is kept on it
+    /// either way, so the client that got the token can tell which toplevel
+    /// used it (`mx_foreign_toplevel_info_v1.activation_token`).
     fn request_activation(
         &mut self,
-        _token: XdgActivationToken,
+        token: XdgActivationToken,
         token_data: XdgActivationTokenData,
         surface: WlSurface,
     ) {
-        if token_data.timestamp.elapsed().as_secs() < 10 {
-            let window = self
-                .space
-                .elements()
-                .find(|w| w.toplevel().is_some_and(|tl| tl.wl_surface() == &surface))
-                .cloned();
-            if let Some(window) = window {
-                self.focus_window(&window);
-            }
+        if token_data.timestamp.elapsed() >= TOKEN_LIFETIME {
+            return;
+        }
+        if let (Some(ws), Some(client)) = (self.toplevels.get_mut(&surface), token_data.client_id) {
+            ws.activated_with = Some(ActivatedWith {
+                token: token.as_str().to_owned(),
+                client,
+            });
+        }
+        let window = self
+            .space
+            .elements()
+            .find(|w| w.toplevel().is_some_and(|tl| tl.wl_surface() == &surface))
+            .cloned();
+        if let Some(window) = window {
+            self.show_window(&window);
         }
     }
 }

@@ -124,6 +124,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43b32313e937c8721c9d17ee9bf60699a6402b4b7c2cb6ac1bee0ffcaa4b4e5e"
 dependencies = [
  "bitflags",
+ "nix 0.31.3",
  "polling",
  "rustix 1.1.4",
  "tracing",
@@ -191,6 +192,7 @@ name = "compositor"
 version = "1.0.0"
 dependencies = [
  "bitflags",
+ "calloop",
  "mxconfig",
  "sd-notify",
  "smithay",
@@ -737,12 +739,12 @@ dependencies = [
 [[package]]
 name = "mxconfig"
 version = "0.1.0"
-source = "git+https://github.com/mecha-org/mxconfig?rev=510a018ef9e0a174fecac7cedb5369231a494e30#510a018ef9e0a174fecac7cedb5369231a494e30"
+source = "git+https://github.com/mecha-org/mxconfig?rev=e0fcff69b5fcc8a7b6a1834714b80d1fc133cc18#e0fcff69b5fcc8a7b6a1834714b80d1fc133cc18"
 dependencies = [
  "inotify",
  "mxconfig-macros",
  "mxconfig-schema",
- "nix",
+ "nix 0.32.0",
  "serde",
  "thiserror 2.0.20",
  "toml",
@@ -752,7 +754,7 @@ dependencies = [
 [[package]]
 name = "mxconfig-codegen"
 version = "0.1.0"
-source = "git+https://github.com/mecha-org/mxconfig?rev=510a018ef9e0a174fecac7cedb5369231a494e30#510a018ef9e0a174fecac7cedb5369231a494e30"
+source = "git+https://github.com/mecha-org/mxconfig?rev=e0fcff69b5fcc8a7b6a1834714b80d1fc133cc18#e0fcff69b5fcc8a7b6a1834714b80d1fc133cc18"
 dependencies = [
  "anyhow",
  "heck",
@@ -762,7 +764,7 @@ dependencies = [
 [[package]]
 name = "mxconfig-macros"
 version = "0.1.0"
-source = "git+https://github.com/mecha-org/mxconfig?rev=510a018ef9e0a174fecac7cedb5369231a494e30#510a018ef9e0a174fecac7cedb5369231a494e30"
+source = "git+https://github.com/mecha-org/mxconfig?rev=e0fcff69b5fcc8a7b6a1834714b80d1fc133cc18#e0fcff69b5fcc8a7b6a1834714b80d1fc133cc18"
 dependencies = [
  "mxconfig-codegen",
  "mxconfig-schema",
@@ -771,7 +773,7 @@ dependencies = [
 [[package]]
 name = "mxconfig-schema"
 version = "0.1.0"
-source = "git+https://github.com/mecha-org/mxconfig?rev=510a018ef9e0a174fecac7cedb5369231a494e30#510a018ef9e0a174fecac7cedb5369231a494e30"
+source = "git+https://github.com/mecha-org/mxconfig?rev=e0fcff69b5fcc8a7b6a1834714b80d1fc133cc18#e0fcff69b5fcc8a7b6a1834714b80d1fc133cc18"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -813,6 +815,18 @@ name = "nix"
 version = "0.31.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
+
+[[package]]
+name = "nix"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77730ed34f01f4990cb2ea67fec715ecebc6fab9a6396cf83c5529b13f581bdc"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -1309,7 +1323,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 [[package]]
 name = "smithay"
 version = "0.7.0"
-source = "git+https://github.com/mecha-org/smithay?rev=69e3fa5a6b95ef73eca5fe43ae8bfdaebfb5135b#69e3fa5a6b95ef73eca5fe43ae8bfdaebfb5135b"
+source = "git+https://github.com/mecha-org/smithay?rev=33397d7e9a5d8f704e76cd0fb84328972945c2a0#33397d7e9a5d8f704e76cd0fb84328972945c2a0"
 dependencies = [
  "appendlist",
  "bitflags",
@@ -1381,7 +1395,7 @@ dependencies = [
 [[package]]
 name = "smithay-drm-extras"
 version = "0.1.0"
-source = "git+https://github.com/mecha-org/smithay?rev=69e3fa5a6b95ef73eca5fe43ae8bfdaebfb5135b#69e3fa5a6b95ef73eca5fe43ae8bfdaebfb5135b"
+source = "git+https://github.com/mecha-org/smithay?rev=33397d7e9a5d8f704e76cd0fb84328972945c2a0#33397d7e9a5d8f704e76cd0fb84328972945c2a0"
 dependencies = [
  "drm",
 ]

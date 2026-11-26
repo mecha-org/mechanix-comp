@@ -27,6 +27,10 @@ impl<BackendData: Backend + 'static> CompositorHandler for State<BackendData> {
             .compositor_state
     }
 
+    fn new_subsurface(&mut self, surface: &WlSurface, _parent: &WlSurface) {
+        self.send_scale_transform_to_its_output(surface);
+    }
+
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<Self, _>(surface, |state, _dh, surface| {
             let (commit_deadline, acquire_point, dmabuf) = with_states(surface, |states| {

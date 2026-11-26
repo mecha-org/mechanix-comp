@@ -1,4 +1,5 @@
 use crate::backend::Backend;
+use crate::handlers::shell_surface;
 use crate::state::State;
 use smithay::desktop::{LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output};
 use smithay::output::Output;
@@ -30,14 +31,18 @@ impl<BackendData: Backend + 'static> WlrLayerShellHandler for State<BackendData>
             .as_ref()
             .and_then(Output::from_resource)
             .or_else(|| self.space.outputs().next().cloned());
-        if let Some(output) = output {
-            let mut map = layer_map_for_output(&output);
-            map.map_layer(&LayerSurface::new(surface, namespace))
-                .unwrap();
-        }
+        let Some(output) = output else {
+            // Nowhere to show it.
+            surface.send_close();
+            return;
+        };
+        let mut map = layer_map_for_output(&output);
+        map.map_layer(&LayerSurface::new(surface, namespace))
+            .unwrap();
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        shell_surface::layer_destroyed(surface.wl_surface());
         self.forget_thumbnail_surface(surface.wl_surface());
         let Some(output) = self
             .space
@@ -111,9 +116,17 @@ pub fn handle_commit<BackendData: Backend + 'static>(
             .initial_configure_sent
     });
 
+    if !initial_configure_sent {
+        state.send_scale_transform_to(surface, &output);
+    }
     let zone_before = layer_map_for_output(&output).non_exclusive_zone();
-    let (needs_configure, on_demand) = {
+    let (needs_configure, on_demand, became_hidden) = {
         let mut map = layer_map_for_output(&output);
+        // A hidden surface reserves no space; the commit that hides or shows
+        // it re-arranges the rest with it.
+        let layer = map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL);
+        let hidden = layer.is_some_and(shell_surface::hidden);
+        let became_hidden = layer.is_some_and(|l| l.set_exclusive_zone_ignored(hidden)) && hidden;
         map.arrange();
         let layer = map
             .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
@@ -121,15 +134,20 @@ pub fn handle_commit<BackendData: Backend + 'static>(
         if !initial_configure_sent {
             layer.layer_surface().send_configure();
         }
-        // Overlay/Top OnDemand layers take keyboard focus on first map; Bottom/Background are click-to-focus.
+        // Overlay/Top OnDemand layers take keyboard focus on first map, if
+        // shown; Bottom/Background are click-to-focus.
         let cached = layer.cached_state();
         let on_demand = matches!(cached.layer, Layer::Overlay | Layer::Top)
-            && cached.keyboard_interactivity == KeyboardInteractivity::OnDemand;
-        (!initial_configure_sent, on_demand)
+            && cached.keyboard_interactivity == KeyboardInteractivity::OnDemand
+            && !hidden;
+        (!initial_configure_sent, on_demand, became_hidden)
     };
 
     if zone_before != layer_map_for_output(&output).non_exclusive_zone() {
         state.apply_layout(&output);
+    }
+    if became_hidden {
+        state.layer_hidden(&output, surface);
     }
     if needs_configure && on_demand {
         state.layer_shell_on_demand_focus = Some(surface.clone());

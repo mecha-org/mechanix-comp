@@ -1,3 +1,4 @@
+pub mod accelerators;
 pub mod compositor;
 pub mod data_control;
 pub mod data_device;
@@ -7,13 +8,13 @@ pub mod foreign_toplevel;
 pub mod fractional_scale;
 pub mod idle;
 pub mod image_copy_capture;
-pub mod keyboard_event;
 pub mod layer_shell;
 pub mod output;
 pub mod output_power;
 pub mod seat;
 pub mod security_context;
 pub mod session_lock;
+pub mod shell_surface;
 pub mod shm;
 pub mod thumbnail_view;
 pub mod virtual_keyboard;
@@ -44,6 +45,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
             && !popup.is_initial_configure_sent()
         {
+            self.send_scale_transform_to_its_output(surface);
             popup.send_configure().expect("initial configure failed");
         }
     }

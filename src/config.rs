@@ -8,6 +8,7 @@ use mxconfig::{Diagnostic, Event, Source};
 use smithay::output::Output;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
+use smithay::utils::Transform;
 use tracing::{error, warn};
 
 use crate::backend::{Backend, snap_scale};
@@ -17,37 +18,42 @@ mod comp {
     mxconfig::client!("resources/org.mechanix.comp.toml");
 }
 
-use comp::{Comp, CompChange};
+use comp::{Comp, CompChange, OutputTransform};
 
-/// The settings source, and the settings if they opened.
+/// The settings source, and the handle once it opens.
 pub struct Config {
     source: Source,
     comp: Option<Comp>,
 }
 
 impl Config {
-    /// Open the settings and follow changes to their files.
-    pub fn load<D: Backend + 'static>(handle: &LoopHandle<'static, State<D>>) -> Self {
+    /// Ask for the settings and follow changes to their files. They arrive
+    /// through [`State::drain_config`].
+    pub fn new<D: Backend + 'static>(handle: &LoopHandle<'static, State<D>>) -> Self {
         let source = Source::new();
         // Watching before the request reads the files once, not twice.
         watch(&source, handle);
         source.request::<Comp>();
-        let mut comp = None;
-        // Without a bus, the request is answered at once.
-        for outcome in source.outcomes() {
-            match outcome.event::<Comp>() {
-                Some(Event::Opened(opened)) => comp = Some(opened),
-                Some(Event::OpenFailed(e)) => error!("config: settings did not open: {e}"),
-                Some(Event::Diagnosed(diagnostics)) => log(&diagnostics),
-                _ => {}
-            }
-        }
-        Self { source, comp }
+        Self { source, comp: None }
     }
 
     /// The configured scale for every output.
     pub fn scale(&self) -> Option<f64> {
         self.comp.as_ref()?.output().scale().map(snap_scale)
+    }
+
+    /// The configured transform for every output.
+    pub fn transform(&self) -> Option<Transform> {
+        Some(match self.comp.as_ref()?.output().transform()? {
+            OutputTransform::Normal => Transform::Normal,
+            OutputTransform::_90 => Transform::_90,
+            OutputTransform::_180 => Transform::_180,
+            OutputTransform::_270 => Transform::_270,
+            OutputTransform::Flipped => Transform::Flipped,
+            OutputTransform::Flipped90 => Transform::Flipped90,
+            OutputTransform::Flipped180 => Transform::Flipped180,
+            OutputTransform::Flipped270 => Transform::Flipped270,
+        })
     }
 }
 
@@ -61,7 +67,10 @@ fn watch<D: Backend + 'static>(source: &Source, handle: &LoopHandle<'static, Sta
     let inserted = handle.insert_source(inotify, |_, fd, state| {
         let mut buf = [0; 4096];
         match (&**fd).read(&mut buf) {
-            Ok(n) => state.config_changed(&buf[..n]),
+            Ok(n) => {
+                state.config.source.feed_inotify(&buf[..n]);
+                state.drain_config();
+            }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {}
             Err(e) => error!("config: reading inotify: {e}"),
         }
@@ -90,22 +99,40 @@ impl<D: Backend + 'static> State<D> {
         self.config.scale().unwrap_or_else(default)
     }
 
-    /// Feed inotify `events` to the settings and apply what changed.
-    fn config_changed(&mut self, events: &[u8]) {
-        self.config.source.feed_inotify(events);
-        let mut rescale = false;
+    /// The transform outputs get from the settings.
+    pub fn output_transform(&self) -> Transform {
+        self.backend_data.output_transform(self.config.transform())
+    }
+
+    /// Handle what the settings source has to say.
+    pub fn drain_config(&mut self) {
         for outcome in self.config.source.outcomes() {
-            match outcome.event::<Comp>() {
-                Some(Event::Changed(CompChange::OutputScale(_))) => rescale = true,
-                Some(Event::Diagnosed(diagnostics)) => log(&diagnostics),
-                _ => {}
+            if let Some(event) = outcome.event::<Comp>() {
+                self.on_comp(event);
             }
         }
-        if rescale {
-            for output in self.space.outputs().cloned().collect::<Vec<_>>() {
-                self.reconfigure_output(&output, None);
+    }
+
+    fn on_comp(&mut self, event: Event<Comp>) {
+        match event {
+            Event::Opened(comp) => {
+                self.config.comp = Some(comp);
+                self.reconfigure_outputs();
             }
-            self.schedule_render();
+            Event::Changed(CompChange::OutputScale(_) | CompChange::OutputTransform(_)) => {
+                self.reconfigure_outputs();
+            }
+            Event::OpenFailed(e) => error!("config: settings did not open: {e}"),
+            Event::Detached(cause) => warn!("config: settings detached: {cause}"),
+            Event::Diagnosed(diagnostics) => log(&diagnostics),
+            _ => {}
         }
+    }
+
+    fn reconfigure_outputs(&mut self) {
+        for output in self.space.outputs().cloned().collect::<Vec<_>>() {
+            self.reconfigure_output(&output, None);
+        }
+        self.schedule_render();
     }
 }

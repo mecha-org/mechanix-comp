@@ -19,6 +19,7 @@ use smithay::wayland::shell::wlr_layer::Layer;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 
 use crate::backend::Backend;
+use crate::handlers::shell_surface::{ShellRole, osk_role_held, shell_role, shown_layers};
 use crate::state::State;
 use crate::state::WindowMode;
 
@@ -163,15 +164,19 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         }
     }
 
-    /// Give `output` `mode`, if any, and its scale, then refit everything on it.
+    /// Give `output` `mode`, if any, and its scale and transform, then refit
+    /// everything on it.
     pub fn reconfigure_output(&mut self, output: &Output, mode: Option<Mode>) {
         let scale = self.output_scale(output);
         let scale = (scale != output.current_scale().fractional_scale())
             .then_some(Scale::Fractional(scale));
-        if mode.is_none() && scale.is_none() {
+        let transform = self.output_transform();
+        let transform = (transform != output.current_transform()).then_some(transform);
+        if mode.is_none() && scale.is_none() && transform.is_none() {
             return;
         }
-        output.change_current_state(mode, None, scale, None);
+        output.change_current_state(mode, transform, scale, None);
+        self.send_scale_transform_on(output);
         layer_map_for_output(output).arrange();
         self.apply_layout(output);
         self.update_capture_constraints(output);
@@ -290,11 +295,15 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             .unwrap()
     }
 
-    /// The active family's windows mapped on `output`, the ones it shows.
+    /// The active family's windows mapped on `output`, the ones it shows:
+    /// none while it shows home.
     pub fn visible_surfaces(&self, output: &Output) -> HashSet<WlSurface> {
         let Some(focused) = &self.active_window else {
             return HashSet::new();
         };
+        if self.showing_home.contains(output) {
+            return HashSet::new();
+        }
         let root = self.root_of(focused);
         self.space
             .elements()
@@ -309,14 +318,15 @@ impl<BackendData: Backend + 'static> State<BackendData> {
     /// How `output` stacks: whether its shown windows are a fullscreen family,
     /// and whether a prompt has the keyboard focus.
     pub fn stack_mode(&self, output: &Output) -> StackMode {
-        let fullscreen = self.active_window.as_ref().is_some_and(|focused| {
-            let root = self.root_of(focused);
-            self.is_on(&root, output)
-                && self
-                    .toplevels
-                    .get(&root)
-                    .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
-        });
+        let fullscreen = !self.showing_home.contains(output)
+            && self.active_window.as_ref().is_some_and(|focused| {
+                let root = self.root_of(focused);
+                self.is_on(&root, output)
+                    && self
+                        .toplevels
+                        .get(&root)
+                        .is_some_and(|ws| ws.mode == WindowMode::Fullscreen)
+            });
         let focus = self.seat.get_keyboard().and_then(|k| k.current_focus());
         let prompt_focused = focus.is_some_and(|focus| {
             layer_map_for_output(output)
@@ -326,6 +336,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
         StackMode {
             fullscreen,
             prompt_focused,
+            osk_role_held: osk_role_held(&self.layer_shell_state),
         }
     }
 
@@ -366,17 +377,23 @@ pub struct StackMode {
     pub fullscreen: bool,
     /// A prompt has the keyboard focus: the keyboard goes above prompts.
     pub prompt_focused: bool,
+    /// Some surface has the osk role: no other is taken for the keyboard by
+    /// its `"osk"` namespace.
+    pub osk_role_held: bool,
 }
 
-/// Where surfaces stack, front to back. Shell roles come from layer-shell
-/// namespaces and only count in Top and Overlay; everything else keeps the
-/// protocol's layer order.
+/// Where surfaces stack, front to back. Shell roles come from
+/// `mx_shell_surface_manager_v1` and only count in Overlay (the `"osk"`
+/// namespace fallback in Top too, see [`stack_slot`]); everything else keeps
+/// the protocol's layer order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Slot {
+pub(crate) enum Slot {
     KeyboardOverPrompt,
     Prompt,
-    Chrome,
+    Edge,
+    Bar,
     Osd,
+    Panel,
     Keyboard,
     View,
     Overlay,
@@ -389,26 +406,42 @@ enum Slot {
     Background,
 }
 
-/// A Top or Overlay layer surface's shell role, from its namespace.
-fn role_slot(layer: &LayerSurface) -> Option<Slot> {
-    if !matches!(layer.layer(), Layer::Top | Layer::Overlay) {
+/// An Overlay layer surface's shell role, from `mx_shell_surface_manager_v1`.
+pub(crate) fn role_slot(layer: &LayerSurface) -> Option<Slot> {
+    if layer.layer() != Layer::Overlay {
         return None;
     }
-    let namespace = layer.namespace();
-    let has = |prefix: &str| namespace.starts_with(prefix);
-    if namespace == "osk" {
-        Some(Slot::Keyboard)
-    } else if has("mx-prompt-") {
-        Some(Slot::Prompt)
-    } else if has("mx-edge-") || has("mx-bar-") {
-        Some(Slot::Chrome)
-    } else if has("mx-osd-") {
-        Some(Slot::Osd)
-    } else if has("mx-view-") {
-        Some(Slot::View)
-    } else {
-        None
+    shell_role(layer).and_then(slot_of)
+}
+
+fn slot_of(role: ShellRole) -> Option<Slot> {
+    match role {
+        ShellRole::None => None,
+        ShellRole::Prompt => Some(Slot::Prompt),
+        ShellRole::Edge => Some(Slot::Edge),
+        ShellRole::Bar => Some(Slot::Bar),
+        ShellRole::Osd => Some(Slot::Osd),
+        ShellRole::Panel => Some(Slot::Panel),
+        ShellRole::Osk => Some(Slot::Keyboard),
+        ShellRole::View => Some(Slot::View),
     }
+}
+
+/// Whether `layer` is a standalone on-screen keyboard's: no role, in the
+/// `"osk"` namespace.
+fn standalone_osk(layer: &LayerSurface) -> bool {
+    layer.namespace() == "osk" && shell_role(layer).is_none()
+}
+
+/// A layer surface's [`role_slot`], else the keyboard's for a Top or Overlay
+/// [`standalone_osk`] one, while no surface holds the osk role.
+pub(crate) fn stack_slot(layer: &LayerSurface, osk_role_held: bool) -> Option<Slot> {
+    role_slot(layer).or_else(|| {
+        let fallback = matches!(layer.layer(), Layer::Top | Layer::Overlay)
+            && standalone_osk(layer)
+            && !osk_role_held;
+        fallback.then_some(Slot::Keyboard)
+    })
 }
 
 /// An output's shown surfaces, holding its layer map while in use.
@@ -437,15 +470,16 @@ impl<'a> StackingOrder<'a> {
     }
 
     /// Front to back, by [`Slot`]: the keyboard (above prompts while one has
-    /// focus), prompts, edges and bars, OSDs, the keyboard otherwise, views,
-    /// other Overlay layers, a fullscreen family, other Top layers,
+    /// focus), prompts, edges and bars, OSDs, panels, the keyboard otherwise,
+    /// views, other Overlay layers, a fullscreen family, other Top layers,
     /// Bottom/Background popups, other windows, Bottom/Background surfaces.
-    /// Within a slot, newest first.
+    /// Within a slot, newest first. Hidden layer surfaces are left out.
     pub fn iter(&self) -> impl Iterator<Item = Stacked<'_>> {
         let popups = WindowSurfaceType::POPUP | WindowSurfaceType::SUBSURFACE;
         let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
         let mut layers = Vec::new();
-        for surface in self.map.layers().rev() {
+        // Hidden ones: not drawn, and no input reaches them.
+        for surface in shown_layers(&self.map).rev() {
             let Some(geo) = self.map.layer_geometry(surface) else {
                 continue;
             };
@@ -454,7 +488,10 @@ impl<'a> StackingOrder<'a> {
                 let entry = StackEntry::Layer(surface, kind);
                 layers.push((slot, Stacked { entry, loc }));
             };
-            match (surface.layer(), role_slot(surface)) {
+            match (
+                surface.layer(),
+                stack_slot(surface, self.mode.osk_role_held),
+            ) {
                 (_, Some(Slot::Keyboard)) if self.mode.prompt_focused => {
                     push(Slot::KeyboardOverPrompt, WindowSurfaceType::ALL)
                 }
@@ -534,4 +571,20 @@ fn layer_under(
             region.is_none_or(|region| region.contains(local.to_i32_round()))
         });
     hits.then(|| (main.clone(), Point::default()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A panel goes over the keyboard and views, under OSDs and the bar, as
+    /// the protocol orders the roles.
+    #[test]
+    fn a_panel_stacks_between_osds_and_the_keyboard() {
+        let slot = |role| slot_of(role).unwrap();
+        assert!(slot(ShellRole::Bar) < slot(ShellRole::Panel));
+        assert!(slot(ShellRole::Osd) < slot(ShellRole::Panel));
+        assert!(slot(ShellRole::Panel) < slot(ShellRole::Osk));
+        assert!(slot(ShellRole::Panel) < slot(ShellRole::View));
+    }
 }

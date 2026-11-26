@@ -1,9 +1,11 @@
-//! Our zwlr-foreign-toplevel-management-v1 + smithay's ext-foreign-toplevel-list-v1, driven by [`State::foreign_toplevel_refresh`].
+//! Our zwlr-foreign-toplevel-management-v1 + smithay's ext-foreign-toplevel-list-v1, driven by [`State::foreign_toplevel_refresh`],
+//! and mx-foreign-toplevel-info-v1 on top of the wlr handles.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 
-use smithay::backend::renderer::utils::RendererSurfaceStateUserData;
+use smithay::backend::renderer::utils::with_renderer_surface_state;
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::ext::foreign_toplevel_list::v1::server::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::{
@@ -24,13 +26,73 @@ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 use smithay::wayland::{Dispatch2, GlobalDispatch2};
 
 use crate::backend::Backend;
-use crate::state::{State, WindowMode};
+use crate::protocols::foreign_toplevel_info::{
+    mx_foreign_toplevel_info_manager_v1::{self, MxForeignToplevelInfoManagerV1},
+    mx_foreign_toplevel_info_v1::{self, MxForeignToplevelInfoV1},
+};
+use crate::state::{ActivatedWith, State, WindowMode};
 
 const WLR_MANAGEMENT_VERSION: u32 = 3;
+const INFO_VERSION: u32 = 1;
+
+trait WlrHandle: Eq + Hash + Clone {
+    type Client: PartialEq;
+
+    fn client_id(&self) -> Option<Self::Client>;
+    fn wlr_version(&self) -> u32;
+    fn send_parent(&self, parent: Option<&Self>);
+    fn send_done(&self);
+    fn send_closed(&self);
+}
+
+impl WlrHandle for ZwlrForeignToplevelHandleV1 {
+    type Client = ClientId;
+
+    fn client_id(&self) -> Option<ClientId> {
+        self.client().map(|client| client.id())
+    }
+
+    fn wlr_version(&self) -> u32 {
+        Resource::version(self)
+    }
+
+    fn send_parent(&self, parent: Option<&Self>) {
+        self.parent(parent);
+    }
+
+    fn send_done(&self) {
+        self.done();
+    }
+
+    fn send_closed(&self) {
+        self.closed();
+    }
+}
+
+/// Per-client handle bookkeeping stored alongside the entered outputs.
+#[derive(Debug)]
+struct WlrInstance<S, O> {
+    outputs: Vec<O>,
+    /// Last non-null parent announced on this handle (`v3+` only), so `None`
+    /// is sent when a parent clears without spamming parentless opens.
+    announced_parent: Option<S>,
+    needs_done: bool,
+}
+
+trait WlrEntry<S, H: WlrHandle, O> {
+    fn parent(&self) -> Option<&S>;
+    fn set_parent(&mut self, parent: Option<S>);
+    fn instances(&self) -> &HashMap<H, WlrInstance<S, O>>;
+    fn instances_mut(&mut self) -> &mut HashMap<H, WlrInstance<S, O>>;
+}
 
 /// Marker so the wlr global and resources dispatch here.
 #[derive(Default)]
 pub struct ForeignToplevelUdata;
+
+/// Marker so the `mx_foreign_toplevel_info_manager_v1` global and its
+/// objects dispatch here.
+pub struct ToplevelInfoUdata;
 
 /// What the foreign-toplevel protocols need to know about one toplevel.
 #[derive(Debug)]
@@ -43,10 +105,37 @@ pub struct ToplevelData {
     output: Option<Output>,
     /// xdg parent, if any; the wlr `parent` event is sent once handles exist.
     parent: Option<WlSurface>,
-    /// Per-client wlr handles, each with the outputs entered so far.
-    wlr_management_instances: HashMap<ZwlrForeignToplevelHandleV1, Vec<WlOutput>>,
+    /// The xdg-dialog modal hint.
+    modal: bool,
+    /// The activation token the toplevel last asked to be activated with.
+    activated_with: Option<ActivatedWith>,
+    /// Per-client wlr handles, each with entered outputs and parent sync state.
+    wlr_management_instances:
+        HashMap<ZwlrForeignToplevelHandleV1, WlrInstance<WlSurface, WlOutput>>,
+    /// mx info objects, each with the wlr handle it was made for.
+    infos: Vec<(MxForeignToplevelInfoV1, ZwlrForeignToplevelHandleV1)>,
     /// smithay's ext-list handle; owns all ext instance bookkeeping.
     ext_handle: Option<ForeignToplevelHandle>,
+}
+
+impl WlrEntry<WlSurface, ZwlrForeignToplevelHandleV1, WlOutput> for ToplevelData {
+    fn parent(&self) -> Option<&WlSurface> {
+        self.parent.as_ref()
+    }
+
+    fn set_parent(&mut self, parent: Option<WlSurface>) {
+        self.parent = parent;
+    }
+
+    fn instances(&self) -> &HashMap<ZwlrForeignToplevelHandleV1, WlrInstance<WlSurface, WlOutput>> {
+        &self.wlr_management_instances
+    }
+
+    fn instances_mut(
+        &mut self,
+    ) -> &mut HashMap<ZwlrForeignToplevelHandleV1, WlrInstance<WlSurface, WlOutput>> {
+        &mut self.wlr_management_instances
+    }
 }
 
 impl ToplevelData {
@@ -80,8 +169,14 @@ impl ToplevelData {
             }
         }
 
-        self.wlr_management_instances
-            .insert(toplevel.clone(), outputs);
+        self.wlr_management_instances.insert(
+            toplevel.clone(),
+            WlrInstance {
+                outputs,
+                announced_parent: None,
+                needs_done: true,
+            },
+        );
         Some(toplevel)
     }
 
@@ -99,7 +194,10 @@ impl ToplevelData {
             states: update.states.clone(),
             output: update.output.clone(),
             parent: update.parent.clone(),
+            modal: update.modal,
+            activated_with: update.activated_with.cloned(),
             wlr_management_instances: HashMap::new(),
+            infos: Vec::new(),
             ext_handle: None,
         }
     }
@@ -118,11 +216,13 @@ impl ToplevelData {
 }
 
 /// One toplevel's freshly observed state, applied to the announced set.
-struct ToplevelUpdate {
+struct ToplevelUpdate<'a> {
     surface: WlSurface,
     states: Vec<u8>,
     output: Option<Output>,
     parent: Option<WlSurface>,
+    modal: bool,
+    activated_with: Option<&'a ActivatedWith>,
 }
 
 /// The foreign-toplevel module state, held by [`State`].
@@ -133,18 +233,21 @@ pub struct ForeignToplevelManagerState {
 }
 
 impl ForeignToplevelManagerState {
-    /// Register the wlr management global; ext-list lives in `State::foreign_toplevel_list`.
+    /// Register the wlr management and mx info globals; ext-list lives in
+    /// `State::foreign_toplevel_list`.
     pub fn new<D>(dh: &DisplayHandle) -> Self
     where
         D: GlobalDispatch<ZwlrForeignToplevelManagerV1, ForeignToplevelUdata>,
         D: Dispatch<ZwlrForeignToplevelManagerV1, ForeignToplevelUdata>,
         D: Dispatch<ZwlrForeignToplevelHandleV1, ForeignToplevelUdata>,
+        D: GlobalDispatch<MxForeignToplevelInfoManagerV1, ToplevelInfoUdata>,
         D: 'static,
     {
         dh.create_global::<D, ZwlrForeignToplevelManagerV1, _>(
             WLR_MANAGEMENT_VERSION,
             ForeignToplevelUdata,
         );
+        dh.create_global::<D, MxForeignToplevelInfoManagerV1, _>(INFO_VERSION, ToplevelInfoUdata);
         Self::default()
     }
 
@@ -208,8 +311,21 @@ impl ForeignToplevelManagerState {
                     parent_targets.insert(update.surface.clone());
                 }
 
-                if new_title.is_some() || new_app_id.is_some() || states_changed || output_changed {
-                    for (instance, outputs) in &mut data.wlr_management_instances {
+                let modal_changed = data.modal != update.modal;
+                data.modal = update.modal;
+
+                if new_title.is_some()
+                    || new_app_id.is_some()
+                    || states_changed
+                    || output_changed
+                    || modal_changed
+                {
+                    for (instance, inst) in &mut data.wlr_management_instances {
+                        if modal_changed {
+                            for (info, _) in data.infos.iter().filter(|(_, h)| h == instance) {
+                                info.modal(u32::from(data.modal));
+                            }
+                        }
                         if let Some(title) = &new_title {
                             instance.title(title.clone());
                         }
@@ -220,24 +336,40 @@ impl ForeignToplevelManagerState {
                             instance.state(state_for_version(&update.states, instance.version()));
                         }
                         if output_changed {
-                            for wl_output in outputs.drain(..) {
+                            for wl_output in inst.outputs.drain(..) {
                                 instance.output_leave(&wl_output);
                             }
                             if let (Some(output), Some(client)) = (&data.output, instance.client())
                             {
                                 for wl_output in output.client_outputs(&client) {
                                     instance.output_enter(&wl_output);
-                                    outputs.push(wl_output);
+                                    inst.outputs.push(wl_output);
                                 }
                             }
                         }
-                        instance.done();
+                        inst.needs_done = true;
+                    }
+                }
+
+                if data.activated_with.as_ref() != update.activated_with {
+                    data.activated_with = update.activated_with.cloned();
+                    if let Some(activated) = &data.activated_with {
+                        let ours = data
+                            .infos
+                            .iter()
+                            .filter(|(info, _)| got_token(info, activated));
+                        for (info, handle) in ours {
+                            info.activation_token(activated.token.clone());
+                            if let Some(inst) = data.wlr_management_instances.get_mut(handle) {
+                                inst.needs_done = true;
+                            }
+                        }
                     }
                 }
 
                 // Clean up dead wl_outputs.
-                for outputs in data.wlr_management_instances.values_mut() {
-                    outputs.retain(|wl_output| wl_output.is_alive());
+                for inst in data.wlr_management_instances.values_mut() {
+                    inst.outputs.retain(|wl_output| wl_output.is_alive());
                 }
             }
             Entry::Vacant(entry) => {
@@ -258,74 +390,11 @@ impl ForeignToplevelManagerState {
 
     /// Close and drop announced toplevels that are no longer active.
     fn retain_active(&mut self, list: &mut ForeignToplevelListState, seen: &HashSet<WlSurface>) {
-        self.toplevels.retain(|surface, data| {
-            let keep = seen.contains(surface);
-            if !keep {
-                if let Some(handle) = data.ext_handle.take() {
-                    list.remove_toplevel(&handle);
-                }
-                for instance in data.wlr_management_instances.keys() {
-                    instance.closed();
-                }
+        retain_active_entries(&mut self.toplevels, seen, |data| {
+            if let Some(handle) = data.ext_handle.take() {
+                list.remove_toplevel(&handle);
             }
-            keep
         });
-    }
-
-    /// Send the wlr v3 `parent` event on every handle of `surface` and its children.
-    fn send_wlr_parent(&mut self, surface: &WlSurface) {
-        let instances: Vec<ZwlrForeignToplevelHandleV1> = self
-            .toplevels
-            .get(surface)
-            .map(|data| data.wlr_management_instances.keys().cloned().collect())
-            .unwrap_or_default();
-        for instance in &instances {
-            self.send_parent_to(surface, instance);
-            instance.done();
-        }
-
-        let children: Vec<(WlSurface, ZwlrForeignToplevelHandleV1)> = self
-            .toplevels
-            .iter()
-            .filter_map(|(child, data)| {
-                if data.parent.as_ref() != Some(surface) {
-                    return None;
-                }
-                Some(
-                    data.wlr_management_instances
-                        .keys()
-                        .cloned()
-                        .map(|instance| (child.clone(), instance))
-                        .collect::<Vec<_>>(),
-                )
-            })
-            .flatten()
-            .collect();
-        for (child, instance) in children {
-            self.send_parent_to(&child, &instance);
-            instance.done();
-        }
-    }
-
-    /// Send the wlr v3 `parent` event on `instance`, matching the parent's
-    /// handle in the same client; pre-v3 handles keep their own version.
-    fn send_parent_to(&self, surface: &WlSurface, instance: &ZwlrForeignToplevelHandleV1) {
-        let Some(parent) = self
-            .toplevels
-            .get(surface)
-            .and_then(|data| data.parent.as_ref())
-        else {
-            return;
-        };
-        let Some(client) = instance.client() else {
-            return;
-        };
-        let parent = self.toplevels.get(parent).and_then(|data| {
-            data.wlr_management_instances
-                .keys()
-                .find(|handle| handle.client().as_ref() == Some(&client))
-        });
-        instance.parent(parent);
     }
 
     /// The `wl_surface` behind a wlr handle, if its toplevel is still announced.
@@ -351,15 +420,222 @@ impl ForeignToplevelManagerState {
             .map(|(surface, _)| surface.clone())
     }
 
+    /// A client bound a `wl_output` for `output`: its handles of the
+    /// toplevels on that output enter it.
+    pub fn output_bound(&mut self, output: &Output, wl_output: &WlOutput) {
+        let client = wl_output.client();
+        for data in self.toplevels.values_mut() {
+            if data.output.as_ref() != Some(output) {
+                continue;
+            }
+            for (instance, inst) in &mut data.wlr_management_instances {
+                if instance.client() != client || inst.outputs.contains(wl_output) {
+                    continue;
+                }
+                instance.output_enter(wl_output);
+                inst.outputs.push(wl_output.clone());
+                instance.done();
+            }
+        }
+    }
+
     fn remove_wlr_instance(&mut self, resource: &ZwlrForeignToplevelHandleV1) {
         for data in self.toplevels.values_mut() {
             data.wlr_management_instances.remove(resource);
+            data.infos.retain(|(_, handle)| handle != resource);
+        }
+    }
+
+    /// Answer `get_info` for `handle`: its pid, modal hint and activation
+    /// token, applied by a `done`. A closed handle's info stays inert.
+    fn add_info(
+        &mut self,
+        dh: &DisplayHandle,
+        info: MxForeignToplevelInfoV1,
+        handle: ZwlrForeignToplevelHandleV1,
+    ) {
+        let Some(surface) = self.surface_for_wlr_handle(&handle) else {
+            return;
+        };
+        let Some(data) = self.toplevels.get_mut(&surface) else {
+            return;
+        };
+        let pid = surface
+            .client()
+            .and_then(|client| client.get_credentials(dh).ok())
+            .map_or(0, |credentials| credentials.pid);
+        info.pid(pid);
+        info.modal(u32::from(data.modal));
+        if let Some(activated) = data.activated_with.as_ref().filter(|a| got_token(&info, a)) {
+            info.activation_token(activated.token.clone());
+        }
+        handle.done();
+        data.infos.push((info, handle));
+    }
+
+    fn remove_info(&mut self, info: &MxForeignToplevelInfoV1) {
+        for data in self.toplevels.values_mut() {
+            data.infos.retain(|(i, _)| i != info);
         }
     }
 }
 
-/// The wlr `state` payload for a toplevel in `mode` with `focused` focus.
-fn to_state_vec(mode: WindowMode, focused: bool) -> Vec<u8> {
+/// Whether `info`'s client is the one that got the activation token: only
+/// it hears which toplevel used it.
+fn got_token(info: &MxForeignToplevelInfoV1, activated: &ActivatedWith) -> bool {
+    info.client().is_some_and(|c| c.id() == activated.client)
+}
+
+/// Emit `done` on every handle of `data` with pending changes.
+fn flush_done_entry<S, H, O, E>(data: &mut E)
+where
+    H: WlrHandle,
+    E: WlrEntry<S, H, O>,
+{
+    for (handle, inst) in data.instances_mut() {
+        if inst.needs_done {
+            handle.send_done();
+            inst.needs_done = false;
+        }
+    }
+}
+
+/// Emit `done` on every handle across `entries` that has pending changes.
+fn flush_all_done<S, H, O, E>(entries: &mut HashMap<S, E>)
+where
+    S: Eq + Hash,
+    H: WlrHandle,
+    E: WlrEntry<S, H, O>,
+{
+    for data in entries.values_mut() {
+        flush_done_entry(data);
+    }
+}
+
+/// Propagate parent updates across `targets` and their children, emitting
+/// `parent` on v3+ handles whenever a handle's resolved parent changed.
+fn sync_parents<S, H, O, E>(entries: &mut HashMap<S, E>, targets: &mut HashSet<S>)
+where
+    S: Eq + Hash + Clone,
+    H: WlrHandle,
+    E: WlrEntry<S, H, O>,
+{
+    if targets.is_empty() {
+        return;
+    }
+    loop {
+        let before = targets.len();
+        for (surface, data) in entries.iter() {
+            if let Some(parent) = data.parent()
+                && targets.contains(parent)
+            {
+                targets.insert(surface.clone());
+            }
+        }
+        if targets.len() == before {
+            break;
+        }
+    }
+
+    let surfaces: Vec<S> = targets.iter().cloned().collect();
+    for surface in surfaces {
+        let desired_parent = entries
+            .get(&surface)
+            .and_then(|data| data.parent().cloned());
+        let Some(handles) = entries
+            .get(&surface)
+            .map(|data| data.instances().keys().cloned().collect::<Vec<_>>())
+        else {
+            continue;
+        };
+
+        let updates: Vec<(H, Option<H>, Option<S>)> = handles
+            .into_iter()
+            .filter(|handle| handle.wlr_version() >= 3)
+            .filter_map(|handle| {
+                let client = handle.client_id()?;
+                let resolved = desired_parent.as_ref().and_then(|parent| {
+                    entries.get(parent).and_then(|data| {
+                        data.instances()
+                            .keys()
+                            .find(|h| h.client_id().as_ref() == Some(&client))
+                            .cloned()
+                            .map(|ph| (ph, parent.clone()))
+                    })
+                });
+                let (parent_handle, parent_surface) = match resolved {
+                    Some((ph, ps)) => (Some(ph), Some(ps)),
+                    None => (None, None),
+                };
+                Some((handle, parent_handle, parent_surface))
+            })
+            .collect();
+
+        if let Some(data) = entries.get_mut(&surface) {
+            for (handle, parent_handle, parent_surface) in updates {
+                if let Some(inst) = data.instances_mut().get_mut(&handle)
+                    && inst.announced_parent != parent_surface
+                {
+                    handle.send_parent(parent_handle.as_ref());
+                    inst.announced_parent = parent_surface;
+                    inst.needs_done = true;
+                }
+            }
+        }
+    }
+}
+
+/// Drop entries missing from `seen`. Active children referencing a dropped parent
+/// have their parent cleared and announced as `parent(None)` before the parent's
+/// `closed` event goes out.
+fn retain_active_entries<S, H, O, E>(
+    entries: &mut HashMap<S, E>,
+    seen: &HashSet<S>,
+    mut on_remove: impl FnMut(&mut E),
+) where
+    S: Eq + Hash + Clone,
+    H: WlrHandle,
+    E: WlrEntry<S, H, O>,
+{
+    let dropped: HashSet<S> = entries
+        .keys()
+        .filter(|surface| !seen.contains(*surface))
+        .cloned()
+        .collect();
+    if dropped.is_empty() {
+        return;
+    }
+
+    let mut cleared = HashSet::new();
+    for (surface, data) in entries.iter_mut() {
+        if !dropped.contains(surface)
+            && data.parent().is_some_and(|parent| dropped.contains(parent))
+        {
+            data.set_parent(None);
+            cleared.insert(surface.clone());
+        }
+    }
+    sync_parents(entries, &mut cleared);
+    for surface in &cleared {
+        if let Some(data) = entries.get_mut(surface) {
+            flush_done_entry(data);
+        }
+    }
+
+    entries.retain(|surface, data| {
+        let keep = seen.contains(surface);
+        if !keep {
+            on_remove(data);
+            for handle in data.instances().keys() {
+                handle.send_closed();
+            }
+        }
+        keep
+    });
+}
+
+/// The wlr `state` payload for a toplevel in `mode`, `active` or not.
+fn to_state_vec(mode: WindowMode, active: bool) -> Vec<u8> {
     let mut states = Vec::new();
     if matches!(mode, WindowMode::Maximized) {
         states.extend((zwlr_foreign_toplevel_handle_v1::State::Maximized as u32).to_ne_bytes());
@@ -367,7 +643,7 @@ fn to_state_vec(mode: WindowMode, focused: bool) -> Vec<u8> {
     if matches!(mode, WindowMode::Fullscreen) {
         states.extend((zwlr_foreign_toplevel_handle_v1::State::Fullscreen as u32).to_ne_bytes());
     }
-    if focused {
+    if active {
         states.extend((zwlr_foreign_toplevel_handle_v1::State::Activated as u32).to_ne_bytes());
     }
     states
@@ -389,14 +665,9 @@ fn state_for_version(states: &[u8], version: u32) -> Vec<u8> {
         .collect()
 }
 
-/// True once the surface has committed a buffer (xdg mapped).
+/// True while the surface has a buffer (xdg mapped): a null buffer unmaps it.
 fn has_buffer(surface: &WlSurface) -> bool {
-    with_states(surface, |states| {
-        states
-            .data_map
-            .get::<RendererSurfaceStateUserData>()
-            .is_some()
-    })
+    with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false)
 }
 
 /// Runs `f` with the toplevel's (title, app_id) under the role lock.
@@ -416,40 +687,51 @@ fn with_xdg_title_app_id<T>(
 }
 
 impl<BackendData: Backend + 'static> State<BackendData> {
-    /// Reconcile both protocols with the current windows; focused last so old windows deactivate first.
+    /// Reconcile both protocols with the current windows; active last so old windows deactivate first.
     pub fn foreign_toplevel_refresh(&mut self) {
+        // Activated is what xdg `activated` is: the active window and its
+        // parents, whoever holds the keyboard (an open menu, an `Exclusive`
+        // layer).
+        let active = self.active_group();
         let Self {
             toplevels,
             space,
             foreign_toplevel: manager,
             foreign_toplevel_list: list,
             display_handle,
-            seat,
             ..
         } = self;
-        let focused = seat.get_keyboard().unwrap().current_focus();
+
+        let active_surfaces: HashSet<WlSurface> = toplevels
+            .iter()
+            .filter(|(surface, _)| surface.is_alive() && has_buffer(surface))
+            .map(|(surface, _)| surface.clone())
+            .collect();
 
         let mut seen: HashSet<WlSurface> = HashSet::new();
         let mut parent_targets: HashSet<WlSurface> = HashSet::new();
-        // Two passes so the focused window is announced last.
-        for focused_pass in [false, true] {
+        // Two passes so the active windows are announced last.
+        for active_pass in [false, true] {
             for (surface, ws) in toplevels.iter() {
-                let is_focused = focused.as_ref() == Some(surface);
-                if is_focused != focused_pass {
-                    continue;
-                }
-                if !surface.is_alive() || !has_buffer(surface) {
+                let is_active = active.contains(surface);
+                if is_active != active_pass || !active_surfaces.contains(surface) {
                     continue;
                 }
                 seen.insert(surface.clone());
                 let output = space.outputs_for_element(&ws.window).into_iter().next();
-                let parent = ws.window.toplevel().and_then(|toplevel| toplevel.parent());
-                let states = to_state_vec(ws.mode, is_focused);
+                let parent = ws
+                    .window
+                    .toplevel()
+                    .and_then(|toplevel| toplevel.parent())
+                    .filter(|p| active_surfaces.contains(p));
+                let states = to_state_vec(ws.mode, is_active);
                 let update = ToplevelUpdate {
                     surface: surface.clone(),
                     states,
                     output,
                     parent,
+                    modal: ws.modal,
+                    activated_with: ws.activated_with.as_ref(),
                 };
                 manager.apply_one::<State<BackendData>>(
                     display_handle,
@@ -460,25 +742,9 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             }
         }
 
+        sync_parents(&mut manager.toplevels, &mut parent_targets);
+        flush_all_done(&mut manager.toplevels);
         manager.retain_active(list, &seen);
-
-        // Children of a targeted surface follow their parent.
-        loop {
-            let before = parent_targets.len();
-            for (surface, data) in &manager.toplevels {
-                if let Some(parent) = &data.parent
-                    && parent_targets.contains(parent)
-                {
-                    parent_targets.insert(surface.clone());
-                }
-            }
-            if parent_targets.len() == before {
-                break;
-            }
-        }
-        for surface in parent_targets {
-            manager.send_wlr_parent(&surface);
-        }
     }
 
     /// wlr `activate` request: raise the toplevel and make it the active one.
@@ -507,7 +773,7 @@ impl<BackendData: Backend + 'static> State<BackendData> {
             return;
         };
         let window = ws.window.clone();
-        self.focus_window(&window);
+        self.show_window(&window);
     }
 
     /// wlr `close` request: ask the toplevel to close.
@@ -544,19 +810,18 @@ impl<BackendData: Backend + 'static>
     ) {
         let manager = data_init.init(resource, ForeignToplevelUdata);
 
-        // Handles need a `done` per surface; `send_wlr_parent` sends it.
-        let mut new_surfaces = Vec::new();
+        // Handles need initial parent events (v3+) and a `done` per surface.
+        let mut new_surfaces = HashSet::new();
         for (surface, data) in state.foreign_toplevel.toplevels.iter_mut() {
             if data
                 .add_wlr_instance::<State<BackendData>>(dh, client, &manager)
                 .is_some()
             {
-                new_surfaces.push(surface.clone());
+                new_surfaces.insert(surface.clone());
             }
         }
-        for surface in new_surfaces {
-            state.foreign_toplevel.send_wlr_parent(&surface);
-        }
+        sync_parents(&mut state.foreign_toplevel.toplevels, &mut new_surfaces);
+        flush_all_done(&mut state.foreign_toplevel.toplevels);
 
         state
             .foreign_toplevel
@@ -624,10 +889,18 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrForeignToplevelHandleV1, Stat
             | zwlr_foreign_toplevel_handle_v1::Request::UnsetMaximized
             | zwlr_foreign_toplevel_handle_v1::Request::SetMinimized
             | zwlr_foreign_toplevel_handle_v1::Request::UnsetMinimized
-            | zwlr_foreign_toplevel_handle_v1::Request::SetRectangle { .. }
             | zwlr_foreign_toplevel_handle_v1::Request::SetFullscreen { .. }
             | zwlr_foreign_toplevel_handle_v1::Request::UnsetFullscreen => {
                 // State is compositor-driven and reflected back on the next refresh.
+            }
+            zwlr_foreign_toplevel_handle_v1::Request::SetRectangle { width, height, .. } => {
+                // Unused, but still checked.
+                if width < 0 || height < 0 {
+                    resource.post_error(
+                        zwlr_foreign_toplevel_handle_v1::Error::InvalidRectangle,
+                        "negative rectangle size",
+                    );
+                }
             }
             zwlr_foreign_toplevel_handle_v1::Request::Activate { .. } => {
                 state.foreign_activate(&surface);
@@ -647,6 +920,74 @@ impl<BackendData: Backend + 'static> Dispatch2<ZwlrForeignToplevelHandleV1, Stat
         resource: &ZwlrForeignToplevelHandleV1,
     ) {
         state.foreign_toplevel.remove_wlr_instance(resource);
+    }
+}
+
+impl<BackendData: Backend + 'static>
+    GlobalDispatch2<MxForeignToplevelInfoManagerV1, State<BackendData>> for ToplevelInfoUdata
+{
+    fn can_view(&self, client: &Client) -> bool {
+        crate::state::client_is_unrestricted(client)
+    }
+
+    fn bind(
+        &self,
+        _state: &mut State<BackendData>,
+        _dh: &DisplayHandle,
+        _client: &Client,
+        resource: New<MxForeignToplevelInfoManagerV1>,
+        data_init: &mut DataInit<'_, State<BackendData>>,
+    ) {
+        data_init.init(resource, ToplevelInfoUdata);
+    }
+}
+
+impl<BackendData: Backend + 'static> Dispatch2<MxForeignToplevelInfoManagerV1, State<BackendData>>
+    for ToplevelInfoUdata
+{
+    fn request(
+        &self,
+        state: &mut State<BackendData>,
+        _client: &Client,
+        _resource: &MxForeignToplevelInfoManagerV1,
+        request: mx_foreign_toplevel_info_manager_v1::Request,
+        dh: &DisplayHandle,
+        data_init: &mut DataInit<'_, State<BackendData>>,
+    ) {
+        match request {
+            mx_foreign_toplevel_info_manager_v1::Request::Destroy => {}
+            mx_foreign_toplevel_info_manager_v1::Request::GetInfo { id, handle } => {
+                let info = data_init.init(id, ToplevelInfoUdata);
+                state.foreign_toplevel.add_info(dh, info, handle);
+            }
+        }
+    }
+}
+
+impl<BackendData: Backend + 'static> Dispatch2<MxForeignToplevelInfoV1, State<BackendData>>
+    for ToplevelInfoUdata
+{
+    fn request(
+        &self,
+        _state: &mut State<BackendData>,
+        _client: &Client,
+        _resource: &MxForeignToplevelInfoV1,
+        request: mx_foreign_toplevel_info_v1::Request,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, State<BackendData>>,
+    ) {
+        match request {
+            mx_foreign_toplevel_info_v1::Request::Destroy => {}
+        }
+    }
+
+    fn destroyed(
+        &self,
+        state: &mut State<BackendData>,
+        _client: ClientId,
+        resource: &MxForeignToplevelInfoV1,
+    ) {
+        state.foreign_toplevel.remove_info(resource);
     }
 }
 
@@ -740,5 +1081,299 @@ mod tests {
     fn other_apps_dialogs_are_ignored() {
         let stack = [w(1, None, false), w(5, None, false), w(6, Some(5), true)];
         assert_eq!(activation_target(&1, &stack), 1);
+    }
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum HandleEvent {
+        Parent(u32, Option<u32>),
+        Done(u32),
+        Closed(u32),
+        ExtRemoved(u32),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    struct TestHandle {
+        id: u32,
+        client: u32,
+        version: u32,
+        log: LogRef,
+    }
+
+    #[derive(Debug, Default)]
+    struct EventLog(Rc<RefCell<Vec<HandleEvent>>>);
+
+    impl EventLog {
+        fn take(&self) -> Vec<HandleEvent> {
+            std::mem::take(&mut *self.0.borrow_mut())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LogRef(Rc<RefCell<Vec<HandleEvent>>>);
+
+    impl PartialEq for LogRef {
+        fn eq(&self, other: &Self) -> bool {
+            Rc::ptr_eq(&self.0, &other.0)
+        }
+    }
+    impl Eq for LogRef {}
+    impl Hash for LogRef {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            (Rc::as_ptr(&self.0) as usize).hash(state);
+        }
+    }
+
+    impl WlrHandle for TestHandle {
+        type Client = u32;
+
+        fn client_id(&self) -> Option<u32> {
+            Some(self.client)
+        }
+
+        fn wlr_version(&self) -> u32 {
+            self.version
+        }
+
+        fn send_parent(&self, parent: Option<&Self>) {
+            self.log
+                .0
+                .borrow_mut()
+                .push(HandleEvent::Parent(self.id, parent.map(|p| p.id)));
+        }
+
+        fn send_done(&self) {
+            self.log.0.borrow_mut().push(HandleEvent::Done(self.id));
+        }
+
+        fn send_closed(&self) {
+            self.log.0.borrow_mut().push(HandleEvent::Closed(self.id));
+        }
+    }
+
+    struct TestEntry {
+        parent: Option<u32>,
+        ext: u32,
+        instances: HashMap<TestHandle, WlrInstance<u32, ()>>,
+    }
+
+    impl WlrEntry<u32, TestHandle, ()> for TestEntry {
+        fn parent(&self) -> Option<&u32> {
+            self.parent.as_ref()
+        }
+
+        fn set_parent(&mut self, parent: Option<u32>) {
+            self.parent = parent;
+        }
+
+        fn instances(&self) -> &HashMap<TestHandle, WlrInstance<u32, ()>> {
+            &self.instances
+        }
+
+        fn instances_mut(&mut self) -> &mut HashMap<TestHandle, WlrInstance<u32, ()>> {
+            &mut self.instances
+        }
+    }
+
+    struct Harness {
+        log: EventLog,
+        clients: Vec<(u32, u32)>,
+        entries: HashMap<u32, TestEntry>,
+        next_handle: u32,
+    }
+
+    impl Harness {
+        fn new(clients: &[(u32, u32)]) -> Self {
+            Self {
+                log: EventLog::default(),
+                clients: clients.to_vec(),
+                entries: HashMap::new(),
+                next_handle: 100,
+            }
+        }
+
+        fn refresh(&mut self, active: &[(u32, Option<u32>)]) -> HashMap<u32, Vec<TestHandle>> {
+            let active_set: HashSet<u32> = active.iter().map(|&(s, _)| s).collect();
+            let mut targets = HashSet::new();
+            let mut created: HashMap<u32, Vec<TestHandle>> = HashMap::new();
+
+            for &(surface, parent) in active {
+                let parent = parent.filter(|p| active_set.contains(p));
+                match self.entries.entry(surface) {
+                    Entry::Occupied(mut e) => {
+                        let data = e.get_mut();
+                        if data.parent != parent {
+                            data.parent = parent;
+                            targets.insert(surface);
+                        }
+                    }
+                    Entry::Vacant(e) => {
+                        let mut instances = HashMap::new();
+                        for &(client, version) in &self.clients {
+                            let h = TestHandle {
+                                id: self.next_handle,
+                                client,
+                                version,
+                                log: LogRef(self.log.0.clone()),
+                            };
+                            self.next_handle += 1;
+                            created.entry(surface).or_default().push(h.clone());
+                            instances.insert(
+                                h,
+                                WlrInstance {
+                                    outputs: Vec::new(),
+                                    announced_parent: None,
+                                    needs_done: true,
+                                },
+                            );
+                        }
+                        targets.insert(surface);
+                        e.insert(TestEntry {
+                            parent,
+                            ext: surface * 10,
+                            instances,
+                        });
+                    }
+                }
+            }
+
+            sync_parents(&mut self.entries, &mut targets);
+            flush_all_done(&mut self.entries);
+            let log = self.log.0.clone();
+            retain_active_entries(&mut self.entries, &active_set, |data| {
+                log.borrow_mut().push(HandleEvent::ExtRemoved(data.ext));
+            });
+            created
+        }
+    }
+
+    #[test]
+    fn explicit_parent_cleared_to_none_notifies_v3() {
+        let mut h = Harness::new(&[(1, 3)]);
+        let created = h.refresh(&[(1, None), (2, Some(1))]);
+        let p_h = created[&1][0].id;
+        let c_h = created[&2][0].id;
+        let events = h.log.take();
+        // Parentless window receives no spurious Parent(None); child receives Parent(Some(p)).
+        assert!(!events.contains(&HandleEvent::Parent(p_h, None)));
+        assert!(events.contains(&HandleEvent::Parent(c_h, Some(p_h))));
+        assert!(events.contains(&HandleEvent::Done(c_h)));
+
+        // Clearing child's parent to None sends Parent(None) + Done.
+        h.refresh(&[(1, None), (2, None)]);
+        assert_eq!(
+            h.log.take(),
+            vec![HandleEvent::Parent(c_h, None), HandleEvent::Done(c_h)]
+        );
+    }
+
+    #[test]
+    fn parent_removed_clears_child_parent_before_closing_parent() {
+        let mut h = Harness::new(&[(1, 3)]);
+        let created = h.refresh(&[(1, None), (2, Some(1))]);
+        let p_h = created[&1][0].id;
+        let c_h = created[&2][0].id;
+        h.log.take();
+
+        // Parent closes/unmaps while child stays mapped.
+        h.refresh(&[(2, Some(1))]);
+        assert_eq!(
+            h.log.take(),
+            vec![
+                HandleEvent::Parent(c_h, None),
+                HandleEvent::Done(c_h),
+                HandleEvent::ExtRemoved(10),
+                HandleEvent::Closed(p_h),
+            ]
+        );
+
+        // Even if stale xdg parent still mentions 1 on later ticks, nothing re-emits.
+        h.refresh(&[(2, Some(1))]);
+        assert!(h.log.take().is_empty());
+
+        // Direct retain_active_entries drop also clears children before closing parent.
+        let mut h2 = Harness::new(&[(1, 3)]);
+        let created2 = h2.refresh(&[(1, None), (2, Some(1))]);
+        let p2 = created2[&1][0].id;
+        let c2 = created2[&2][0].id;
+        h2.log.take();
+        let keep = HashSet::from([2]);
+        let log2 = h2.log.0.clone();
+        retain_active_entries(&mut h2.entries, &keep, |data| {
+            log2.borrow_mut().push(HandleEvent::ExtRemoved(data.ext));
+        });
+        assert_eq!(
+            h2.log.take(),
+            vec![
+                HandleEvent::Parent(c2, None),
+                HandleEvent::Done(c2),
+                HandleEvent::ExtRemoved(10),
+                HandleEvent::Closed(p2),
+            ]
+        );
+    }
+
+    #[test]
+    fn pre_v3_handles_receive_no_parent_events() {
+        let mut h = Harness::new(&[(1, 1), (2, 2), (3, 3)]);
+        let created = h.refresh(&[(1, None), (2, Some(1))]);
+        let v1_c = created[&2][0].id;
+        let v2_c = created[&2][1].id;
+        let v3_c = created[&2][2].id;
+        let v3_p = created[&1][2].id;
+        let events = h.log.take();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, HandleEvent::Parent(id, _) if *id == v1_c || *id == v2_c))
+        );
+        assert!(events.contains(&HandleEvent::Parent(v3_c, Some(v3_p))));
+
+        h.refresh(&[(1, None), (2, None)]);
+        assert_eq!(
+            h.log.take(),
+            vec![HandleEvent::Parent(v3_c, None), HandleEvent::Done(v3_c)]
+        );
+    }
+
+    #[test]
+    fn unmap_closes_wlr_and_ext_and_remap_announces_fresh_handles() {
+        let mut h = Harness::new(&[(1, 3)]);
+        let first = h.refresh(&[(1, None)]);
+        let first_id = first[&1][0].id;
+        assert_eq!(h.log.take(), vec![HandleEvent::Done(first_id)]);
+
+        // Unmap: closed on wlr and removed from ext.
+        h.refresh(&[]);
+        assert_eq!(
+            h.log.take(),
+            vec![HandleEvent::ExtRemoved(10), HandleEvent::Closed(first_id)]
+        );
+
+        // Remap: fresh wlr handle is created; old handle receives nothing.
+        let second = h.refresh(&[(1, None)]);
+        let second_id = second[&1][0].id;
+        assert_ne!(first_id, second_id);
+        assert_eq!(h.log.take(), vec![HandleEvent::Done(second_id)]);
+    }
+
+    #[test]
+    fn child_announced_before_parent_in_same_refresh_resolves_parent_before_done() {
+        let mut h = Harness::new(&[(1, 3)]);
+        let created = h.refresh(&[(2, Some(1)), (1, None)]);
+        let c_h = created[&2][0].id;
+        let p_h = created[&1][0].id;
+        let events = h.log.take();
+        let parent_idx = events
+            .iter()
+            .position(|e| *e == HandleEvent::Parent(c_h, Some(p_h)))
+            .expect("child received parent");
+        let done_idx = events
+            .iter()
+            .position(|e| *e == HandleEvent::Done(c_h))
+            .expect("child received done");
+        assert!(parent_idx < done_idx);
     }
 }

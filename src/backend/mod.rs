@@ -74,6 +74,12 @@ pub trait Backend {
     /// `output`'s scale when none is configured.
     fn default_scale(&self, output: &Output) -> f64;
 
+    /// The transform outputs get given the `configured` one: that, or
+    /// `Normal`. (The DRM panel-orientation property is not read.)
+    fn output_transform(&self, configured: Option<Transform>) -> Transform {
+        configured.unwrap_or(Transform::Normal)
+    }
+
     /// Discard any cached swapchain/damage buffers for `output`, e.g. after a
     /// session resume (VT switch back) where the previous framebuffers are stale.
     fn reset_buffers(&mut self, output: &Output);

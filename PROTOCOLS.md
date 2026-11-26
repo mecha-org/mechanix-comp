@@ -10,7 +10,7 @@ Smithay: ❌ means we hand-roll it.
 
 | Protocol | | Version | Smithay | Notes |
 | --- | --- | --- | --- | --- |
-| `wl_compositor` | ✅ | 5 / 6 | ✅ | |
+| `wl_compositor` | ✅ | 6 / 7 | ✅ | v7 (`get_release`) not in Smithay |
 | `wl_subcompositor` | ✅ | 1 / 1 | ✅ | |
 | `wl_shm` | ✅ | 2 / 2 | ✅ | |
 | `wl_seat` | ✅ | 9 / 9 | ✅ | |
@@ -58,7 +58,6 @@ Smithay: ❌ means we hand-roll it.
 | `zxdg_decoration_manager_v1` | ✅ | 1 / 1 | ✅ | server-side but no titlebars drawn (intentionally) |
 | `zxdg_output_manager_v1` | ✅ | 3 / 3 | ✅ | |
 | `zxdg_exporter_v2` / `zxdg_importer_v2` | ✅ | 1 / 1 | ✅ | |
-| `phosh_private_keyboard_event` | ✅ | 8 / 8 | ❌ | accelerator grabs; compositor-side repeat 400/120 ms, capped at 10 s; XML interface is v7, the object inherits the `phosh_private` bind version (8) |
 | `zwp_pointer_constraints_v1` | 🚧 | — / 1 | ✅ | no global |
 | `zwp_relative_pointer_v1` | ❌ | — / 1 | ✅ | |
 | `zwp_tablet_v2` | 🚧 | — / 1 | ✅ | no global |
@@ -71,6 +70,10 @@ Smithay: ❌ means we hand-roll it.
 | `zwlr_data_control_manager_v1` | ✅ | 2 / 2 | ✅ | |
 | `zwlr_foreign_toplevel_manager_v1` | ✅ | 3 / 3 | ❌ | `activate`/`close` works, state requests ignored |
 | `zwlr_output_power_manager_v1` | ✅ | 1 / 1 | ❌ | |
+| `mx_shell_surface_manager_v1` | ✅ | 1 / 1 | ❌ | shell roles for layer surfaces |
+| `mx_foreign_toplevel_info_manager_v1` | ✅ | 1 / 1 | ❌ | pid and modal hint per wlr toplevel handle |
+| `mx_thumbnail_view_manager_v1` | ✅ | 1 / 1 | ❌ | live toplevel thumbnails drawn onto the shell's layer surfaces |
+| `mx_accelerators_v1` | ✅ | 1 / 1 | ❌ | shell accelerator grabs (compositor-side repeat 400/120 ms, capped at 10 s); derived from Purism's `phosh_private`, under its notice |
 
 ## Missing
 

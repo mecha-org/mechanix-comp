@@ -1,7 +1,0 @@
-[Desktop Entry]
-Name=Mechanix
-Comment=Mechanix OS session
-Exec=/usr/bin/mechanix-session
-TryExec=/usr/bin/mechanix-session
-Type=Application
-DesktopNames=mechanix
